@@ -1,0 +1,16 @@
+{
+  "name": "lion-code-tui",
+  "version": "1.5.46",
+  "private": true,
+  "description": "Lion Code 终端界面（Ink = React for CLIs）",
+  "type": "module",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "ink": "^6.0.0",
+    "react": "^19.0.0",
+    "ink-text-input": "^6.0.0"
+  }
+}
