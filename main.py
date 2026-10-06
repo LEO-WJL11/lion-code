@@ -22720,7 +22720,12 @@ def run_alias_tables() -> None:
           name_aliases.resolve("ls_l", KNOWN_TOOLS + ["file_info"]) == "list_directory")
     check("包含多个真实工具名 -> 不猜",
           name_aliases.resolve("read_file_and_git_commit", ["read_file", "git_commit"]) is None)
-    check("别名表大小 = 267（逐条搬全）", name_aliases.size() == 267)
+    # 【为什么不能写 name_aliases.size()】内联后各模块同名符号会被改名以避免冲突
+    # （`size` → `size__agent_name_aliases`）。而 `name_aliases` / `arg_aliases` /
+    # `parsing` 这些名字在本文件里都指向**本模块自己**（sys.modules 自引用），
+    # 于是 `name_aliases.size()` 实际调到的是**参数别名表**的 `size`，返回 36，
+    # 断言 267 必然失败（实测）。表本身是齐的：len(ALIASES__agent_name_aliases)=267。
+    check("别名表大小 = 267（逐条搬全）", size__agent_name_aliases() == 267)
     check("参数别名表 = 36 组 / 188 个别名",
           arg_aliases.size() == 36 and sum(len(v) for v in arg_aliases.ALIASES.values()) == 188)
 
