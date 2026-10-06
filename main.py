@@ -10852,6 +10852,16 @@ PARAMETER = re.compile(r"<parameter\s*=\s*([A-Za-z_][\w.\-]*)\s*>(.*?)</paramete
 #: `<tool_call>…</tool_call>` 整块（stripCalls 先删它）
 _TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 
+#: 【未闭合兜底】`<function=名字> … ` 但**没有** `</function>`。
+#: 流式输出里模型经常来不及写闭合标签（被 `</tool_call>` 或输出结束截断），
+#: 上面的 FUNCTION 正则要求闭合 → 整个调用被丢掉 → 用户看到的是
+#: "它说要调用工具，然后什么都没发生"。实测：本地模型一次回复里
+#: 第 2、3 个调用常是残缺的。
+#: 只在前面的严格解析**一个都没匹配到**时才用，避免把已闭合的块重复解析。
+_FUNCTION_LOOSE = re.compile(
+    r"<function\s*=\s*([A-Za-z_][\w.\-]*)\s*>(.*?)(?=</function>|</tool_call>|\Z)",
+    re.DOTALL)
+
 
 class Call:
     """一次解析出来的调用：工具名 + 参数字典（对应 Java 的 `Call` record）。"""
@@ -10893,6 +10903,25 @@ def parse(text: str | None) -> list[Call]:
             # "没有参数"，工具回一句"缺少必需参数"，整轮就废了 —— 实测踩过。
             args.update(_parse_json_arguments(fn.group(2)))
         calls.append(Call(name, args))
+
+    # 【未闭合兜底】严格解析一个都没成，再试"有 <function=名字> 但没有 </function>"
+    # 的写法。流式输出里模型常把第 2、3 个调用写残；不兜这一下，整轮工具调用作废，
+    # 用户看到的就是"它说要调用工具，然后什么都没发生"（本轮实测就是这个形态）。
+    if not calls:
+        for fn in _FUNCTION_LOOSE.finditer(text):        # type: ignore[arg-type]
+            name = fn.group(1).strip()
+            if not name:
+                continue
+            body = fn.group(2)
+            args: dict[str, Any] = {}
+            for pm in PARAMETER.finditer(body):
+                args[pm.group(1).strip()] = _unescape(pm.group(2))
+            if not args:
+                args.update(_parse_json_arguments(body))
+            # 一个参数都没解析出来时，不硬凑成"无参调用"：那会让工具回一句
+            # "缺少必需参数"，比直接放弃更容易误导。只有能读出参数才认。
+            if args:
+                calls.append(Call(name, args))
     return calls
 
 
@@ -10906,6 +10935,11 @@ def strip_calls(text: str | None) -> str:
         return text            # type: ignore[return-value]
     out = _TOOL_CALL_BLOCK.sub(" ", text)
     out = FUNCTION.sub(" ", out)
+    # 未闭合的块也要清掉，否则残骸会当正文显示给用户（模型来不及写 </function> 时）
+    out = _FUNCTION_LOOSE.sub(" ", out)
+    # 上面那个正则从 `<function` 开始吃，孤立的外壳标签会留下（实测 `'<tool_call>'`），
+    # 一并扫掉，免得用户看到半截标签。
+    out = re.sub(r"</?tool_call\s*>", " ", out)
     return out.strip()
 
 
@@ -22614,6 +22648,27 @@ def run_parser_samples() -> None:
            "</tool_call>")
     tcs = loop.parse_tool_calls_from_text(xml)
     check("XML name/arguments 通道", len(tcs) == 1 and tcs[0].name == "read_file")
+
+    # 【未闭合兜底】流式输出里模型常来不及写 `</function>`（被 `</tool_call>` 或输出
+    # 结束截断）。严格正则要求闭合，于是整个调用被丢掉 —— 用户看到的是
+    # "它说要调用工具，然后什么都没发生"。实测：一轮里第 2、3 个调用常是残缺的。
+    for _label, _text, _want in (
+        ("被 </tool_call> 截断（JSON 参数）",
+         '<tool_call><function=directory_tree>{"path": "src", "maxDepth": 2}</tool_call>',
+         "directory_tree"),
+        ("被 </tool_call> 截断（parameter 形式）",
+         "<tool_call><function=list_directory><parameter=path>src</parameter></tool_call>",
+         "list_directory"),
+        ("输出到这就断了（完全没闭合）",
+         '<tool_call><function=directory_tree>{"path": "."}',
+         "directory_tree"),
+    ):
+        tcs = loop.parse_tool_calls_from_text(_text)
+        check(f"未闭合的 <function=…> 也能认出来：{_label}",
+              len(tcs) == 1 and tcs[0].name == _want and bool(tcs[0].arguments))
+    check("未闭合块的残骸不会当正文显示给用户（strip_calls 清干净）",
+          "<function" not in parsing.strip_calls(
+              '<tool_call><function=directory_tree>{"path": "."}'))
 
     loose = "<name>read_file</name><arguments>{\"path\": \"b.txt\"}</arguments>"
     tcs = loop.parse_tool_calls_from_text(loose)

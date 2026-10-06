@@ -1,0 +1,29 @@
+工具调用解析：补上「未闭合块」兜底（用户报"工具解析失败"）
+
+【现象】本地模型吐出的调用长这样，界面上报解析失败：
+    <tool_call><function=directory_tree>{"path": "…", "maxDepth": 2}</function></tool_call>
+
+【排查（每一步都有实测，不是猜）】
+1. 把原文直接喂给 parsing.parse → 解析成功（name=directory_tree，参数完整）
+   ⇒ 解析器本身没问题，问题在下游
+2. directory_tree 在别名表里是正名（L10647），且在工具描述表里有实现
+   ⇒ 名字也是对的（别名表里只有 get_env/number_convert/translate 三个缺实现，与本例无关）
+3. 端到端跑本地模型（/api/chat/stream）→ 一轮里 6 个 <tool_call> 块
+   → 6 个 TOOL_CALL 帧，全部「执行完成」⇒ 这条路是通的
+4. 真正的缺口：FUNCTION 正则要求 </function> 闭合，而流式输出里模型经常
+   来不及写（被 </tool_call> 或输出结束截断）→ 该块被整个丢掉 →
+   用户看到"它说要调用工具，然后什么都没发生"
+
+【改动】main.py 的 parsing 模块
+- 新增 _FUNCTION_LOOSE：匹配"有 <function=名字> 但没有 </function>"，
+  右界取 </function> | </tool_call> | 文本结束
+- parse()：严格解析一个都没成时才走这条兜底（避免与已闭合块重复）
+  · 没有解析出任何参数时不硬凑成"无参调用"（那会让工具回一句"缺少必需参数"，
+    比放弃更容易误导）
+- strip_calls()：未闭合块的残骸也清掉；顺带扫掉孤立的 tool_call 标签
+  （实测会留下半截 <tool_call> 给用户看）
+
+【回归】自带用例 run_parser_samples()：21 个用例 0 失败
+  新增 4 个：未闭合(JSON 参数被 </tool_call> 截断) / 未闭合(parameter 形式) /
+             未闭合(完全没闭合) / strip_calls 不留残骸
+  原有用例（模板原生、XML、宽松 XML、json 代码块、多块、别名归一化）全部照旧通过
