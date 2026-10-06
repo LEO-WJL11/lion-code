@@ -28,6 +28,7 @@ MiMo Code 的前端（OpenTUI + SolidJS，`MiMo-Code-main/packages/cli/src/cli/c
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -36,6 +37,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,12 +53,14 @@ MODEL_ID = "lion-merged"
 BACKEND = os.environ.get("LION_CODE_BACKEND", "http://127.0.0.1:8080").rstrip("/")
 
 
-def _req(path: str, body: dict | None = None, timeout: float = 30.0):
+def _req(path: str, body: dict | None = None, timeout: float = 30.0,
+         method: str | None = None):
     """调 Lion Code 后端。失败返回 None（调用方兜住）。"""
     url = BACKEND + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(
-        url, data=data, method="POST" if body is not None else "GET",
+        url, data=data,
+        method=method or ("POST" if body is not None else "GET"),
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -74,7 +78,12 @@ _PARTS: dict[str, list] = {}             # messageID → [Part]
 _TOOLS: dict[str, dict] = {}             # 会话 → 工具（给 /session/{id}/task 之类兜底）
 _SUBS: list[queue.Queue] = []            # SSE 订阅者
 _WORKSPACES: list[dict] = []             # 工作区（/workspace 新建的）
+#: 默认工作区的 id —— 只生成一次，保证状态接口的键和列表对得上
+_WORKSPACE_DEFAULT_ID = ""
 _DIRECTORY = os.getcwd()
+#: 持久化根（.lioncode 所在处）。启动器用 --workspace= 传入，与 main.py 的
+#: --lion.workspace.default-path 取同一个值。留空则在候选根里搜。
+_WORKSPACE_ROOT = ""
 _PROJECT_ID = None
 
 
@@ -113,17 +122,307 @@ def project() -> dict:
             "sandboxes": []}
 
 
-def new_session(title: str = "新会话", parent: str | None = None) -> dict:
-    sid = "ses_" + _slug(12)
+def new_session(title: str = "新会话", parent: str | None = None,
+                directory: str = "") -> dict:
+    # 【id 由后端 id 派生】列表里点进来的会话就是这个形状；新建的也保持一致，
+    # 否则同一条会话会在"内存随机 id"和"派生 id"下各出现一份。
+    bid = ""
+    try:
+        bid = create_backend_session(directory)
+    except Exception:                                     # noqa: BLE001
+        pass
+    sid = from_backend_id(bid) if bid else "ses_" + _slug(12)
     s = {"id": sid, "slug": _slug(6), "projectID": project()["id"],
-         "directory": _DIRECTORY, "parentID": parent, "title": title,
+         "directory": directory or _DIRECTORY, "parentID": parent, "title": title,
          "titleSource": "user", "titleRevision": 1, "version": VERSION,
+         "backendID": bid,
          "time": {"created": now_ms(), "updated": now_ms()}}
     with _LOCK:
         _SESSIONS[sid] = s
         _MESSAGES[sid] = []
     broadcast({"type": "session.created", "properties": {"info": s}})
     return s
+
+
+# ── 会话列表：把后端真实会话映射成 MiMo 形状 ──────────────────────────────
+#: 形如 ses_<32位十六进制> 的 id 是我们派生的，可反查回后端 UUID
+_SES_HEX = re.compile(r"^ses_([0-9a-fA-F]{32})$")
+
+
+def from_backend_id(uuid: str) -> str:
+    """后端 UUID → MiMo 侧 id（确定性派生，可逆）。"""
+    return "ses_" + str(uuid).replace("-", "").lower()
+
+
+def to_backend_id(mimo_sid: str) -> str:
+    """MiMo 侧 id → 后端 UUID；不是派生形状就返回空串。"""
+    m = _SES_HEX.match(str(mimo_sid or ""))
+    if not m:
+        return ""
+    h = m.group(1).lower()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+def _iso_ms(v) -> int:
+    """ISO 时间串 → 毫秒；解析不了退回当前时间。"""
+    if isinstance(v, (int, float)):
+        return int(v * 1000) if v < 10_000_000_000 else int(v)
+    s = str(v or "").strip()
+    if not s:
+        return now_ms()
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:                                     # noqa: BLE001
+        return now_ms()
+
+
+def _conv_roots(extra: str = "") -> list:
+    r"""`.lioncode` 可能的所在根，按可信度排序。
+
+    【为什么是搜而不是算】实测后端 /api/sessions 的 workspaceId 是**项目目录**
+    （仓库根），而 .lioncode 落在 --lion.workspace.default-path 指定的
+    **持久化根**（启动器给的是 <仓库>\.lbcheck\workspace）。两者名字和值都
+    不同，算不出来；显式参数加候选搜索才可靠。
+    """
+    home = os.path.expanduser("~")
+    cands = [
+        _WORKSPACE_ROOT,
+        os.environ.get("LION_WORKSPACE_DEFAULT_PATH", "").strip(),
+        extra,
+        os.path.join(_DIRECTORY, ".lbcheck", "workspace"),
+        os.path.join(home, "lion-code-workspace"),
+        _DIRECTORY,
+    ]
+    out, seen = [], set()
+    for c in cands:
+        c = str(c or "").strip()
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _find_persisted(backend_uuid: str, kind: str, extra: str = "") -> str:
+    r"""在候选根里找 <root>/.lioncode/<kind>/<id>.json，返回第一个存在的。"""
+    for root in _conv_roots(extra):
+        try:
+            p = os.path.join(root, ".lioncode", kind, backend_uuid + ".json")
+            if os.path.isfile(p):
+                return p
+        except Exception:                                 # noqa: BLE001
+            continue
+    return ""
+
+
+def _read_conv(backend_uuid: str, extra: str = "") -> list:
+    """读持久化对话；任何异常都当没有历史，不让接口 500。"""
+    try:
+        p = _find_persisted(backend_uuid, "conversations", extra)
+        if not p:
+            return []
+        with io.open(p, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:                                     # noqa: BLE001
+        return []
+
+
+def _updated_ms(backend_uuid: str, fallback: int, extra: str = "") -> int:
+    """最后活动时间：优先对话文件 mtime，其次会话元数据文件 mtime。"""
+    for kind in ("conversations", "sessions"):
+        p = _find_persisted(backend_uuid, kind, extra)
+        if p:
+            try:
+                return int(os.path.getmtime(p) * 1000)
+            except Exception:                             # noqa: BLE001
+                continue
+    return fallback
+
+
+def _title_of(backend_uuid: str, name, fallback: str = "新会话", extra: str = "") -> str:
+    """标题：后端 name → 首条用户消息 → 兜底。"""
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    for rec in _read_conv(backend_uuid, extra):
+        if isinstance(rec, dict) and str(rec.get("role")) == "user":
+            txt = " ".join(str(rec.get("content") or "").split())
+            if txt:
+                return txt[:48] + ("…" if len(txt) > 48 else "")
+    return fallback
+
+
+def backend_sessions() -> list:
+    """后端真实会话 → MiMo 的 Session 列表。"""
+    r = _req("/api/sessions") or {}
+    items = (r.get("data") or []) if isinstance(r, dict) else []
+    out = []
+    for x in items:
+        if not isinstance(x, dict):
+            continue
+        uuid = str(x.get("sessionId") or x.get("id") or "")
+        if not uuid:
+            continue
+        ws = str(x.get("workspaceId") or _DIRECTORY)
+        created = _iso_ms(x.get("createdAt"))
+        out.append({
+            "id": from_backend_id(uuid),
+            "slug": uuid.replace("-", "")[:8],
+            "projectID": project()["id"],
+            "directory": ws,
+            "parentID": None,
+            "title": _title_of(uuid, x.get("name"), extra=ws),
+            "titleSource": "user" if x.get("name") else "auto",
+            "titleRevision": 1,
+            "version": VERSION,
+            "backendID": uuid,
+            "time": {"created": created, "updated": _updated_ms(uuid, created, extra=ws)},
+        })
+    return out
+
+
+def all_sessions() -> list:
+    """后端真实会话 + 本进程内存会话，按最后活动倒序（最新在上）。
+
+    内存里的优先（那是正在聊的），避免同一会话出现两份。
+    """
+    with _LOCK:
+        mem = list(_SESSIONS.values())
+    merged, seen = [], set()
+    for s in mem + backend_sessions():
+        key = str(s.get("backendID") or s.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(s)
+    merged.sort(key=lambda s: int((s.get("time") or {}).get("updated") or 0), reverse=True)
+    return merged
+
+
+def session_messages(sid: str) -> tuple:
+    """某会话的历史消息 + parts。
+
+    内存里有（正在聊的）就用内存；否则回放持久化对话。
+    返回 (messages, {messageID: [parts]})。
+    """
+    with _LOCK:
+        mem = list(_MESSAGES.get(sid) or [])
+        mem_parts = dict(_PARTS)
+    if mem:
+        return mem, {m["id"]: list(mem_parts.get(m["id"]) or []) for m in mem}
+
+    bid = to_backend_id(sid)
+    if not bid:
+        with _LOCK:
+            cur = _SESSIONS.get(sid)
+        bid = str((cur or {}).get("backendID") or "")
+    if not bid:
+        return [], {}
+
+    msgs, parts, parent = [], {}, ""
+    for rec in _read_conv(bid):
+        if not isinstance(rec, dict):
+            continue
+        role = str(rec.get("role") or "assistant")
+        if role not in ("user", "assistant"):
+            continue
+        mid = str(rec.get("messageId") or ("msg_" + _slug(12)))
+        base = {"id": mid, "sessionID": sid, "agentID": AGENT, "role": role,
+                "time": {"created": now_ms(), "completed": now_ms()}}
+        if role == "user":
+            base.update({"agent": AGENT,
+                         "model": {"providerID": PROVIDER_ID, "modelID": MODEL_ID}})
+            parent = mid
+        else:
+            base.update({"parentID": parent, "modelID": MODEL_ID,
+                         "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT})
+        msgs.append(base)
+        mid_parts = []
+        text = str(rec.get("content") or "")
+        if text:
+            mid_parts.append({"id": "prt_" + _slug(12), "sessionID": sid,
+                              "messageID": mid, "type": "text", "text": text,
+                              "time": {"start": now_ms(), "end": now_ms()}})
+        reasoning = str(rec.get("reasoningContent") or "")
+        if reasoning:
+            mid_parts.append({"id": "prt_" + _slug(12), "sessionID": sid,
+                              "messageID": mid, "type": "reasoning", "text": reasoning,
+                              "time": {"start": now_ms(), "end": now_ms()}})
+        parts[mid] = mid_parts
+    return msgs, parts
+
+
+def backend_session(session_id: str) -> str:
+    """按需在后端建一个真会话，返回**后端认的** id。
+
+    【为什么必须】适配层自己造的 id（ses_xxx）后端不认识，直接转发聊天会得到
+    "会话不存在"。这里走后端既有的两步：POST /api/workspaces → POST /api/sessions。
+    （之前拿假模型测没暴露：假模型不校验 sessionId。）
+    """
+    if not session_id:
+        return ""
+    # ① 由后端 id 派生出来的（列表里点进来的）→ 直接反查，不必创建
+    direct = to_backend_id(session_id)
+    if direct:
+        return direct
+    with _LOCK:
+        s = _SESSIONS.get(session_id)
+        if s is not None and s.get("backendID"):
+            return str(s["backendID"])
+    bid = create_backend_session()
+    if bid:
+        with _LOCK:
+            cur = _SESSIONS.get(session_id)
+            if cur is not None:
+                cur["backendID"] = bid
+    return str(bid)
+
+
+def new_workspace_root() -> str:
+    r"""新建工作区的落地根目录（`/new` 和 `/workspaces` 里"新建"的落点）。
+
+    【为什么不直接用 `_WORKSPACE_ROOT`】那个名字已经属于**持久化根**
+    （`.lioncode` 所在处，启动器用 `--workspace=` 传入，与后端
+    `--lion.workspace.default-path` 同值）。这里在它下面再开一层 `workspaces/`；
+    没传 `--workspace=` 时退回仓库内 `.lbcheck\workspace\workspaces`。
+    """
+    base = _WORKSPACE_ROOT or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".lbcheck", "workspace")
+    return os.path.join(base, "workspaces")
+
+
+def workspace_directory(mimo_workspace_id: str) -> str:
+    """MiMo 侧工作区 id（wrk_xxx）→ 真实目录；认不出来就用当前目录。
+
+    我们后端的 workspaceId 就是路径，所以拿到目录就能把会话放进对应工作区。
+    """
+    if not mimo_workspace_id:
+        return _DIRECTORY
+    with _LOCK:
+        for w in _WORKSPACES:
+            if w.get("id") == mimo_workspace_id:
+                return str(w.get("directory") or _DIRECTORY)
+    return _DIRECTORY
+
+
+def create_backend_session(directory: str = "") -> str:
+    """在后端新建会话，返回 UUID。
+
+    `POST /api/workspaces` 的 id 就是工作区**路径**（实测）；
+    `POST /api/sessions` 返回 {sessionId, workspaceId, mode, createdAt, ...}。
+    `directory` 决定这条会话属于哪个工作区。
+    """
+    path = directory or _DIRECTORY
+    ws = _req("/api/workspaces", {"path": path}) or {}
+    wsid = (ws.get("data") or {}).get("id")
+    if not wsid:
+        d = _req("/api/workspaces/default") or {}
+        wsid = (d.get("data") or {}).get("id")
+    if not wsid:
+        wsid = path
+    made = _req("/api/sessions", {"workspaceId": wsid, "mode": "STANDARD"}) or {}
+    data = made.get("data") or {}
+    return str(data.get("sessionId") or data.get("id") or "")
 
 
 def new_message(sid: str, role: str, parent: str = "", text: str = ""):
@@ -184,7 +483,9 @@ def _finish_message(sid: str, mid: str) -> None:
 def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> None:
     """把 Lion Code 后端的 SSE 翻译成 MiMo 的 message.part.* 事件。"""
     url = BACKEND + "/api/chat/stream"
-    body = json.dumps({"sessionId": sid, "message": text,
+    # 【必须用后端 id】适配层的 ses_xxx 后端不认识 → 直接转发就是"会话不存在"
+    bid = backend_session(sid) or sid
+    body = json.dumps({"sessionId": bid, "message": text,
                        "thinkingLevel": thinking}).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
@@ -290,6 +591,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _workspace_of(self, body: dict | None = None) -> str:
+        """当前请求属于哪个工作区（MiMo 侧 id）。
+
+        SDK 把它放在请求头 `x-mimocode-workspace`
+        （packages/sdk/src/v2/client.ts:82-85）；部分调用还会带 `?workspace=`
+        或 body 里的 workspace。三处都读，读不到就当默认工作区。
+        """
+        h = self.headers.get("x-mimocode-workspace")
+        if h:
+            return urllib.parse.unquote(h).strip()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if q.get("workspace"):
+            return str(q["workspace"][0]).strip()
+        if isinstance(body, dict) and isinstance(body.get("workspace"), str):
+            return str(body["workspace"]).strip()
+        return ""
+
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
@@ -323,6 +641,18 @@ class Handler(BaseHTTPRequestHandler):
                                "worktree": _DIRECTORY, "directory": _DIRECTORY})
         if p == "/experimental/resource":
             return self._json({"cpu": 0, "memory": 0, "uptime": 0})
+        # 【必须实现，且必须是数组】"新建工作区"对话框一打开就拉这个端点
+        # （dialog-workspace-create.tsx:185），然后把结果直接 `.map`（L223）：
+        #     list.map((item) => ({title: item.name, value: item.type, ...}))
+        # 未实现时走通用兜底返回了**字典** —— 字典是 truthy，绕过了前端的
+        # `if (!list)` 保护（L214），于是 `list.map is not a function` 直接崩界面。
+        # 形状照前端的 `type Adaptor = {type, name, description}`（L14-18）；
+        # `type` 会原样进 `workspace.create({type})`，所以只列我们真支持的那种。
+        if p == "/experimental/workspace/adaptor":
+            return self._json([
+                {"type": "local", "name": "本地目录",
+                 "description": "在本地磁盘上新建一个工作区目录"},
+            ])
         # 【不能返空数组】TUI 拿到空的工作区列表就会弹"新建工作区"，
         # 于是每次启动都强制你先建一个工作区才能发消息（实测就是这么卡住的）。
         # 结构照 SDK 的 Workspace：{id,type,name,branch,directory,extra,projectID}
@@ -332,9 +662,21 @@ class Handler(BaseHTTPRequestHandler):
                     _WORKSPACES.append(self._workspace())
                 return self._json(list(_WORKSPACES))
         if p == "/experimental/workspace/status":
-            return self._json({self._workspace()["id"]: {"status": "ready"}})
+            # 【形状】前端读的是数组 [{workspaceID, status}, ...]
+            # （context/project.tsx:64 直接对它 .map），返回字典会被整段丢掉。
+            # 取值用前端枚举里的 "connected"，否则会话列表会显示成异常状态。
+            with _LOCK:
+                if not _WORKSPACES:
+                    _WORKSPACES.append(self._workspace())
+                items = list(_WORKSPACES)
+            return self._json([{"workspaceID": w["id"], "status": "connected"}
+                               for w in items])
         if p == "/experimental/console":
             return self._json({"org": None, "orgs": []})
+        # 权限提问的超时（毫秒）；null = 不超时。前端启动时会探一次，
+        # 不实现就吃 404 字典 —— 这里没人 .map，不至于崩，但补上更干净。
+        if p == "/permission/ask-timeout":
+            return self._json(None)
         if p == "/global/config":
             return self._json({"theme": "mimocode", "model": MODEL_ID})
         if p == "/project/current" or p == "/project":
@@ -349,8 +691,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({})
 
         if p == "/session":
-            with _LOCK:
-                return self._json(list(_SESSIONS.values()))
+            # 【不能只返回内存】那只有本次启动见过的会话；侧边栏要的是后端
+            # 持久化的全部会话（标题 + 最后活动时间），最新在上。
+            return self._json(all_sessions())
         if p == "/session/status":
             return self._json({})
 
@@ -358,15 +701,21 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             with _LOCK:
                 s = _SESSIONS.get(m.group(1))
+            if s is None:
+                # 列表里点进来的历史会话：内存没有，但从后端列表能构造
+                s = next((x for x in backend_sessions() if x["id"] == m.group(1)), None)
             return self._json(s) if s else self._json({"error": "not found"}, 404)
 
         m = re.match(r"^/session/([^/]+)/message$", p)
         if m:
-            with _LOCK:
-                msgs = list(_MESSAGES.get(m.group(1), []))
+            # 历史会话（列表里点进来的）内存里没有消息 → 回放持久化对话。
+            # parts 也必须取自 hist_parts：回放出来的 part 不在 _PARTS 里，
+            # 用 _PARTS 查会得到空数组（消息有、内容空）。
+            msgs, hist_parts = session_messages(m.group(1))
             out = []
             for msg in msgs:
-                out.append({"info": msg, "parts": _PARTS.get(msg["id"], [])})
+                out.append({"info": msg,
+                            "parts": hist_parts.get(msg["id"]) or _PARTS.get(msg["id"], [])})
             return self._json(out)
 
         if re.match(r"^/session/([^/]+)/(todo|children|diff|task|actors|recovery)$", p):
@@ -403,9 +752,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not implemented: " + p}, 404)
 
     def _workspace(self) -> dict:
-        """默认工作区（当前目录）。返回它，TUI 就不会再逼你新建工作区。"""
+        """默认工作区（当前目录）。返回它，TUI 就不会再逼你新建工作区。
+
+        id 只生成一次：每次调用都换 id 的话，状态接口的键就和列表对不上了。
+        """
+        global _WORKSPACE_DEFAULT_ID
         name = os.path.basename(_DIRECTORY.rstrip("\\/")) or "lion-code"
-        return {"id": "wrk_" + _slug(10), "type": "local", "name": name,
+        with _LOCK:
+            if not _WORKSPACE_DEFAULT_ID:
+                _WORKSPACE_DEFAULT_ID = "wrk_" + _slug(10)
+            wid = _WORKSPACE_DEFAULT_ID
+        return {"id": wid, "type": "local", "name": name,
                 "branch": None, "directory": _DIRECTORY, "extra": None,
                 "projectID": project()["id"]}
 
@@ -511,12 +868,71 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/session":
             title = str(body.get("title") or "新会话")
-            return self._json(new_session(title))
+            # 【工作区】`/new` 与 `/workspaces` 都是「先选工作区再开会话」，
+            # 会话要真的落在那份目录里，否则"选择工作区"只是换个标题。
+            return self._json(new_session(
+                title, directory=workspace_directory(self._workspace_of(body))))
 
-        # 【/workspace 命令】新建工作区：结构照 SDK 的 Workspace
+        # 【删除工作区】有的 SDK 用 POST 做删除，这里一并接住
+        if re.match(r"^/experimental/workspace/(remove|delete)$", p):
+            return self._json(self._remove_workspace(body))
+
+        # 【/workspace 命令】新建/登记工作区：结构照 SDK 的 Workspace
         if p == "/experimental/workspace":
-            name = str(body.get("name") or "lion-code")
-            directory = str(body.get("directory") or _DIRECTORY)
+            # 【directory 走 query，不走 body】SDK 生成的 create 里
+            #   args: [{in:"query",key:"directory"}, ... {in:"body",key:"type"} ...]
+            # （packages/sdk/src/v2/gen/sdk.gen.ts:705）
+            # 所以只读 body 会**永远读不到路径** ✗ —— 这就是"新建工作区只会
+            # 自动编号建空目录、没法用自己项目目录"的根因。两个地方都读。
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            want = str((qs.get("directory") or [""])[0]).strip() or \
+                   str(body.get("directory") or "").strip()
+
+            if want:
+                # 【用户指定了目录】已存在就直接登记 —— **不建、不覆盖、不动里面
+                # 任何文件**（用户可能把自己的项目目录登记进来 ✗ 删他代码是灾难）。
+                directory = os.path.abspath(os.path.expanduser(want))
+                if os.path.isdir(directory):
+                    pass                                  # 登记已有目录 ✓
+                else:
+                    try:
+                        os.makedirs(directory, exist_ok=True)   # 不存在才建 ✓
+                    except OSError:
+                        return self._json({"error": "cannot create directory: " + want}, 400)
+                    except Exception:                     # noqa: BLE001
+                        pass
+                # 名字默认取目录名；适配层建的 ones 已自带序号，天然不重名
+                base = os.path.basename(directory.rstrip("\\/")) or "workspace"
+                name = str(body.get("name") or base)
+            else:
+                # 【没给目录】保持原行为：自动编号 + 在 workspace_root 下建目录
+                # （前端只发 {type, branch} 时走这条；别改回去 ✗）
+                with _LOCK:
+                    seq = len(_WORKSPACES) + 1
+                base = os.path.basename(_DIRECTORY.rstrip("\\/")) or "lion-code"
+                directory = os.path.join(new_workspace_root(), f"{base}-{seq}")
+                try:
+                    os.makedirs(directory, exist_ok=True)
+                except OSError:
+                    directory = _DIRECTORY
+                name = str(body.get("name") or f"{base}-{seq}")
+
+            # 【同名去重】登记两个同名目录（不同路径）时，名字后面补序号，
+            # 否则列表里分不清谁是谁。
+            with _LOCK:
+                taken = {w.get("name") for w in _WORKSPACES}
+            if name in taken:
+                i = 2
+                while f"{name}-{i}" in taken:
+                    i += 1
+                name = f"{name}-{i}"
+
+            # 【同一目录重复登记】直接返回已有的那个，避免列表里出现两条一样的
+            with _LOCK:
+                for w in _WORKSPACES:
+                    if os.path.normcase(str(w.get("directory") or "")) == os.path.normcase(directory):
+                        return self._json(w)
+
             ws = {"id": "wrk_" + _slug(10), "type": str(body.get("type") or "local"),
                   "name": name, "branch": body.get("branch"),
                   "directory": directory, "extra": None,
@@ -532,7 +948,7 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/session/([^/]+)/(summarize|compact)$", p)
         if m:
             sid = m.group(1)
-            ctx = _req("/api/context?sessionId=" + sid) or {}
+            ctx = _req("/api/context?sessionId=" + (backend_session(sid) or sid)) or {}
             with _LOCK:
                 s = _SESSIONS.get(sid)
             if s is not None:
@@ -552,7 +968,8 @@ class Handler(BaseHTTPRequestHandler):
 
         m = re.match(r"^/session/([^/]+)/abort$", p)
         if m:
-            _req("/api/chat/control/stop", {"sessionId": m.group(1)})
+            _req("/api/chat/control/stop", 
+                 {"sessionId": backend_session(m.group(1)) or m.group(1)})
             broadcast({"type": "session.idle", "properties": {"sessionID": m.group(1)}})
             return self._json(True)
 
@@ -650,13 +1067,80 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(s or {})
         return self._json(True)
 
+    # -- 工作区删除（MiMo 有几个可能的入口，全部接住）
+    def _remove_workspace(self, body: dict) -> dict:
+        """从列表摘掉一个工作区；目录落在我们工作区根下时一并删除。"""
+        q = self.path.split("?", 1)[1] if "?" in self.path else ""
+        wid = ""
+        for src in (body.get("id"), body.get("workspaceID"), body.get("workspaceId"),
+                    body.get("name")):
+            if isinstance(src, str) and src:
+                wid = src
+                break
+        if not wid and q:
+            for pair in q.split("&"):
+                if pair.startswith(("id=", "workspaceID=")):
+                    wid = pair.split("=", 1)[1]
+                    break
+        if not wid:
+            m2 = re.match(r"^/experimental/workspace/([^/]+)/(remove|delete)?$", self._path())
+            wid = m2.group(1) if m2 else ""
+        if not wid:
+            return {"success": False, "message": "缺少工作区 id"}
+
+        gone = None
+        with _LOCK:
+            for i, w in enumerate(list(_WORKSPACES)):
+                if wid in (str(w.get("id")), str(w.get("name"))):
+                    gone = _WORKSPACES.pop(i)
+                    break
+        if gone is None:
+            return {"success": False, "message": "工作区不存在: " + wid}
+
+        # 【只清理适配层自己建的空目录】工作区删除的语义是"从应用里注销"，
+        # 不是删用户的文件 ✗ —— 用户完全可能把真实项目目录注册成工作区，
+        # 无条件 rmtree 就是删他的代码。这里要求同时满足：
+        #   ① 在 <workspace_root>/workspaces/ 之下（适配层建的都在这）
+        #   ② 目录为空（非空说明用户在里头放东西了，一律不碰）
+        d = str(gone.get("directory") or "")
+        root = os.path.abspath(_WORKSPACE_ROOT or "")
+        made = os.path.join(root, "workspaces") if root else ""
+        if d and made and os.path.abspath(d).startswith(os.path.abspath(made) + os.sep):
+            target = os.path.abspath(d)
+            if os.path.isdir(target) and not os.listdir(target):
+                try:
+                    os.rmdir(target)
+                except OSError:
+                    pass
+        broadcast({"type": "project.updated", "properties": {"workspace": gone}})
+        return {"success": True, "id": wid}
+
     def do_DELETE(self):                                  # noqa: N802
         p = self._path()
+        body = self._body()
+
+        # 【删除工作区】路径有好几种可能，都接住（日志会记录实际到达的那个）
+        if p in ("/experimental/workspace", "/experimental/workspace/remove",
+                 "/experimental/workspace/delete") or \
+                re.match(r"^/experimental/workspace/[^/]+(/remove|/delete)?$", p):
+            return self._json(self._remove_workspace(body))
+
         m = re.match(r"^/session/([^/]+)$", p)
         if m:
+            sid = m.group(1)
             with _LOCK:
-                s = _SESSIONS.pop(m.group(1), None)
-                _MESSAGES.pop(m.group(1), None)
+                s = _SESSIONS.get(sid)
+            # 【必须落到后端】原来只删内存 → 重启后对话又回来了（看着成功其实没删）
+            bid = (s or {}).get("backendID") or backend_session(sid)
+            if bid:
+                try:
+                    _req("/api/sessions/" + str(bid), method="DELETE")
+                except Exception:                         # noqa: BLE001
+                    pass
+            with _LOCK:
+                s = _SESSIONS.pop(sid, None)
+                _MESSAGES.pop(sid, None)
+                _PARTS.clear() if False else None
             if s:
                 broadcast({"type": "session.deleted", "properties": {"info": s}})
             return self._json(True)
@@ -664,7 +1148,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv: list[str] | None = None) -> int:
-    global BACKEND, _DIRECTORY
+    global BACKEND, _DIRECTORY, _WORKSPACE_ROOT
     args = list(sys.argv[1:] if argv is None else argv)
     port = 8791
     for i, a in enumerate(args):
@@ -676,6 +1160,8 @@ def main(argv: list[str] | None = None) -> int:
             BACKEND = a.split("=", 1)[1].rstrip("/")
         elif a.startswith("--directory="):
             _DIRECTORY = a.split("=", 1)[1]
+        elif a.startswith("--workspace="):
+            _WORKSPACE_ROOT = a.split("=", 1)[1]
     srv = _Server(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
     # 【预建一个会话，让前端直接进去】MiMo 的流程是"选工作区 → 选会话 → 聊天"，
