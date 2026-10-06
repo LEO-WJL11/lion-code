@@ -24044,21 +24044,38 @@ _API_REGISTER = {
 
 
 def _ink_frontend_cmd() -> list | None:
-    """Ink 前端的启动命令；不可用返回 None（并说明缺什么）。"""
+    """终端界面的启动命令；不可用返回 None（并说明缺什么）。
+
+    【为什么是 bun 不是 node】界面用 OpenTUI 渲染（与 MiMo Code 同款：
+    `@opentui/core` + `@opentui/solid` + solid-js）。OpenTUI 的渲染器走 **Bun 的
+    原生 FFI**，在 Node 上直接报：
+        Failed to initialize OpenTUI render library:
+        OpenTUI native FFI is not available for this runtime yet
+    所以这里必须找 bun。JSX runtime 由 tui/bunfig.toml 的
+    `preload = ["@opentui/solid/preload"]` 挂上（缺了会报 jsxDEV 找不到）。
+    """
     root = os.path.dirname(os.path.abspath(__file__))
-    app = os.path.join(root, "tui", "app.js")
+    tui = os.path.join(root, "tui")
+    app = os.path.join(tui, "src", "index.tsx")
     if not os.path.isfile(app):
         print(f"找不到界面文件: {app}")
         return None
-    if not os.path.isdir(os.path.join(root, "tui", "node_modules", "ink")):
-        print("界面依赖还没装。在 tui/ 目录里执行一次：")
-        print("    npm install")
+    if not os.path.isdir(os.path.join(tui, "node_modules", "@opentui", "core")):
+        print("界面依赖还没装。在 tui/ 目录里执行一次（需要 Bun）：")
+        print("    bun install")
         return None
-    node = shutil.which("node")
-    if not node:
-        print("PATH 里找不到 node（需要 Node 20+）。装上 node 之后再运行本程序。")
+    bun = shutil.which("bun")
+    if not bun:
+        print("PATH 里找不到 bun（OpenTUI 只能在 Bun 上跑，Node 不行）。")
+        print("装 Bun：npm install -g bun   （或 https://bun.sh）")
         return None
-    return [node, app]
+    # --conditions=browser 是 MiMo 那边的入口写法，少它会在依赖解析上翻车
+    # 【cwd 必须切到 tui/】Bun 读 `bunfig.toml` 是按 **cwd** 找的，不看脚本路径。
+    # 主程序是从仓库根目录启动的，不切目录就找不到那份 preload（JSX runtime），
+    # 于是 Bun 退回默认 React runtime，报：
+    #     Cannot find module 'react/jsx-dev-runtime' from '.../tui/src/index.tsx'
+    # （`bun --cwd` 不能放在 `run` 前面，所以由调用方用 subprocess 的 cwd 切。）
+    return [bun, "run", "--conditions=browser", app]
 
 
 def _wait_backend(port: int, proc, timeout: float = 90.0) -> bool:
@@ -24174,7 +24191,13 @@ def _ink_main(argv: list | None = None) -> int:
         cmd = [*ink, f"--port={port}", f"--workspace={workspace or os.getcwd()}"]
         if script_arg:
             cmd.append(script_arg)
-        rc = subprocess.call(cmd)
+        # 切到 tui/：Bun 是按 **cwd** 找 bunfig.toml / tsconfig.json 的，不看脚本路径。
+        # 从仓库根目录启动它会把 JSX 退化成 React runtime，报：
+        #     Cannot find module 'react/jsx-dev-runtime' from '.../tui/src/index.tsx'
+        tui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tui")
+        print(f"[界面] {' '.join(cmd)}", flush=True)
+        print(f"[界面] 工作目录 {tui_dir}", flush=True)
+        rc = subprocess.call(cmd, cwd=tui_dir)
     except KeyboardInterrupt:
         rc = 0
     finally:

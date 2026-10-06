@@ -2,15 +2,15 @@
   "name": "lion-code-tui",
   "version": "1.5.46",
   "private": true,
-  "description": "Lion Code 终端界面（Ink = React for CLIs）",
   "type": "module",
-  "main": "app.js",
+  "description": "Lion Code 终端界面（OpenTUI + SolidJS —— 与 MiMo Code 同款技术栈）",
   "scripts": {
-    "start": "node app.js"
+    "start": "bun run --conditions=browser ./src/index.tsx",
+    "dev": "bun run --conditions=browser ./src/index.tsx"
   },
   "dependencies": {
-    "ink": "^6.0.0",
-    "react": "^19.0.0",
-    "ink-text-input": "^6.0.0"
+    "@opentui/core": "0.1.101",
+    "@opentui/solid": "0.1.101",
+    "solid-js": "^1.9.5"
   }
 }

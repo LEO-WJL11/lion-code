@@ -1,7 +1,7 @@
 # 🦁 Lion Code（Lion-Code Agent Harness）
 
-**本地优先的 AI 编程 Agent**：后端是纯 Python 3.15 单机运行，界面是用 **Ink（React for CLIs）**
-写的终端界面，模型跑在你自己机器上 —— 代码和数据不出本机。
+**本地优先的 AI 编程 Agent**：后端是纯 Python 3.15 单机运行，界面复用 **MiMo Code 的原版终端 UI**
+（OpenTUI + SolidJS，中间隔一层接口适配），模型跑在你自己机器上 —— 代码和数据不出本机。
 
 配套模型（本机默认用的那个）：**[lion-models1 @ ModelScope](https://modelscope.cn/models/lionnezha/lion-models)**
 —— 9B、Qwen3.5 架构、按 Agent 工具调用微调，三档 GGUF 量化（Q8_0 / Q4_K_M / IQ4_XS）。
@@ -15,28 +15,62 @@
 
 ## 🚀 怎么运行
 
-**双击仓库根目录的 `启动LionCode.cmd`** —— 这是最省事的方式（会开一个控制台窗口跑界面）。
+**双击仓库根目录的 `启动MiMo界面.cmd`** —— 界面是 **MiMo Code 的原版 TUI**，
+后端是我们自己的纯 Python 服务。
+
+```
+启动MiMo界面.cmd
+  └─ _start_mimo.py（三段编排）
+       ① main.py --backend-only :18080   我们的 Python 后端（能力全在这里）
+       ② mimo适配.py :8791               MiMo 的 API 形状 → 我们的 /api/*
+       ③ MiMo 原版 TUI attach 到 ②       MiMo 的前端（除品牌外一行未改）
+```
 
 命令行也行：
 
 ```bash
-python main.py                 # 终端界面（默认）
-python main.py --backend-only  # 只起 HTTP 后端，不起界面（调接口 / 跑自动化用）
+python main.py                 # 自带界面（tui/ 下的 OpenTUI 版）
+python main.py --backend-only  # 只起 HTTP 后端
+python mimo适配.py --port=8791 --backend=http://127.0.0.1:18080   # 只起适配层
 ```
 
-> ⚠️ **界面需要"真终端"（TTY）**。PyCharm 的 Run 窗口、管道、输出重定向都**没有 TTY**，
-> Ink 的光标控制在那儿会变成一堆乱字，看起来就像"只是个 python 终端"。
-> 所以：
-> - 在 PyCharm 里 Run 时，程序会**自动新开一个 Windows Terminal 窗口**把界面放进去跑；
-> - 或者直接双击 `启动LionCode.cmd`；
-> - 或者在 Windows Terminal / PowerShell 里执行 `python main.py`。
+### 首次部署需要两步
 
-界面依赖只装一次（Node 20+）：
+**① 准备 MiMo 前端源码**（`MiMo-Code-main/` 不进仓库，24 MB）：
 
 ```bash
-cd tui
-npm install                    # 装 ink / react / ink-text-input，约 40 个包
+# 从 MiMo Code 官方仓库取，解压到仓库根目录，目录名保持 MiMo-Code-main
+cd MiMo-Code-main && bun install --ignore-scripts && cd ..
 ```
+
+> `--ignore-scripts` 是必需的：`tree-sitter-powershell` 等原生模块要
+> `node-gyp rebuild`，在 Windows 上会因 EPERM 失败。
+> 另外装完后如果 `packages/*/node_modules` 里有残留副本，要删掉 ——
+> 它会挡住根目录的完整依赖，导致 `Cannot find module 'drizzle-orm/sqlite-core'`。
+
+**② 准备 llama.cpp 运行时**（31.8 MB 二进制，不进仓库）：
+
+```bash
+python _setup_runtime.py       # 从 llama.cpp 官方 Releases 拉 Vulkan 版
+```
+
+> 后端自己的下载源没实现（`POST /api/runtime/local/download` 返回
+> "下载源解析将在 P2 实现"），所以要用这个脚本。
+
+### 本地模型的模型权重
+
+`lion-merged-IQ4_XS.gguf`（4.87 GB，`*.gguf` 已被 gitignore）放在**仓库根目录**。
+
+> ⚠️ 后端启动**必须带 `--app-root=<仓库根>`** —— 它决定去哪找
+> `*.gguf` 和 `runtime-vulkan/`。不给的话会默认去 `<仓库>/python/`（旧布局），
+> 模型会被判为"未安装"，然后**反复重新下载**。启动器已经带上了。
+
+### 关于终端
+
+> ⚠️ MiMo 的 `app.tsx` 会用 FFI 改控制台模式（`SetConsoleMode`），老式
+> conhost 窗口会因此异常（窗口一闪就关）。所以启动器用
+> **Windows Terminal + `cmd /k`**，并且退出后会主动复位终端模式
+> （关鼠标上报、退备用屏、显示光标）。
 
 缺 node 或没装依赖时，程序会直接告诉你去 `tui/` 跑一次 `npm install` ——
 **界面只有 Ink 这一个实现**（不做第二套，免得两套界面两套行为）。

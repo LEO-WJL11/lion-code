@@ -1,0 +1,4 @@
+# Bun 的 JSX runtime 需要这个 preload，否则报：
+#   SyntaxError: Export named 'jsxDEV' not found in module '@opentui/solid'
+# （MiMo Code 的 packages/cli/bunfig.toml 也是这么配的）
+preload = ["@opentui/solid/preload"]

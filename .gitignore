@@ -47,3 +47,8 @@ docs/_archive/
 .DS_Store
 Thumbs.db
 desktop.ini
+# ── llama.cpp 运行时（31.8 MB 二进制，用 _get_runtime.py 现下）──────────
+runtime-vulkan/
+
+# ── bun 安装缓存 ──────────────────────────────────────────────────
+.bun-cache/
