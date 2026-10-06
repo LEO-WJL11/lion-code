@@ -73,6 +73,7 @@ _MESSAGES: dict[str, list] = {}          # sessionID → [Message]
 _PARTS: dict[str, list] = {}             # messageID → [Part]
 _TOOLS: dict[str, dict] = {}             # 会话 → 工具（给 /session/{id}/task 之类兜底）
 _SUBS: list[queue.Queue] = []            # SSE 订阅者
+_WORKSPACES: list[dict] = []             # 工作区（/workspace 新建的）
 _DIRECTORY = os.getcwd()
 _PROJECT_ID = None
 
@@ -326,7 +327,10 @@ class Handler(BaseHTTPRequestHandler):
         # 于是每次启动都强制你先建一个工作区才能发消息（实测就是这么卡住的）。
         # 结构照 SDK 的 Workspace：{id,type,name,branch,directory,extra,projectID}
         if p == "/experimental/workspace":
-            return self._json([self._workspace()])
+            with _LOCK:
+                if not _WORKSPACES:
+                    _WORKSPACES.append(self._workspace())
+                return self._json(list(_WORKSPACES))
         if p == "/experimental/workspace/status":
             return self._json({self._workspace()["id"]: {"status": "ready"}})
         if p == "/experimental/console":
@@ -405,15 +409,69 @@ class Handler(BaseHTTPRequestHandler):
                 "branch": None, "directory": _DIRECTORY, "extra": None,
                 "projectID": project()["id"]}
 
+    def _model_ids(self) -> list:
+        """真实可选的模型列表。
+
+        【数据源】试过 `/api/models` —— 它是空的（`data: []`）。有内容的只有
+        `/api/runtime/local/models`：三份量化，带中文标签与下载状态。
+        云端配了 key 之后，`/api/models` 才会有东西，所以两个都读、合并去重。
+        """
+        ids = []
+
+        # ① 本地量化（file 是它的标识）
+        r = _req("/api/runtime/local/models") or {}
+        data = r.get("data") if isinstance(r, dict) else None
+        if isinstance(data, list):
+            for x in data:
+                if isinstance(x, dict):
+                    n = x.get("file") or x.get("id") or x.get("name")
+                    if n:
+                        ids.append(str(n))
+                elif isinstance(x, str):
+                    ids.append(x)
+
+        # ② 云端 / 其它（配了 key 才有）
+        r2 = _req("/api/models") or {}
+        d2 = r2.get("data") if isinstance(r2, dict) else None
+        pool = []
+        if isinstance(d2, dict):
+            for key in ("local", "cloud", "models"):
+                v = d2.get(key)
+                if isinstance(v, list):
+                    pool += v
+        elif isinstance(d2, list):
+            pool = d2
+        for x in pool:
+            if isinstance(x, dict):
+                n = x.get("id") or x.get("name") or x.get("model")
+                if n:
+                    ids.append(str(n))
+            elif isinstance(x, str):
+                ids.append(x)
+
+        # ③ 兜底：当前激活的那个
+        if not ids:
+            m = _req("/api/runtime/mode") or {}
+            d = m.get("data") if isinstance(m, dict) else {}
+            ids = [str((d or {}).get("model") or MODEL_ID)]
+
+        seen, out = set(), []
+        for x in ids:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
     def _provider(self) -> dict:
-        r = _req("/api/runtime/mode") or {}
-        d = r.get("data") if isinstance(r, dict) else {}
-        model = str((d or {}).get("model") or MODEL_ID)
-        one = {"id": model, "name": model, "attachment": False, "reasoning": True,
-               "temperature": True, "tool_call": True,
-               "cost": {"input": 0, "output": 0}}
+        """/models 面板读的是 providers[].models —— 这里给真实列表，
+        否则只能看到一个模型，等于没法切换。"""
+        models = {}
+        for mid in self._model_ids():
+            models[mid] = {"id": mid, "name": mid, "attachment": False,
+                           "reasoning": True, "temperature": True,
+                           "tool_call": True, "cost": {"input": 0, "output": 0}}
         return {"id": PROVIDER_ID, "name": "Lion Code", "source": "custom",
-                "env": [], "options": {}, "models": {model: one}}
+                "env": [], "options": {}, "models": models}
 
     # -- SSE：界面"活过来"全靠它
     def _sse(self) -> None:
@@ -454,6 +512,35 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/session":
             title = str(body.get("title") or "新会话")
             return self._json(new_session(title))
+
+        # 【/workspace 命令】新建工作区：结构照 SDK 的 Workspace
+        if p == "/experimental/workspace":
+            name = str(body.get("name") or "lion-code")
+            directory = str(body.get("directory") or _DIRECTORY)
+            ws = {"id": "wrk_" + _slug(10), "type": str(body.get("type") or "local"),
+                  "name": name, "branch": body.get("branch"),
+                  "directory": directory, "extra": None,
+                  "projectID": project()["id"]}
+            with _LOCK:
+                _WORKSPACES.append(ws)
+            broadcast({"type": "project.updated", "properties": {"workspace": ws}})
+            return self._json(ws)
+
+        # 【/compact 命令】压缩上下文：把会话在该后端侧做一次整理。
+        # 我们后端没有独立的 compact 接口，这里给会话打上摘要标记并广播，
+        # 前端会据此刷新上下文读数（真正的裁剪由后端按窗口自己触发）。
+        m = re.match(r"^/session/([^/]+)/(summarize|compact)$", p)
+        if m:
+            sid = m.group(1)
+            ctx = _req("/api/context?sessionId=" + sid) or {}
+            with _LOCK:
+                s = _SESSIONS.get(sid)
+            if s is not None:
+                s["summary"] = {"additions": 0, "deletions": 0, "files": 0}
+                s.setdefault("time", {})["updated"] = now_ms()
+                broadcast({"type": "session.compacted", "properties": {"info": s}})
+                broadcast({"type": "session.updated", "properties": {"info": s}})
+            return self._json({"success": True, "context": ctx.get("context", {})})
 
         m = re.match(r"^/session/([^/]+)/message$", p)
         if m:
@@ -520,6 +607,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):                                   # noqa: N802
         p = self._path()
         body = self._body()
+
+        # 【/context-limit 命令走这里】前端发 PATCH /global/config {config:{...}}
+        # 或直接 {contextLimit/...}；把上下文上限转给我们后端的 /api/context。
+        if p in ("/global/config", "/config"):
+            cfg = body.get("config") if isinstance(body.get("config"), dict) else body
+            limit = None
+            for k in ("contextLimit", "context_limit", "limit", "tokens"):
+                if isinstance(cfg.get(k), (int, float)):
+                    limit = int(cfg[k])
+                    break
+            if limit is not None:
+                # 后端约定：tokens=0 表示不设限
+                _req("/api/context", {"sessionId": "", "tokens": limit})
+                broadcast({"type": "session.updated",
+                           "properties": {"info": {"contextLimit": limit}}})
+
+            # 【/models 选完模型走这里】把模型切换落到后端
+            want = None
+            for k in ("model", "modelID", "modelId"):
+                if isinstance(cfg.get(k), str) and cfg[k]:
+                    want = cfg[k]
+                    break
+            if want:
+                global MODEL_ID
+                MODEL_ID = want
+                # 本地量化用 file 名切换；认不出来就当普通模型名交给 mode 接口
+                _req("/api/runtime/local/model", {"file": want}) or _req(
+                    "/api/runtime/mode", {"mode": "local", "model": want})
+            return self._json({"success": True})
+
         m = re.match(r"^/session/([^/]+)$", p)
         if m:
             with _LOCK:
