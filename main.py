@@ -157,6 +157,9 @@ import 权限
 import 插件管理
 import 工具
 import 技能
+# 系统提示词正文（中文，译自 Claude Code 的真实系统提示词并按我们的工具/平台改造）。
+# 单独成文件是为了能独立改、独立看字数；接线点在 build_system_prompt 里。
+import 提示词
 
 # 【每个被内联模块各自原本的 __file__】有代码用它推算"程序装在哪"（例如技能目录：
 # `skills/repository.py` 往上三层才是安装根）。内联后 `__file__` 全是 main.py 的路径，
@@ -12206,6 +12209,13 @@ CONTEXT_ECONOMY = """【上下文怎么用才省钱】默认窗口是 16K，这�
 5. 裁剪前想先看看会删掉什么，用 context_prune 的 dry_run=true。
 """
 
+# 【提示词里不许留写给开发者看的说明】
+# 这段 MODE_STANDARD 原来在第 3 条后面跟了一句：
+#     "注：这里原来写的是'每轮只调用一个工具'，和主提示词（一次给最多 3 个）
+#      以及 maxToolsPerRound 默认 0（不限）自相矛盾，模型两头看会犹豫。"
+# 那是开发过程中的推理记录，却被原样拼进了系统提示词 —— 对 9B 模型是纯噪音
+# （它会去"权衡"这段自相矛盾的话）。规则本身没变，只是把说明挪到这个注释里。
+# 以后往这几个 PROMPT 常量里写东西，先问一句："这句是给模型看的，还是给我看的？"
 MODE_STANDARD = """## 当前模式：标准模式（STANDARD）
 
 你是全能型编程助手，拥有完整工具集（文件、Shell、Git、网络、代码工具）。
@@ -12213,10 +12223,7 @@ MODE_STANDARD = """## 当前模式：标准模式（STANDARD）
 行为准则：
 1. 收到任务先快速分析，然后立即动手执行，绝不停留在口头建议。
 2. 优先用工具实际读取、修改、运行代码，用真实结果说话。
-3. 互不依赖的调用一次给（最多 3 个）；有先后依赖的（得先看到结果才知道下一步）
-   一轮只给一个 —— 代码不会丢掉你给的调用，但一次给太多会拖慢。
-   注：这里原来写的是"每轮只调用一个工具"，和主提示词（"一次给最多 3 个"）
-   以及 maxToolsPerRound 默认 0（不限）自相矛盾，模型两头看会犹豫。
+3. 互不依赖的调用一次给（最多 3 个）；有先后依赖的（得先看到结果才知道下一步）一轮只给一个。
 4. 修改文件前先读取相关文件，修改后主动验证（编译/运行/测试）。
 5. 输出保持结构化：简短说明 → 工具调用 → 结果总结。
 6. 遇到错误时，先读错误信息再定位原因，不要盲目重试。
@@ -12320,6 +12327,114 @@ class _ToolCallAccumulator:
         self.args_builder: list[str] = []
 
 
+#: 环境探测缓存（一次进程只探一遍 —— 探测要起子进程，不能每轮提示词都探）。
+_ENV_PROBE_CACHE: dict[str, Any] | None = None
+
+#: 要探测"到底装没装"的命令。**只列模型爱瞎猜的那几个**：
+#: 实测本地模型会直接写 `which node npm python3 ollama` 一次问一串 —— 它默认这些
+#: 都存在。把真实结果写进提示词，它就不用猜了（也就不用写探测命令）。
+_ENV_PROBE_COMMANDS = (
+    "git", "python", "node", "npm", "pnpm", "bun", "uv", "pip",
+    "ollama", "docker", "cargo", "go", "java", "rg", "curl",
+)
+
+
+def probe_environment() -> dict[str, Any]:
+    r"""探测这台机器的真实环境，供系统提示词动态注入。
+
+    【为什么要动态探测，而不是把结论写死在提示词里】
+    写死只能写"本机装了什么"，用户换台机器就全错；而且实测模型**不会自己去探**，
+    它会直接把 `which node npm python3 ollama` 拼成一条命令发出来（Windows 上
+    `which` 还不存在）。这里在进程内探一遍、缓存住，提示词里就能明确写出
+    "已确认存在 / 未确认存在"，模型不必猜也不必探。
+
+    【为什么用 `shutil.which` 而不是跑 `where`】
+    which 在进程内就能查 PATH，不起子进程，快且不受 shell 差异影响；
+    提示词里再告诉模型"你自己要用 where"。
+
+    返回：{os, os_version, arch, shell, tools: {名字: 路径或 ""}}
+    """
+    global _ENV_PROBE_CACHE
+    if _ENV_PROBE_CACHE is not None:
+        return _ENV_PROBE_CACHE
+
+    # 【局部导入】本文件是 186 个模块内联成的，顶层导入区被引擎的注册逻辑夹着，
+    # 往里加东西风险大于收益；`platform` 只在这里用一次，就地导入最干净。
+    import platform as _platform
+
+    tools: dict[str, str] = {}
+    for name in _ENV_PROBE_COMMANDS:
+        try:
+            hit = shutil.which(name)
+        except Exception:                                 # noqa: BLE001
+            hit = None
+        tools[name] = str(hit or "")
+
+    info: dict[str, Any] = {
+        "os": _platform.system() or ("Windows" if os.name == "nt" else os.name),
+        "os_version": _platform.version() or "",
+        "arch": _platform.machine() or "",
+        "python_version": _platform.python_version(),
+        "tools": tools,
+    }
+    _ENV_PROBE_CACHE = info
+    return info
+
+
+def environment_prompt_section() -> str:
+    r"""把探测到的环境写成系统提示词里的一段（Windows 上额外给命令写法硬规则）。
+
+    【这段为什么必须存在】用户实测本地模型吐出过：
+        which node npm python3 ollama 2>&1; node --version 2>&1; python3 --version 2>&1
+    在 Windows 上**四处全错**：which 不存在、python3 不存在、ollama 没装、
+    一次把 4 条不相关命令塞进一个 command。根因是提示词里那段"执行环境是 Windows"
+    因为平台判断写错（`"windows" in sys.platform` 在 win32 上恒为 False）**从未生效**。
+    修好判断之后，这里按"错在哪就写清哪"逐条补齐。
+    """
+    env = probe_environment()
+    out: list[str] = []
+
+    if os.name == "nt":
+        out.append("## 执行环境（Windows —— 命令写法有硬规则，违反必然报错）\n")
+        out.append("系统：" + env["os"] + " " + env["os_version"] + "（" + env["arch"] + "）\n")
+        out.append("execute_command 走 **PowerShell**（不是 bash、不是 cmd）：\n")
+        out.append("- `ls` `cat` `rm` `cp` `mv` `pwd` 可用（PowerShell 内置别名），"
+                   "多条命令之间用 `;` 分隔。\n")
+        out.append("- **不要用 `&&` / `||`**：Windows PowerShell 5.1 不认，会直接语法报错。"
+                   "要「前一条成功才跑后一条」就写 `A; if ($?) { B }`。\n")
+        out.append("- **没有 `which`** → 用 `where 名字`（例：`where git`）。\n")
+        out.append("- **没有 `python3`** → 用 `python`（本机 " + env["python_version"] + "）。\n")
+        out.append("- 不要写 `2>&1`、`2>/dev/null` 这类 Unix 重定向；"
+                   "命令的输出本来就会被完整收走。\n")
+        out.append("- 路径用反斜杠；**含空格或中文的路径必须加引号**。\n")
+        out.append("- 不要把 `cd` 当成必写项：execute_command 是**一个持续运行的终端**"
+                   "（同一工作区共用一个会话），切过的目录、设过的变量都会留到下一次调用。\n")
+        out.append("- **一条 command 只做一件相关的事**：不要把好几条互不相关的命令用 `;` 串成一条"
+                   "（读起来乱、失败时也不知道是哪条坏的）。互不相关的操作请拆成多个工具调用，"
+                   "一轮里一起发。\n")
+        out.append("\n### 这台机器上实际装了什么（已探测，别再猜）\n")
+        have = [n for n, p in env["tools"].items() if p]
+        miss = [n for n, p in env["tools"].items() if not p]
+        if have:
+            out.append("**已确认存在**：" + "、".join(have) + "\n")
+        if miss:
+            out.append("**未安装 / PATH 里没有**：" + "、".join(miss)
+                       + " —— 不要假设它存在，也不要为了用不上它去装它；"
+                         "确实需要就先 `where 名字` 探一下，探不到就换别的办法。\n")
+        out.append("上面没列到的命令表示**情况不明**：要用就先 `where 名字` 探一下再决定。\n")
+    else:
+        out.append("## 执行环境\n")
+        out.append("系统：" + env["os"] + "（" + env["arch"] + "）；execute_command 走 `sh`。\n")
+        have = [n for n, p in env["tools"].items() if p]
+        miss = [n for n, p in env["tools"].items() if not p]
+        if have:
+            out.append("**已确认存在**：" + "、".join(have) + "\n")
+        if miss:
+            out.append("**未安装**：" + "、".join(miss) + "（不要假设存在）\n")
+    out.append("\n")
+    return "".join(out)
+
+
 class AgentLoop:
     """Agent 主循环。
 
@@ -12398,15 +12513,26 @@ class AgentLoop:
         p.append("## 工作区\n")
         p.append((workspace_path if workspace_path is not None else "(未设置)") + "\n")
         p.append("文件与命令都在此工作区内；path 可用相对路径（相对工作区）或绝对路径。\n")
-        # 执行环境：实测模型爱写 Unix 命令，在 Windows 的 cmd 里 ls/cat/rm 都报
-        # "'ls' 不是内部或外部命令"。现在 execute_command 走 PowerShell
-        # （ls/cat/rm/cp/mv/pwd 都是内置别名），这里把环境说清楚。
-        if "win" in os.name.lower() or "windows" in sys.platform.lower():
-            p.append("执行环境是 **Windows**，execute_command 走 PowerShell：ls/cat/rm/cp/mv/pwd 都能用，")
-            p.append("但多条命令之间用 `;` 分隔，不要用 `&&`（Windows PowerShell 不认）。\n")
-            p.append("execute_command 是**一个持续运行的终端**（同一工作区共用一个会话）：")
-            p.append("cd 切过的目录、设过的变量和函数都会留到下一次调用，不用每条命令都重新 cd。\n")
-        p.append("\n")
+        # 执行环境：实测模型爱写 Unix 命令（`which node npm python3 ollama` 这种）。
+        #
+        # 【这里曾经是死代码】原判断写成：
+        #     if "win" in os.name.lower() or "windows" in sys.platform.lower():
+        # 而在 Windows 上 os.name == "nt"（不含 "win"）、sys.platform == "win32"
+        # （不含 "windows"）—— **两个条件恒为 False**，整段 Windows 规则从未进过提示词。
+        # 用户实测的证据：模型在 Windows 上吐出
+        #     which node npm python3 ollama 2>&1; node --version 2>&1; ...
+        # 四处全错（which 不存在、python3 不存在、ollama 没装、把 4 条不相关命令串一条）。
+        # 现在：判断按项目统一写法（`os.name == "nt"`，与 L7443/L20050 一致），
+        # 内容改为动态探测 + 逐条硬规则，见 environment_prompt_section()。
+        p.append(environment_prompt_section())
+
+        # 行为规范（译自 Claude Code 的真实系统提示词，工具名/平台/调用格式已按我们改造，
+        # 见 提示词.py 的文件头）。**放在这么靠前是有意的** —— 本文件多次实测：
+        # 模型只看前几屏，靠后的段落它基本不遵守。
+        # 原样保留后面的工作区、模式、技能、输出纪律、工具清单 —— 那些是本地模型
+        # 跑得动的关键（尤其工具清单 + 参数签名，文本通道下它是唯一说明）。
+        p.append(提示词.SYSTEM_PROMPT_ZH)
+        p.append("\n\n")
 
         # 根据模式添加专属提示词（每个模式独立撰写，行为规则各不相同）
         p.append(self.mode_instructions(mode))
@@ -22310,7 +22436,32 @@ class ExecuteCommandTool(ToolPlugin):
     def name(self): return "execute_command"
 
     @property
-    def description(self): return "执行命令"
+    def description(self):
+        # 【为什么描述要写这么长】原生通道下模型看到的**就是这一段**（系统提示词那段
+        # 它也看得到，但描述紧挨着工具定义，离决策最近）。原来这里只有「执行命令」
+        # 四个字，模型只能靠自己的先验 —— 实测它会在 Windows 上写出
+        #     which node npm python3 ollama 2>&1; node --version 2>&1; ...
+        # 四处全错（which/python3/2>&1 都不存在于这台机器），还会拿
+        # Get-ChildItem -Recurse 去扫整个 C:\ 找人。
+        # 参考 Claude Code 的 PowerShell 工具描述（Piebald-AI/claude-code-system-prompts
+        # 的 tool-description-powershell.md）—— 它整段讲了"Unix 命令在 PowerShell 里
+        # 不存在，改用等价写法"。这里按 9B 模型能吃的长度压到 10 行内。
+        return (
+            "在命令行里执行一条命令（终端操作：git、构建、跑测试、装依赖等）。\n"
+            "【不要用它做文件操作】读/写/改/删/搜文件请用对应的专用工具，不要用 shell 代替。\n"
+            "环境是 **Windows + PowerShell**，不是 bash：\n"
+            "- 没有 `which` → 用 `where 名字`；没有 `python3` → 用 `python`。\n"
+            "- 不要用 `&&` / `||`（PowerShell 5.1 不认）；多条命令用 `;` 分隔，"
+            "要「前一条成功才跑后一条」就写 `A; if ($?) { B }`。\n"
+            "- 不要写 `2>&1` / `2>/dev/null` 这类 Unix 重定向；输出会被完整收走。\n"
+            "- 含空格或中文的路径要加引号；可用 `ls` `cat` `rm` `cp` `mv` `pwd` 这些别名。\n"
+            "- 工作目录会保持，不必每条命令都 `cd`。\n"
+            "- **一条命令只做一件相关的事**：不要用 `;` 把互不相关的命令串成一条；"
+            "互不相关的操作请拆成多个工具调用，一轮里一起发。\n"
+            "- 不确定某个命令装没装，先 `where 名字` 探一下再决定；**不要假设它存在**"
+            "（系统提示词里列了本机已确认存在的命令）。\n"
+            "- 不要跑会卡住等输入的交互式命令（`pause`、`Read-Host`、`git rebase -i` 等）。"
+        )
 
     @property
     def category(self): return ToolCategory.SHELL

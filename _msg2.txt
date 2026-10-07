@@ -1,0 +1,54 @@
+fix(prompt): 环境段是死代码（平台判断写错）+ 补齐 Windows 命令硬规则 + 动态探测环境
+
+【用户报的问题】本地模型在 Windows 上吐出：
+    which node npm python3 ollama 2>&1; node --version 2>&1; python3 --version 2>&1
+四处全错：which 不存在、python3 不存在、ollama 没装、把 4 条不相关命令串成一条。
+
+【根因：提示词里那段 Windows 规则从未生效（死代码）】
+build_system_prompt 里原本有：
+    if "win" in os.name.lower() or "windows" in sys.platform.lower():
+实测在 Windows 上：
+    os.name     == "nt"     → "win" in "nt"          == False
+    sys.platform == "win32" → "windows" in "win32"   == False
+两个条件恒为 False ⇒ 整段 Windows 说明一次都没进过提示词。
+（项目别处用的是 `os.name == "nt"` / `sys.platform == "win32"`，这里没跟上。）
+
+【改动】
+1. 新增 probe_environment()：进程内探测 OS / 版本 / 架构 / python 版本，
+   并用 shutil.which 查一组常用命令装没装（git/python/node/npm/ollama/docker/...）。
+   结果缓存，一次进程只探一遍。
+2. 新增 environment_prompt_section()：按探测结果生成环境段 ——
+   · Windows 硬规则：没有 which→用 where；没有 python3→用 python；
+     不要用 && / ||（PS 5.1 不认）→ 写 `A; if ($?) { B }`；
+     不要写 2>&1 / 2>/dev/null；含空格或中文的路径要加引号；
+     工作目录会保持不必每条 cd；**一条 command 只做一件相关的事**
+   · **本机实际装了什么**：已确认存在 / 未安装 两份清单（模型不必猜、也不必探）
+   · 非 Windows 分支给一份简版
+3. 修掉那个恒为 False 的平台判断，改为环境段函数（注释里记了死代码这件事）。
+4. execute_command 的工具描述从「执行命令」四个字补到 580 字：
+   原生通道下模型看到的就是这段（紧挨工具定义，离决策最近），
+   原来只有四个字，等于把平台差异全交给模型先验 —— 这就是它写 which/python3 的土壤。
+   内容参考 Claude Code 的 tool-description-powershell（Piebald-AI/claude-code-system-prompts），
+   按 9B 能吃的长度压到 10 行内。同时写明"文件操作用专用工具，别用 shell 代替"。
+5. 清掉混进提示词的开发者注释：MODE_STANDARD 第 3 条后面原本跟着
+   "注：这里原来写的是…与 maxToolsPerRound 默认 0 自相矛盾…" —— 那是写给人看的
+   推理记录，却被原样拼进了系统提示词（对 9B 是纯噪音）。挪到 Python 注释里。
+
+【验证】
+· 自带 7 套测试 163/163 全绿（改前改后一致）
+· 提示词 dump：环境段确实进去了 ——
+    "系统：Windows 10.0.26200（AMD64）"
+    "已确认存在：git、python、node、npm、pnpm、bun、pip、docker、cargo、java、curl"
+    "未安装：uv、ollama、go、rg"
+· 真模型 A/B（关掉环境段 vs 开启）：**两次结论相反** ——
+    第一次 A=16 次工具调用 / B=4 次（B 好）
+    第二次 A=6 次 / B=8 次，且 B 那次还去 Get-ChildItem -Recurse 扫 C:\（B 差）
+  ⇒ 单次采样被模型的随机性主导，**不构成有效测量**；要出数字得每组 ≥5 次。
+  能确证的是确定性部分：死代码确实修好了、环境清单确实进了提示词、
+  工具描述确实从 4 字变 580 字、163 个用例没红。
+
+【该改但本次没改】
+· 其余 7 个工具的描述仍是 4~11 个字（read_file「读取文件内容」、web_search「联网搜索」…），
+  同样偏薄；本次只动了引起用户可见错误的 execute_command。
+· 提示词总量从 1466 → 2208 字符（+51%）：对 9B 是负担，但环境段换来的是
+  "不必猜也不必探"，先留着；若后续发现拖慢首字，优先压缩"输出纪律"那段的重复表述。
