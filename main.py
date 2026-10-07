@@ -12402,7 +12402,10 @@ def environment_prompt_section() -> str:
                    "多条命令之间用 `;` 分隔。\n")
         out.append("- **不要用 `&&` / `||`**：Windows PowerShell 5.1 不认，会直接语法报错。"
                    "要「前一条成功才跑后一条」就写 `A; if ($?) { B }`。\n")
-        out.append("- **没有 `which`** → 用 `where 名字`（例：`where git`）。\n")
+        out.append("- **没有 `which`** → 用 **`where.exe 名字`**（例：`where.exe git`）\n"
+               "  或 `Get-Command 名字`。\n"
+               "  **注意：PowerShell 里的 `where` 是 `Where-Object` 的别名，不是查找命令** ——\n"
+               "  `where.exe git` 什么都不会输出（实测），会让模型误以为『没装』，必须写 `where.exe`。\n")
         out.append("- **没有 `python3`** → 用 `python`（本机 " + env["python_version"] + "）。\n")
         out.append("- 不要写 `2>&1`、`2>/dev/null` 这类 Unix 重定向；"
                    "命令的输出本来就会被完整收走。\n")
@@ -12420,8 +12423,8 @@ def environment_prompt_section() -> str:
         if miss:
             out.append("**未安装 / PATH 里没有**：" + "、".join(miss)
                        + " —— 不要假设它存在，也不要为了用不上它去装它；"
-                         "确实需要就先 `where 名字` 探一下，探不到就换别的办法。\n")
-        out.append("上面没列到的命令表示**情况不明**：要用就先 `where 名字` 探一下再决定。\n")
+                         "确实需要就先 `where.exe 名字` 探一下，探不到就换别的办法。\n")
+        out.append("上面没列到的命令表示**情况不明**：要用就先 `where.exe 名字` 探一下再决定。\n")
     else:
         out.append("## 执行环境\n")
         out.append("系统：" + env["os"] + "（" + env["arch"] + "）；execute_command 走 `sh`。\n")
@@ -22529,7 +22532,7 @@ class ExecuteCommandTool(ToolPlugin):
             "在命令行里执行一条命令（终端操作：git、构建、跑测试、装依赖等）。\n"
             "【不要用它做文件操作】读/写/改/删/搜文件请用对应的专用工具，不要用 shell 代替。\n"
             "环境是 **Windows + PowerShell**，不是 bash：\n"
-            "- 没有 `which` → 用 `where 名字`；没有 `python3` → 用 `python`。\n"
+            "- 没有 `which` → 用 `where.exe 名字`；没有 `python3` → 用 `python`。\n"
             "- 不要用 `&&` / `||`（PowerShell 5.1 不认）；多条命令用 `;` 分隔，"
             "要「前一条成功才跑后一条」就写 `A; if ($?) { B }`。\n"
             "- 不要写 `2>&1` / `2>/dev/null` 这类 Unix 重定向；输出会被完整收走。\n"
@@ -22537,7 +22540,7 @@ class ExecuteCommandTool(ToolPlugin):
             "- 工作目录会保持，不必每条命令都 `cd`。\n"
             "- **一条命令只做一件相关的事**：不要用 `;` 把互不相关的命令串成一条；"
             "互不相关的操作请拆成多个工具调用，一轮里一起发。\n"
-            "- 不确定某个命令装没装，先 `where 名字` 探一下再决定；**不要假设它存在**"
+            "- 不确定某个命令装没装，先 `where.exe 名字` 探一下再决定；**不要假设它存在**"
             "（系统提示词里列了本机已确认存在的命令）。\n"
             "- 不要跑会卡住等输入的交互式命令（`pause`、`Read-Host`、`git rebase -i` 等）。"
         )
@@ -22722,6 +22725,20 @@ def build_registry(workspace: Path) -> PluginRegistry:
     for cls in (ReadFileTool, HeadTailTool, WriteFileTool, ExecuteCommandTool, MoveFileTool,
                 ContextWindowTool, WebSearchTool, ListDirectoryTool):
         reg.register(cls(workspace))
+    # 【工具补全】提示词/别名表里**广告了 57 个工具名**，而这里原来只注册 8 个
+    # （其中 execute_command / move_file / context_window / web_search 还是窄桩）。
+    # 其余 49 个模型喊了只会得到"未找到工具" —— 用户反复遇到的"工具不能用"就是它。
+    # 真实现写在 工具集.py（独立模块，避免改动这个 1.1 MB 的内联文件），
+    # 基类从这里传进去（避免循环导入）。注册在原有 8 个**之后** → 同名会覆盖桩实现
+    # （引擎自己会打"插件已存在，将覆盖"日志）。
+    try:
+        import 工具集
+        for _cls in 工具集.build_tools(globals()):
+            reg.register(_cls(workspace))
+    except Exception:                                      # noqa: BLE001
+        # 工具补全失败不该让整个后端起不来 —— 但也不能静默（本项目的教训）。
+        import traceback as _tb
+        print("[工具集] 注册失败，只有基础 8 个工具可用: " + _tb.format_exc()[-400:], flush=True)
     return reg
 
 
