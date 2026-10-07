@@ -12405,7 +12405,8 @@ def environment_prompt_section() -> str:
         out.append("- **没有 `which`** → 用 **`where.exe 名字`**（例：`where.exe git`）\n"
                "  或 `Get-Command 名字`。\n"
                "  **注意：PowerShell 里的 `where` 是 `Where-Object` 的别名，不是查找命令** ——\n"
-               "  `where.exe git` 什么都不会输出（实测），会让模型误以为『没装』，必须写 `where.exe`。\n")
+               "  裸写 `where git` 会走别名、**什么都不输出**（实测），会让模型误以为『没装』；\n"
+               "  必须写带扩展名的 `where.exe git`。\n")
         out.append("- **没有 `python3`** → 用 `python`（本机 " + env["python_version"] + "）。\n")
         out.append("- 不要写 `2>&1`、`2>/dev/null` 这类 Unix 重定向；"
                    "命令的输出本来就会被完整收走。\n")
