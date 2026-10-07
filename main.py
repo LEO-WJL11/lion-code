@@ -10918,10 +10918,14 @@ def parse(text: str | None) -> list[Call]:
                 args[pm.group(1).strip()] = _unescape(pm.group(2))
             if not args:
                 args.update(_parse_json_arguments(body))
-            # 一个参数都没解析出来时，不硬凑成"无参调用"：那会让工具回一句
-            # "缺少必需参数"，比直接放弃更容易误导。只有能读出参数才认。
-            if args:
-                calls.append(Call(name, args))
+            # 【无参调用必须收】system_info / timestamp 这类工具**本来就不要参数**，
+            # 项目自己的提示词就是这么教的（main.py 里那行样例）：
+            #   <tool_call><function=system_info></function></tool_call>
+            # 严格路径一直是接受的（它无条件 append），兜底路径也必须一致。
+            # 之前这里写"解析不出参数就不硬凑"，把合法的无参调用整条吃掉了 ——
+            # 实测：模型一轮里第一个是带参的 directory_tree、第二个就是无参
+            # system_info，第二个被丢掉。
+            calls.append(Call(name, args))
     return calls
 
 
@@ -22669,6 +22673,28 @@ def run_parser_samples() -> None:
     check("未闭合块的残骸不会当正文显示给用户（strip_calls 清干净）",
           "<function" not in parsing.strip_calls(
               '<tool_call><function=directory_tree>{"path": "."}'))
+
+    # 【无参工具不能被吃掉】system_info / timestamp 这类工具**本来就不要参数**，
+    # 项目自己的提示词就是这么教的（见 build_*_prompt 里的样例）：
+    #   <tool_call><function=system_info></function></tool_call>
+    # 用户实测贴过的真实两连发：
+    #   <tool_call><function=directory_tree><parameter=path>.</parameter>…</function></tool_call>
+    #   <tool_call><function=system_info></function></tool_call>          ← 第二个曾被丢掉
+    tcs = loop.parse_tool_calls_from_text(
+        "<tool_call><function=system_info></function></tool_call>")
+    check("无参工具（严格闭合）解析出来且参数为空",
+          len(tcs) == 1 and tcs[0].name == "system_info" and tcs[0].arguments == {})
+    tcs = loop.parse_tool_calls_from_text(
+        '<tool_call><function=directory_tree><parameter=path>.</parameter>'
+        "<parameter=maxDepth>2</parameter></function></tool_call>"
+        "<tool_call><function=system_info></function></tool_call>")
+    check("用户实测的双连发：两个都解析出来（含无参的 system_info）",
+          len(tcs) == 2 and tcs[0].name == "directory_tree" and tcs[1].name == "system_info"
+          and tcs[1].arguments == {})
+    tcs = loop.parse_tool_calls_from_text(
+        "<tool_call><function=system_info></tool_call>")     # 未闭合 + 无参
+    check("未闭合的无参工具也要收（兜底路径与严格路径行为一致）",
+          len(tcs) == 1 and tcs[0].name == "system_info")
 
     loose = "<name>read_file</name><arguments>{\"path\": \"b.txt\"}</arguments>"
     tcs = loop.parse_tool_calls_from_text(loose)

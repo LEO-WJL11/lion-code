@@ -1,0 +1,27 @@
+fix(tools): 无参工具被兜底解析吃掉（system_info / timestamp 这类）
+
+【用户实测】模型一轮里吐两个调用：
+    <tool_call><function=directory_tree><parameter=path>.</parameter><parameter=maxDepth>2</parameter></function></tool_call>
+    <tool_call><function=system_info></function></tool_call>
+第二个（无参）没有执行。
+
+【排查】
+1. system_info 是真工具：别名表 L10668 有它、描述表 L12130 有它、
+   工具.py L357 注册了 SystemInfoTool
+2. 它本来就**不要参数** —— 项目自己的提示词就是这么教的（main.py 里
+   build_*_prompt 的样例：<tool_call><function=system_info></function></tool_call>）
+3. 严格解析路径一直是接受无参调用的（无条件 append），
+   只有上一轮新加的「未闭合兜底」路径写了"解析不出参数就不硬凑" ✗
+   → 两条路径行为不一致，是我引入的回归
+
+【改动】main.py parsing.parse 的兜底分支：无条件 append，与严格路径一致。
+
+【回归】自带 7 套测试 163/163 全绿，新增 3 个用例：
+  · 无参工具（严格闭合）解析出来且参数为空
+  · 用户实测的双连发：两个都解析出来（含无参的 system_info）
+  · 未闭合的无参工具也要收（兜底与严格路径行为一致）
+
+【真模型验证】提问"列出当前目录，并告诉我这台机器的 CPU 和内存配置"
+  → [TOOL_CALL] list_directory 执行完成
+  → [TOOL_CALL] system_info    执行完成     ← 修的就是这条
+  帧统计 {'TEXT': 304, 'TOOL_CALL': 2, 'DONE': 1}
