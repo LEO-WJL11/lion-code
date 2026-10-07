@@ -1110,6 +1110,13 @@ DEFAULTS: dict[str, Any] = {
     "provider": "lionbox-local",
     "model": "lion-models1",
     "toolCallMode": "auto",
+    # 【模型审查默认关（本仓库决定）】原来每次"危险工具调用"都会**再跑一次模型对话**
+    # 让另一个模型判 ALLOW/DENY（见 `_approval_review`）。本地跑的是 **9B IQ4_XS 4bit**:
+    #   · 它当审查者不准（容易误判 ✓ 该拦的不拦、不该拦的拦 ✓）
+    #   · 每次多一次几秒到几十秒的 LLM 往返 ✗ 而本地一轮本来就要十几秒 ✓
+    # 现在策略改成：**规则表为主判定**（`_rule_based_tool_decision` ✓ 确定性、可审计 ✓），
+    # 模型审查降为**可选兜底**，要用就把它设成 true ✓（云端大模型当审查者时才值得开 ✓）。
+    "approvalReview": False,
     # 本地 llama.cpp 运行时参数（键名与 Java 版 /api/runtime/local/config 一致）
     "llama": {
         "modelFile": "lion-merged-IQ4_XS.gguf",
@@ -8540,8 +8547,17 @@ class OpenAICompatibleAdapter(ModelAdapter):
                     node["tool_calls"] = arr
 
             # 思考内容（thinking 模式必须原样回传，否则 API 报 400）
-            if msg.reasoning_content and msg.reasoning_content.strip():
-                node["reasoning_content"] = msg.reasoning_content
+            # 【必须 getattr ✗ 不能直接点属性】上下文被压缩过之后，历史里会混进
+            # `_Msg`（定义见本文件 `class _Msg` ✓ `__slots__` 里**没有** reasoning_content ✗）。
+            # 它的 docstring 写着"与 loop 层的真实消息类鸭子类型兼容" ✓ 但这里直接
+            # `msg.reasoning_content` 就把它当成了真实消息类 ✗ →
+            #   AttributeError: '_Msg' object has no attribute 'reasoning_content'
+            # 实测触发链：`read_file` 读大文件（结果很大）→ 触发上下文压缩 →
+            # 压缩产出 _Msg ✓ → 下一轮构建请求时崩 ✗ 整个任务在这里断掉 ✓
+            # （真模型 e2e 抓到的：3 个工具都跑完了，第 4 次模型调用直接 ERROR ✗）
+            _reasoning = getattr(msg, "reasoning_content", None)
+            if _reasoning and str(_reasoning).strip():
+                node["reasoning_content"] = _reasoning
 
             if msg.tool_call_id is not None:
                 node["tool_call_id"] = msg.tool_call_id
@@ -10932,6 +10948,197 @@ def parse(text: str | None) -> list[Call]:
     return calls
 
 
+# ---------------------------------------------------------------------------
+# 流式可见性过滤（本仓库新增）
+# ---------------------------------------------------------------------------
+#: 可能是"工具调用标签开头"的片段 —— 结尾命中这些就扣住，等下一片再判断。
+#: 顺序无关，只做前缀判断；`<` 单独一个也算（标签可能刚开了个头）。
+_PARTIAL_TAG_PREFIXES = (
+    "<", "<t", "<to", "<too", "<tool", "<tool_", "<tool_c", "<tool_ca",
+    "<tool_cal", "<tool_call", "<tool_call>",
+    "<f", "<fu", "<fun", "<func", "<funct", "<funci", "<functi", "<functio",
+    "<function", "<function=", "<function =",
+    "<p", "<pa", "<par", "<para", "<param", "<parame", "<paramet",
+    "<parameter", "<parameter=", "<parameter =",
+    "</", "</t", "</to", "</tool", "</tool_", "</tool_c", "</tool_ca",
+    "</tool_call", "</tool_call>",
+    "</f", "</fu", "</fun", "</func", "</funct", "</funci", "</functi",
+    "</functio", "</function", "</function>",
+    "</p", "</pa", "</par", "</para", "</param", "</parame", "</paramet",
+    "</parameter", "</parameter>",
+)
+
+#: 成对/孤立标签的统一丢法 —— **连标签中间的值一起丢**。
+#: 为什么连值也丢：真模型泄漏的那串里，`<parameter=command>git --version</parameter>`
+#: 中间的值是**参数原文** ✓ 留着会被当正文显示 ✓ 而块已经残缺到无法判断边界 ✓
+#: （宁可多丢一点，也不让标签漏到用户眼前 ✓）
+_SPANS = (
+    re.compile(r"(?s)<tool_call>.*?</tool_call>"),
+    re.compile(r"(?s)<function\s*=[^>]*>.*?</function>"),
+    re.compile(r"(?s)<parameter\s*=[^>]*>.*?</parameter>"),
+    re.compile(r"(?s)[A-Za-z_]*unction\s*=[^>]*>.*?</function>"),      # 词中残片
+    re.compile(r"(?s)[A-Za-z_]*arameter\s*=[^>]*>.*?</parameter>"),    # 词中残片
+    re.compile(r"</?tool_call\s*>"),
+    re.compile(r"</?function\b[^>]*>"),
+    re.compile(r"</?parameter\b[^>]*>"),
+    re.compile(r"[A-Za-z_]*unction\s*=\s*[A-Za-z_][\w.\-]*\s*>"),
+    re.compile(r"[A-Za-z_]*arameter\s*=\s*[A-Za-z_][\w.\-]*\s*>"),
+)
+
+#: "隐式块"开头：没有 `<tool_call>` 外壳的残片形态（真模型实测 `unction=execute_command>…`
+#: 连 `<f` 都被切掉了 ✓ 只认 `<tool_call>` 的写法够不着 ✓）
+_IMPLICIT_OPEN = (
+    re.compile(r"<function\s*="),
+    re.compile(r"<parameter\s*="),
+    re.compile(r"[A-Za-z_]*unction\s*="),
+    re.compile(r"[A-Za-z_]*arameter\s*="),
+)
+
+
+class ToolCallStreamFilter:
+    """流式增量里，把"可能是工具调用块"的部分扣住，只放行确定是正文的内容。
+
+    【为什么必须是流式过滤，而不是事后 strip】
+    strip 只在一轮**结束后**对累计文本做（`remove_tool_call_blocks`），
+    而流式是把增量**逐片** yield 给用户的 —— XML 在结束前就已经显示在屏幕上了 ✗
+    （真模型实测：完整块 + 正文一起出现在最终回答里 ✓ 而把那串喂给 strip 是能剥掉的 ✓
+      ⇒ 问题在"没被用上"，不在那个函数 ✓）
+    """
+
+    __slots__ = ("_buf", "_in_block")
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_block = False          # 是否已进入未闭合的 <tool_call> 块
+
+    def feed(self, delta: str) -> str:
+        """喂一片增量，返回**现在就能安全显示**的部分（可能为空）。"""
+        if not delta:
+            return ""
+        self._buf += delta
+        return self._drain(final=False)
+
+    def flush(self) -> str:
+        """一轮结束时调用：把扣住的剩余部分中安全的部分交出来。"""
+        return self._drain(final=True)
+
+    # -- 内部 ----------------------------------------------------------------
+    def _drain(self, final: bool) -> str:
+        """把缓冲里"确定是正文"的部分吐出来。
+
+        【核心规则（重写过的，前一版是死路）】
+        找到缓冲里**第一个**工具调用标签/残片的位置 s：
+          · 没有 → 吐掉（末尾若是"像标签开头"的残尾就先扣住，见 _partial_tail_len）
+          · 有   → 只吐 buf[:s]，**从 s 起整段进入块模式**，扣到 </tool_call> 为止
+        【前一版的错】它是"把孤立的开始标签逐个 sub 掉、然后继续" ✗ ——
+        标签被丢掉后，**剩下的参数值看起来就是普通正文** ✗ 于是被吐出去 ✓
+        （实测片 0-64：`<tool_call><function=…><parameter=path>C:\\Users\\Leo\\Des`
+          吐出 `C:\\Users\\Leo\\Des` ✗ 缓冲还是空的 ✓ 块模式根本没进 ✓）
+        ⇒ 所以不是"丢标签"，而是"从第一个标签起就整块扣住" ✓
+        """
+        out: list[str] = []
+        while True:
+            if self._in_block:
+                # 块模式：整块丢到 </tool_call>（含中间的参数值）
+                # 找不到（被截断）→ 继续扣；一轮结束时仍未闭合 → 整个丢掉 ✓
+                k = self._buf.find("</tool_call>")
+                if k < 0:
+                    if final:
+                        self._buf = ""
+                        self._in_block = False
+                    break
+                self._buf = self._buf[k + len("</tool_call>"):]
+                self._in_block = False
+                continue
+
+            # ① 第一个工具调用标签/残片的位置
+            s = self._first_tag_at(self._buf)
+            if s >= 0:
+                out.append(self._buf[:s])
+                self._buf = self._buf[s:]
+                self._in_block = True
+                continue
+
+            # ② 没有标签：结尾若是"像标签开头"的残尾 → 扣住（结束时丢掉 ✗ 不能吐）
+            hold = self._partial_tail_len(self._buf)
+            if hold:
+                out.append(self._buf[: len(self._buf) - hold])
+                self._buf = "" if final else self._buf[len(self._buf) - hold:]
+                break
+
+            # ③ 安全正文，全部吐掉
+            out.append(self._buf)
+            self._buf = ""
+            break
+        return "".join(out)
+
+    @staticmethod
+    def _first_tag_at(buf: str) -> int:
+        """缓冲里第一个工具调用标签/残片的起点（没有则 -1）。
+
+        识别：完整标签（`<tool_call>` / `<function=…>` / `<parameter=…>` 及其闭合形式 ✓）
+              以及**词中残片**（`…unction=名字` / `…arameter=名字` ✓ —— 真模型实测
+              `<function` 被切成 `unction` 过 ✗）。
+        """
+        best = -1
+        for rx in _SPANS:
+            m2 = rx.search(buf)
+            if m2 is not None and (best < 0 or m2.start() < best):
+                best = m2.start()
+        for rx in _IMPLICIT_OPEN:
+            for m2 in rx.finditer(buf):
+                if m2.start() > 0 and buf[m2.start() - 1] == "<":
+                    continue          # 正规标签的一部分，已被 _SPANS 覆盖
+                if best < 0 or m2.start() < best:
+                    best = m2.start()
+        return best
+
+    @staticmethod
+    def _partial_tail_len(buf: str) -> int:
+        """结尾有多长的"可能是标签开头"的尾巴（0 表示结尾是安全的正文）。"""
+        lt = buf.rfind("<")
+        if lt >= 0:
+            tail = buf[lt:]
+            if ">" not in tail:
+                # 【只认"字母前缀"，别用"长度<=12"这种粗判据】
+                # 粗判据会把**正文里的数学小于号**也扣住 ✗，而结束时扣住的东西会被丢掉 ✗
+                # → 实测「如果 a < b … 那么 a < c。」被截成「…那么 a 」✗。
+                # 正确的判据：`<` 后面要么什么都没有（还可能长出标签 ✓），
+                # 要么是某个标签名的**字母前缀**（`<t` `<to` `<tool` `<f` `<fu` `<p` `<pa`… ✓）。
+                # `< c` 里紧跟的是空格 → 不是标签 → 安全放行 ✓。
+                s = tail[1:]
+                if s.startswith("/"):
+                    s = s[1:]
+                # 【别用 s.isalpha() ✗】标签名里有下划线（`tool_call` ✓）——
+                # `<tool_` 在 isalpha() 下是 False ✗ → 扣不住 → 整段漏给用户 ✓
+                # （实测：`[6] ch='_' 吐出='<tool_'` ✓）。用 [A-Za-z_]+ 才覆盖得了 ✓。
+                if s == "" or (re.fullmatch(r"[A-Za-z_]+", s)
+                               and any(name.startswith(s.lower())
+                                       for name in ("tool_call", "function", "parameter"))):
+                    return len(tail)
+                head = s.split("=")[0]
+                if "=" in s and head.lower() in ("function", "parameter", "tool_call"):
+                    return len(tail)
+        # 词中残片：`…unction=` / `…arameter=` 开了头还没到 `>`
+        m = re.search(r"[A-Za-z_]{0,10}(?:unction|arameter)\s*(?:=\s*[A-Za-z_.\-]*)?$", buf)
+        if m and m.group(0) and ">" not in m.group(0):
+            frag = m.group(0)
+            if len(frag) >= 4 and (frag.endswith("unction") or frag.endswith("arameter")
+                                   or "unction" in frag or "arameter" in frag):
+                return len(frag)
+        # 【半截词也要扣】流式是一个字符一个字符来的 —— `unction=` 会先到 `u`、`un`、
+        # `unc`…（实测分片=1 时前半截 `unction=` 会漏出去 ✗）。只要结尾这段字母**有可能
+        # 长成** `unction` / `arameter`（是它们的前缀 ✓ 或以它们结尾 ✓），就先扣住。
+        # 代价只是"多等一个字符"（下一个字符不是续写就立刻放行 ✓），可以接受 ✓。
+        m2 = re.search(r"([A-Za-z_]{1,12})$", buf)
+        if m2:
+            w = m2.group(1)
+            if (any(full.startswith(w) for full in ("unction", "arameter"))
+                    or w.endswith("unction") or w.endswith("arameter")):
+                return len(w)
+        return 0
+
+
 def strip_calls(text: str | None) -> str:
     """把模板原生的工具调用块从正文里删掉，剩下的才是给用户看的文字。
 
@@ -13186,6 +13393,9 @@ class AgentLoop:
 
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
+            # 【流式可见性过滤】见 ToolCallStreamFilter 的注释：strip 只在轮末做，
+            # 而增量是实时吐给用户的 → 工具调用 XML 会在结束前就显示出来（真模型实测）。
+            visible_filter = ToolCallStreamFilter()
             accumulators: dict[int, _ToolCallAccumulator] = {}
             last_finish: list[str | None] = [None]
             stream_error: list[BaseException] = []
@@ -13196,7 +13406,9 @@ class AgentLoop:
                     delta_text = _chunk_delta_text(chunk)
                     if delta_text:
                         content_parts.append(delta_text)
-                        yield AgentChunk.text(delta_text)
+                        visible = visible_filter.feed(delta_text)
+                        if visible:
+                            yield AgentChunk.text(visible)
                     rc = _chunk_reasoning(chunk)
                     if rc:
                         reasoning_parts.append(rc)
@@ -13223,6 +13435,10 @@ class AgentLoop:
                 yield AgentChunk.error("模型调用失败: " + str(stream_error[0]))
                 return
 
+            # 流结束后把过滤器里扣住的剩余安全内容吐出来（未闭合的工具块会被丢掉）
+            tail_visible = visible_filter.flush()
+            if tail_visible:
+                yield AgentChunk.text(tail_visible)
             full_content = "".join(content_parts)
             reasoning = "".join(reasoning_parts) or None
 
@@ -13378,6 +13594,18 @@ class AgentLoop:
             self._reply_tool(session_id, tool_call.id, tool_name, "错误: " + error)
             return _ToolOutcome(False, "错误: " + error)
 
+        # 【规则表判定（主）】确定性、可审计、不花 LLM 往返 ✓
+        # 放在本地审批策略（①）与权限等级（②）之后、模型审查（③）之前 ✓ ——
+        # 那两道是"用户自己定的规矩"，不该被规则表跳过 ✓；模型审查是可选兜底 ✓。
+        rule_denial = self._rule_based_tool_decision(tool_name, tool_call.arguments)
+        if rule_denial is not None:
+            self._record(session_id, "TOOL_CALL_ERROR",
+                         {"toolName": tool_name, "error": rule_denial, "approval": "RULE_CONFIRM"},
+                         "规则表拦截: " + str(tool_name))
+            self._sound("APPROVAL")
+            self._reply_tool(session_id, tool_call.id, tool_name, "错误: " + rule_denial)
+            return _ToolOutcome(False, "错误: " + rule_denial)
+
         # 自动授权审查：用**另一个模型**审这次危险调用，DENY 就拦下来。
         #
         # 【为什么放在这里】要在"真正执行工具之前"，但要排在本地审批策略与权限检查之后 ——
@@ -13514,13 +13742,80 @@ class AgentLoop:
         finally:
             self._record_tool_timeout_cleanup(ex)
 
+    def _approval_review_enabled(self) -> bool:
+        """模型审查是否启用（默认关，见 DEFAULTS 里 `approvalReview` 的注释）。
+
+        【为什么要有这个方法】关掉之后**不能再跑那次 LLM** ✗ —— 否则"默认关"只是
+        语义上关了、时间照旧花掉 ✓（测试可验：关闭时不会出现审查调用 ✓）。
+        """
+        try:
+            cfg = getattr(self, "cfg", None)
+            if cfg is None:
+                return False
+            return bool(cfg.get("approvalReview", False))
+        except Exception:                                 # noqa: BLE001 读不到就当关闭
+            return False
+
+    #: `execute_command` 的**写/破坏**模式 —— 命中就"需要确认"（不是必须拒绝，
+    #: 而是**别默默干** ✓）。规则表是给"确定性判定"用的 ✓ 每条都写清"匹配什么 → 判什么" ✓
+    #: 便于审计 ✓（模型审查默认关之后，这里就是主判定 ✓）。
+    _EXEC_RISKY_RULES: tuple[tuple[str, str], ...] = (
+        (r"[^>|]>[^>]|>>", "重定向写文件（> 或 >>）"),
+        (r"\bRemove-Item\b|\brmdir\b|\bdel\b|\berase\b|\brm\b(?![a-z])", "删除文件/目录"),
+        (r"\bSet-Content\b|\bOut-File\b|\bAdd-Content\b|\bNew-Item\b|\bni\b\s",
+         "写入文件/新建条目"),
+        (r"\bMove-Item\b|\bmove\b|\bmv\b|\bCopy-Item\b|\bcopy\b|\bcp\b|\brename\b",
+         "移动/复制/改名（可能覆盖已有文件）"),
+        (r"\bgit\s+(reset\s+--hard|clean|checkout\s+--|restore|revert|push\s+--force|branch\s+-D)",
+         "破坏性 git 操作（丢改动/丢历史）"),
+        (r"\bformat\b|\bdiskpart\b|\bmkfs\b|\bshutdown\b|\breg\s+delete\b|\bbcdedit\b",
+         "系统级破坏操作"),
+        (r"-Recurse\b[\s\S]*-Force\b", "递归 + 强制（会批量删/改）"),
+        (r"\bStop-Process\b|\btaskkill\b|\bkill\b", "结束进程"),
+        (r"\bStart-Process\b|\bInvoke-Expression\b|\biex\b|\bStart-Job\b",
+         "拉起进程 / 执行动态字符串"),
+        (r"\bSet-ExecutionPolicy\b|\bnetsh\b|\bsc\s+(delete|stop|config)\b",
+         "改系统配置（执行策略/网络/服务）"),
+    )
+
+    def _rule_based_tool_decision(self, tool_name: str | None,
+                                  arguments: dict[str, Any] | None) -> str | None:
+        """规则表判定：返回**拦截原因**（非 None = 这次调用需要确认/被拦）。
+
+        【为什么规则表优先】审查模型（9B）判不准 ✗ 而这类判定**本来就可以确定性做** ✓：
+        工具名 + 参数 → 结论 ✓ 不用花一次 LLM 往返 ✓ 而且规则可审计 ✓ 可测 ✓。
+        · 只读工具：`PermissionLevel.READ_ONLY` 那一档 ✓ 由 `check_permission` 放行 ✓ 这里不碰 ✓
+        · **`execute_command`**：命令里命中写/破坏模式 → 需要确认 ✓；纯读命令 → 放行 ✓
+          （这正是本地最常走、也最容易出事的一条 ✓）
+        · 其它写类工具：由 `approval_policy`（①）与权限等级（②）管 ✓ 这里不重复判 ✓
+        """
+        if str(tool_name or "") != "execute_command":
+            return None
+        command = str((arguments or {}).get("command") or "")
+        if not command.strip():
+            return None
+        hits = [why for pattern, why in self._EXEC_RISKY_RULES
+                if re.search(pattern, command, re.IGNORECASE)]
+        if not hits:
+            return None
+        return ("这条命令需要确认后再执行（规则表判定）：" + "；".join(dict.fromkeys(hits))
+                + "。\n如果只是想看一眼信息，换成只读命令（如 where.exe / Get-ChildItem / git status）；"
+                  "确实要改动，请让用户确认后再说一次。")
+
     def _approval_review(self, session_id: str, tool_name: str | None,
                          arguments: dict[str, Any] | None) -> str | None:
         """自动授权审查：返回**拦截原因**（非 None = 拒绝执行这次工具调用）。
 
         【为什么单独一个方法】审查是"用另一次模型对话判断这次调用危不危险"，
         逻辑上独立于工具执行；失败一律**放行**（Java 的语义：审查不可用不能把应用变砖）。
+
+        【本仓库改动：默认关闭】配置项 `approvalReview` 默认 **False** ✓（见 DEFAULTS 的注释）：
+        本地审查模型是 9B IQ4_XS，判不准 ✗ 而且每次多一次 LLM 往返 ✗。
+        授权判定改由 `_rule_based_tool_decision()` 的规则表做（确定性 ✓ 可审计 ✓）；
+        要恢复模型审查把配置设成 true 即可 ✓。
         """
+        if not self._approval_review_enabled():
+            return None
         try:
             from lionbox.plugins.lifecycle import default_registry
             for plugin in default_registry().get_by_kind("APPROVAL_REVIEW"):
@@ -22520,9 +22815,20 @@ class WriteFileTool(ToolPlugin):
 
     def execute(self, args):
         p = self.resolve_path(str(args.get("path", "")))
+        # 【覆盖必须如实说】本工具的语义就是"整体写入/覆盖" ✓ 所以不拒绝 ✓
+        # 但**不能只说"已写入"** ✗ —— 用户和模型都以为那是新建 ✓
+        # （footgun 审计实测：原文件 27 字节被换成 12 字节，返回却是"已写入 xxx" ✗）
+        # 覆盖是**不可逆**的 ✓ 必须报出"原有多大、新有多大" ✓ 模型才知道自己动了什么 ✓。
+        existed = p.exists()
+        old_size = p.stat().st_size if existed else 0
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(str(args.get("content", "")), encoding="utf-8")
-        return ToolResult.ok("已写入 " + p.name)
+        content = str(args.get("content", ""))
+        p.write_text(content, encoding="utf-8")
+        if existed:
+            return ToolResult.ok(
+                "已**覆盖**已有文件 " + p.name
+                + f"（原 {old_size} 字节 → 新 {len(content.encode('utf-8'))} 字节）")
+        return ToolResult.ok("已新建 " + p.name + f"（{len(content.encode('utf-8'))} 字节）")
 
 
 class ExecuteCommandTool(ToolPlugin):
@@ -23194,6 +23500,33 @@ def run_parser_samples() -> None:
     check("remove_tool_call_blocks 剥离后只剩正文",
           loop.remove_tool_call_blocks(SAMPLES[0][2]).strip() == "我看看目录里有什么。")
 
+    # 【流式可见性过滤】真模型实测泄漏过**完整块**：
+    #   <tool_call><function=write_file><parameter=path>…</parameter></function></tool_call>文件已创建…
+    # 根因不是 strip 不会剥（把它喂给 remove_tool_call_blocks 是能剥干净的 ✓），
+    # 而是**流式增量是实时 yield 的**，strip 只在一轮结束后做 → 字早就显示在屏幕上了 ✗。
+    # 所以修法是在流式处加 ToolCallStreamFilter ✓ 这里按**任意分片**验它 ✓。
+    _leak = ('<tool_call><function=write_file><parameter=path>C:\\tmp\\test.txt</parameter>'
+             '<parameter=content>hello</parameter></function></tool_call>')
+    _visible = "文件已创建，等待人工审核通过后才落盘"
+    _stream_cases = (
+        (_leak + _visible, _visible, "完整块 + 正文"),
+        ("我来创建文件。" + _leak + _visible, "我来创建文件。" + _visible, "块前有正文"),
+        (_leak, "", "只有块"),
+        (_leak + _leak + _visible, _visible, "两个块 + 正文"),
+        ("<tool_call><function=write_file><parameter=path>a.txt", "", "未闭合的块（截断）"),
+        ("unction=execute_command><parameter=command>git --version</parameter>"
+         "</function></tool_call>结果：git 2.55", "结果：git 2.55", "词中残片（<f 被切掉）"),
+        ("如果 a < b 且 b < c，那么 a < c。", "如果 a < b 且 b < c，那么 a < c。", "正文含数学小于号"),
+    )
+    for _text, _want, _label in _stream_cases:
+        for _size in (1, 3, 17, 10_000):
+            _f = ToolCallStreamFilter()
+            _got = "".join(_f.feed(_text[_i:_i + _size]) for _i in range(0, len(_text), _size)) + _f.flush()
+            _tags = [t for t in ("<tool_call>", "</tool_call>", "<function", "</function",
+                                 "<parameter", "</parameter", "unction=", "arameter=") if t in _got]
+            check(f"流式过滤（{_label}，分片={_size}）：无标签残留且正文不丢",
+                  not _tags and _got.split() == _want.split())
+
 
 # ==========================================================================
 # B. 别名判定表
@@ -23503,6 +23836,30 @@ def run_guard() -> None:
     check("历史常量保留（3 / 5 / 6 / 3）",
           (ToolCallGuard.REPEAT_SKIP_AT, ToolCallGuard.REPEAT_ABORT_AT,
            ToolCallGuard.FAIL_SKIP_AT, ToolCallGuard.FAIL_WARN_AT) == (3, 5, 6, 3))
+
+    # 【授权规则表】模型审查默认关之后，这里就是 `execute_command` 的主判定 ✓
+    # 所以它必须被自带测试覆盖：纯读放行 ✓ 写/破坏要确认 ✓
+    _dummy = type("_D", (), {"_EXEC_RISKY_RULES": AgentLoop._EXEC_RISKY_RULES})()
+    for _cmd, _want_block, _label in (
+        ("where.exe git", False, "纯读：查 git"),
+        ("git status", False, "纯读：git status"),
+        ("Get-ChildItem .", False, "纯读：列目录"),
+        ("echo hi > out.txt", True, "重定向写文件"),
+        ("echo hi >> out.txt", True, "追加重定向"),
+        ("Remove-Item -Recurse -Force C:\\tmp\\x", True, "递归强制删除"),
+        ("git reset --hard HEAD~3", True, "破坏性 git"),
+        ("git clean -fd", True, "git clean"),
+        ("Set-Content a.txt x", True, "写入文件"),
+        ("format C:", True, "系统级破坏"),
+        ("taskkill /F /IM node.exe", True, "结束进程"),
+        ("Start-Process notepad", True, "拉起进程"),
+        ("Move-Item a b", True, "移动（可能覆盖）"),
+    ):
+        _got = AgentLoop._rule_based_tool_decision(_dummy, "execute_command", {"command": _cmd})
+        check("规则表：" + _label, (_got is not None) == _want_block)
+    check("规则表不越权：只读工具不由它判",
+          AgentLoop._rule_based_tool_decision(_dummy, "read_file", {"path": "x"}) is None)
+    check("模型审查默认关（approvalReview=False）", DEFAULTS.get("approvalReview") is False)
 
 
 # ==========================================================================

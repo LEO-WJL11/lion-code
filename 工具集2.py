@@ -398,6 +398,12 @@ def build_tools(NS: dict) -> list:
             if not url or not args.get("path"):
                 return ToolResult.fail("需要 url 与 path 两个参数")
             dest = self.resolve_path(str(args["path"]))
+            # 【目标已存在就拒绝】与 move_file / copy_file / create_file 保持同一策略 ✓
+            # footgun 审计实测：原来会**静默覆盖**（27 字节的已有文件被 29506 字节的下载
+            # 内容顶掉 ✗ 而返回只说"已下载" ✗）—— 下载覆盖是最没必要的破坏 ✓。
+            if dest.exists():
+                return ToolResult.fail("目标已存在，没有覆盖: " + str(dest)
+                                       + "（要覆盖请先 delete_file 或换个路径）")
             dest.parent.mkdir(parents=True, exist_ok=True)
             if not re.match(r"^https?://", url):
                 return ToolResult.fail("只支持 http/https")
