@@ -12114,24 +12114,24 @@ REPAIR_HINT_EMPTY = (
     "请直接给出结论，或者调用合适的工具继续推进任务。")
 
 TOOL_PROMPT_HINTS: dict[str, str] = {
-    "read_file": "读文件内容（已经知道是哪个文件时用它）",
-    "head_tail_file": "看文件开头/结尾 N 行。用户说“前 5 行/最后几行”就用它，**不要用 list_directory、不要用 read_file**",
+    "read_file": "读文件内容（已知具体路径时用它）。不知道文件在哪先用 glob_files / search_in_files；只看开头结尾用 head_tail_file；列目录用 list_directory —— 本工具传目录会失败",
+    "head_tail_file": "看文件开头/结尾 N 行。用户说“前 5 行/最后几行/看下开头”就用它，**不要用 list_directory、也不要用 read_file 整读**（大日志用这个省上下文）；想看结尾加 tail=true",
     "line_count": "统计行数。用户问“有多少行代码/一共多少行”就用它；path 给目录会递归累计所有文件",
     "word_count": "统计行数、字数、字节数。用户问“多少字/多大”用它",
-    "list_directory": "列目录下的文件和子目录。只在用户问“有哪些文件/列一下目录”时用",
+    "list_directory": "列目录下的文件和子目录（只一层）。用户问“有哪些文件/列一下目录”时用它；要看多层结构用 directory_tree、按后缀找用 glob_files、搜内容用 search_in_files",
     "directory_tree": "画目录树。用户说“目录结构/画给我看/树状”用它",
     "glob_files": "按名字或后缀找文件。用户说“所有 .java 文件/找找 xyz 文件”用它，pattern 传 **/*.java 这种",
     "search_in_files": "在**文件内容**里搜文本或正则。用户说“哪里提到了 TODO/搜一下内容”用它",
     "create_file": "只创建**空**文件。要写内容请用 write_file",
-    "write_file": "新建文件并写入内容（也用于整体覆盖）。用户说“建个文件，写上…”用它",
+    "write_file": "新建文件并写入内容（也用于整体覆盖）。用户说“建个文件，写上…”用它；只想建空文件用 create_file；改已有文件的一小部分用 modify_file（别整体重写）；追加用 append_file",
     "append_file": "往文件末尾追加内容。用户说“追加一行/加到末尾”用它",
     "modify_file": "改文件内容：替换/插入/删除行。用 operation 指定动作，替换给 oldText+content，按行改给 startLine/endLine+content",
-    "move_file": "移动或改名。source 是原路径、target 是新路径",
+    "move_file": "移动或改名（source → target，两个都要给含文件名的完整路径）。只是复制、原文件留着用 copy_file；删除用 delete_file",
     "copy_file": "复制文件或目录。source → target",
     "delete_file": "删除文件或空目录。用户说“删掉/清理”用它",
     "create_directory": "创建目录（含父目录）",
     "file_info": "看文件大小、修改时间等信息",
-    "execute_command": "在常驻终端里执行命令。用户说“跑一下/执行/编译/安装/装依赖”用它",
+    "execute_command": "在常驻终端里执行命令（git/构建/跑测试/装依赖）。用户说“跑一下/执行/编译/安装”用它；**读写改删搜文件不要用它**，用对应专用工具。环境是 Windows + PowerShell：没有 which（用 where）、没有 python3（用 python）、不要用 && / || 和 2>&1",
     "run_background": "后台运行长时间命令（服务、监听、常驻进程）",
     "stop_background": "停掉后台进程",
     "system_info": "系统信息（CPU、内存、操作系统）。用户问“什么配置/多少内存”用它",
@@ -12146,7 +12146,7 @@ TOOL_PROMPT_HINTS: dict[str, str] = {
     "fetch_url": "抓取网页正文（给定 URL 时用它）",
     "http_get": "发 HTTP GET 请求（要接口原始响应时用它）",
     "http_post": "发 HTTP POST 请求",
-    "web_search": "联网搜索（不知道具体网址、要查资料时用它）",
+    "web_search": "联网搜索（不知道网址、要查资料时用它）。已知 URL 取正文用 fetch_url；要接口原始响应用 http_get / http_post；下载文件用 download_file",
     "download_file": "把 URL 上的文件下载到本地",
     "translate": "翻译文本",
     "working_directory": "查看或切换当前工作目录",
@@ -22350,7 +22350,20 @@ class ReadFileTool(ToolPlugin):
     def name(self): return "read_file"
 
     @property
-    def description(self): return "读取文件内容"
+    def description(self):
+        # 【照 Claude Code 的写法】描述要回答四件事：干什么 / 何时用（含用户会怎么说）/
+        # 何时别用（该用哪个别的）/ 坑。CC 的 ReadFile 描述里就明写了
+        # "This tool can only read files, not directories" —— 模型选错工具的根源
+        # 就是描述只说了"干什么"，没说"别拿我干什么"。
+        return (
+            "读取文件内容（已知具体路径时用它）。\n"
+            "用法：\n"
+            "- 不知道文件在哪，先用 glob_files 按名字找、或 search_in_files 按内容搜；"
+            "**不要**拿本工具逐个文件试。\n"
+            "- 只看开头/结尾几行用 head_tail_file，别把整个大文件读进来（会吃掉上下文）。\n"
+            "- 列目录用 list_directory；**本工具只读文件，传目录会失败**。\n"
+            "- path 必填；含空格或中文的路径原样传，不用自己加转义。"
+        )
 
     @property
     def category(self): return ToolCategory.FILE_OPERATION
@@ -22363,9 +22376,30 @@ class ReadFileTool(ToolPlugin):
                 "required": ["path"]}
 
     def execute(self, args):
+        # 【原来是窄桩】只回一个文件名（"文件内容：main.py"）—— 模型拿不到任何内容，
+        # 只能一遍遍再调别的工具。这里改成**真读**（只读操作，安全）。
         if "path" not in args:
             return ToolResult.fail("缺少 path 参数")
-        return ToolResult.ok("文件内容：" + str(args["path"]).replace("\\", "/").split("/")[-1])
+        try:
+            p = self.resolve_path(str(args["path"]))
+        except Exception as e:                             # noqa: BLE001
+            return ToolResult.fail("路径无法解析: " + type(e).__name__ + ": " + str(e))
+        if not p.exists():
+            return ToolResult.fail("文件不存在: " + str(p))
+        if p.is_dir():
+            # 描述里明写了"传目录会失败" —— 报错时给出**可操作的替代**，别只说不
+            return ToolResult.fail("这是目录不是文件: " + str(p) + "（列目录请用 list_directory）")
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            return ToolResult.fail("读不了: " + type(e).__name__ + ": " + str(e))
+        # 【大文件要截断】模型上下文有限，宁可给前一段并说清楚，也不要塞爆上下文
+        limit = 200_000
+        text = data[:limit].decode("utf-8", "replace")
+        if len(data) > limit:
+            text += "\n…（文件共 " + format(len(data), ",") + " 字节，只读了前 " \
+                    + format(limit, ",") + " 字节）"
+        return ToolResult.ok(text)
 
 
 class HeadTailTool(ToolPlugin):
@@ -22378,22 +22412,58 @@ class HeadTailTool(ToolPlugin):
     def name(self): return "head_tail_file"
 
     @property
-    def description(self): return "查看文件头部或尾部N行"
+    def description(self):
+        return (
+            "查看文件开头/结尾的 N 行（大文件、大日志优先用它，比 read_file 省很多上下文）。\n"
+            "用法：\n"
+            "- 用户说“前 5 行”“最后几行”“看下开头”就用它。\n"
+            "- **不要**用 read_file 整读去看开头结尾；**也不要用 list_directory**（那个只列文件名）。\n"
+            "- path 必填，lines 给行数（传数字，不要传字符串）；"
+            "想看**结尾**就加 tail=true（默认看开头）。"
+        )
 
     @property
     def category(self): return ToolCategory.FILE_OPERATION
 
     def parameters_schema(self):
         return {"type": "object",
-                "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}},
+                "properties": {"path": {"type": "string"}, "lines": {"type": "integer"},
+                               "tail": {"type": "boolean"}},
                 "required": ["path"]}
 
     def execute(self, args):
+        # 【原来是窄桩】只回 "前 N 行（path）"，而且**没有 tail 能力** ——
+        # 描述里写着"开头/结尾"，代码却只能"开头"，属描述与实现不一致 ✗。现在补齐。
+        if "path" not in args:
+            return ToolResult.fail("缺少 path 参数")
+        raw = args.get("lines", 20)
+        if raw is None:
+            raw = 20
         # 真实工具里就是 ((Number) args.get("lines")).intValue()：
-        # 字符串 "5" 会 ClassCastException —— coerce_arguments 必须把它转成 int
-        if not isinstance(args.get("lines"), int):
-            return ToolResult.fail("参数 lines 不是数字: " + type(args.get("lines")).__name__)
-        return ToolResult.ok("前 " + str(args["lines"]) + " 行（" + str(args["path"]) + "）")
+        # 字符串 "5" 会 ClassCastException —— 这里宽容一点，能转就转
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            try:
+                raw = int(str(raw).strip())
+            except (TypeError, ValueError):
+                return ToolResult.fail("参数 lines 不是数字: " + type(args.get("lines")).__name__)
+        # 负数 = 从结尾数（顺手支持，和 tail 等价）
+        tail = bool(args.get("tail")) or raw < 0
+        n = abs(raw) or 20
+        try:
+            p = self.resolve_path(str(args["path"]))
+        except Exception as e:                             # noqa: BLE001
+            return ToolResult.fail("路径无法解析: " + type(e).__name__ + ": " + str(e))
+        if not p.exists():
+            return ToolResult.fail("文件不存在: " + str(p))
+        if p.is_dir():
+            return ToolResult.fail("这是目录不是文件: " + str(p) + "（列目录请用 list_directory）")
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as e:
+            return ToolResult.fail("读不了: " + type(e).__name__ + ": " + str(e))
+        picked = lines[-n:] if tail else lines[:n]
+        head = ("后 " if tail else "前 ") + str(len(picked)) + " 行（共 " + str(len(lines)) + " 行）:"
+        return ToolResult.ok(head + "\n" + "\n".join(picked))
 
 
 class WriteFileTool(ToolPlugin):
@@ -22406,7 +22476,16 @@ class WriteFileTool(ToolPlugin):
     def name(self): return "write_file"
 
     @property
-    def description(self): return "新建文件并写入内容"
+    def description(self):
+        return (
+            "新建文件并写入内容（整体写入/覆盖）。\n"
+            "用法：\n"
+            "- 用户说“建个文件，写上…”用它；只想要一个**空**文件用 create_file。\n"
+            "- 改已有文件的一小部分用 modify_file（替换/插入/删行）；"
+            "**不要**用本工具整体重写没读过的文件（会丢掉原有内容）。\n"
+            "- 往末尾追加用 append_file。\n"
+            "- path 必填，content 是要写的内容；目录不存在会自动创建。"
+        )
 
     @property
     def category(self): return ToolCategory.FILE_OPERATION
@@ -22487,7 +22566,13 @@ class MoveFileTool(ToolPlugin):
     def name(self): return "move_file"
 
     @property
-    def description(self): return "移动或改名"
+    def description(self):
+        return (
+            "移动或重命名文件/目录：source → target（改名就是同目录换个名字）。\n"
+            "用法：\n"
+            "- 两个参数都必填，都要给**含文件名的完整路径**（不是只给目录）。\n"
+            "- 只是复制、原文件要留着，用 copy_file；删除用 delete_file。"
+        )
 
     @property
     def category(self): return ToolCategory.FILE_OPERATION
@@ -22523,7 +22608,14 @@ class ContextWindowTool(ToolPlugin):
     def name(self): return "context_window"
 
     @property
-    def description(self): return "调整本会话的上下文窗口"
+    def description(self):
+        return (
+            "调整本会话可用的上下文窗口大小（单位 token，默认 16384）。\n"
+            "用法：\n"
+            "- **只有真装不下时**才调大（例如必须读一个很大的文件），用完**立刻调回 16384**。\n"
+            "- 想丢掉前面已经没用的历史消息，用 context_prune；不要靠缩窗口解决。\n"
+            "- tokens 必填，给整数。"
+        )
 
     @property
     def category(self): return ToolCategory.CONTEXT
@@ -22548,7 +22640,15 @@ class WebSearchTool(ToolPlugin):
     def name(self): return "web_search"
 
     @property
-    def description(self): return "联网搜索"
+    def description(self):
+        return (
+            "联网搜索（不知道具体网址、需要查资料时用它），返回搜索结果摘要。\n"
+            "用法：\n"
+            "- 已知 URL 想取正文用 fetch_url；要接口原始响应用 http_get / http_post；"
+            "要下载文件用 download_file。\n"
+            "- query 必填（一个字符串，就写成你想搜的那句话）。\n"
+            "- 搜到的内容可能过时或不准，关键结论要说明来源，不要当成既定事实。"
+        )
 
     @property
     def category(self): return ToolCategory.WEB
@@ -22562,8 +22662,13 @@ class WebSearchTool(ToolPlugin):
 
 
 class ListDirectoryTool(ReadFileTool):
-    """真实注册表里 list_directory 也是 (path*) 形状，这里用同一份替身占名，
-    好让「模型喊 ls / list_dir → 归一化成 list_directory → 真的执行」这条链路能被验证。"""
+    """列目录（只一层）。
+
+    【原来这里是"替身占名"】execute 只回一句 `"目录内容：" + path` ✗ —— 移植时是刻意
+    留的窄桩，但对用户就是"模型调了工具、工具什么都没做、模型只好再调一次"。
+    实测证据：拿一个非空目录调用它，输出里**没有任何文件名** ✓。
+    现在改成真列目录（只读操作，安全）。
+    """
 
     @property
     def id(self): return "tool.file.list"
@@ -22572,10 +22677,44 @@ class ListDirectoryTool(ReadFileTool):
     def name(self): return "list_directory"
 
     @property
-    def description(self): return "列出目录内容"
+    def description(self):
+        return (
+            "列出目录下的文件和子目录（**只一层**，不递归）。\n"
+            "用法：\n"
+            "- 用户问“有哪些文件”“列一下目录”用它。\n"
+            "- 想看多层结构用 directory_tree；按后缀找文件用 glob_files；"
+            "搜文件**内容**用 search_in_files；看文件内容用 read_file / head_tail_file。\n"
+            "- path 必填；含空格或中文的路径原样传（不要自己加转义）。"
+        )
 
     def execute(self, args):
-        return ToolResult.ok("目录内容：" + str(args.get("path", "")))
+        if "path" not in args:
+            return ToolResult.fail("缺少 path 参数")
+        try:
+            p = self.resolve_path(str(args["path"]))
+        except Exception as e:                             # noqa: BLE001
+            return ToolResult.fail("路径无法解析: " + type(e).__name__ + ": " + str(e))
+        if not p.exists():
+            return ToolResult.fail("目录不存在: " + str(p))
+        if not p.is_dir():
+            return ToolResult.fail("这是文件不是目录: " + str(p)
+                                   + "（看内容请用 read_file / head_tail_file）")
+        try:
+            entries = list(p.iterdir())
+        except OSError as e:
+            return ToolResult.fail("读不了: " + type(e).__name__ + ": " + str(e))
+        # 目录排前面，其余按名字不区分大小写排序 —— 顺手但可预期
+        entries.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
+        limit = 200
+        shown = entries[:limit]
+        body = "\n".join(("[目录] " if e.is_dir() else "       ") + e.name for e in shown)
+        head = str(p) + "（" + str(len(entries)) + " 项）:"
+        if not shown:
+            head += "\n（空目录）"
+            return ToolResult.ok(head)
+        if len(entries) > limit:
+            body += "\n…（共 " + str(len(entries)) + " 项，只列了前 " + str(limit) + " 项）"
+        return ToolResult.ok(head + "\n" + body)
 
 
 def build_registry(workspace: Path) -> PluginRegistry:
@@ -22930,6 +23069,14 @@ def run_alias_tables() -> None:
 def run_main_loop(work: Path) -> None:
     section("C. 主循环：FakeChatClient 跑通一轮（工具派发 / 结果回灌 / 第二轮结束 / 事件）")
 
+    # 【为什么要真造文件】原来这几个用例拿"不存在的文件"（notes.txt / x.txt）驱动工具 ——
+    # 那时工具是窄桩、永远返回成功，所以看不出问题；工具改成**真实现**后，读不存在的
+    # 文件会返回失败 → 事件记成 TOOL_CALL_ERROR 而不是 COMPLETE → 用例变红 ✗。
+    # 这些用例的**意图**是验证"派发 → 执行 → 结果回灌 → 事件"这条链路 ✓，
+    # 所以正确做法是给它们一个真实存在的文件，而不是把工具改回桩 ✗。
+    (work / "notes.txt").write_text("这是 notes.txt 的内容。\n", encoding="utf-8")
+    (work / "x.txt").write_text("x 的内容。\n", encoding="utf-8")
+
     events = LocalEventStore()
     history = LocalConversationHistory()
     client = FakeChatClient([
@@ -22970,7 +23117,7 @@ def run_main_loop(work: Path) -> None:
     check("系统提示词里有工具清单（文本通道）",
           "## 可用工具（" in prompt_text and "- read_file(path*)" in prompt_text)
     check("清单里每个工具都带参数签名（带 * 的是必填）",
-          "- head_tail_file(path*, lines)" in prompt_text
+          "- head_tail_file(path*, lines, tail)" in prompt_text
           and "- write_file(path*, content)" in prompt_text)
     check("系统提示词里有工具选择对照表", "别选错工具" in prompt_text)
     check("系统提示词里有上下文经济约束（有 context_window 工具才写）",
@@ -23006,8 +23153,11 @@ def run_main_loop(work: Path) -> None:
     tm2 = tool_messages(client2.calls[1])
     print("  最终回答: " + ans2)
     print("  回灌的 tool 结果: " + str([m.content for m in tm2]))
+    # 【原来断言的是窄桩的固定串 "目录内容：."】工具改成真列目录后，输出是真实清单 ✓。
+    # 这条用例的**意图**是"它真的执行了"，那就检查真实清单的特征（有项数、且不再是
+    # 那句占位），而不是把桩的输出钉死 ✗。
     check("文本通道：list_dir 被归一化成 list_directory 并真的执行了",
-          len(tm2) == 1 and tm2[0].content == "目录内容：.",
+          len(tm2) == 1 and "项）" in tm2[0].content and "目录内容：" not in tm2[0].content,
           "实际 " + str([m.content for m in tm2]))
     check("文本通道：正文里的 tool_call 被剥掉，不当成回答",
           ans2 == "目录里有一个文件。")
@@ -23103,9 +23253,12 @@ def run_main_loop(work: Path) -> None:
           any(c.type == "TOOL_CALL" and c.tool_name == "read_file" for c in chunks))
     check("流式：最后一块是 DONE",
           chunks[-1].type == "DONE" and chunks[-1].content == "看完了，x.txt 存在。")
+    # 【原来断言输出里有 "x.txt"】那是窄桩的行为（桩只回文件名）✗；
+    # 真实现返回的是**文件内容** ✓。意图是"分片拼出的参数正确、工具真的执行了"，
+    # 所以断言真实内容（用例开头已经把这个文件造出来了 ✓）。
     check("流式：分片拼出的工具名 read_ + file = read_file，参数拼成合法 JSON",
           len(tool_messages(stream.calls[1])) == 1
-          and "x.txt" in tool_messages(stream.calls[1])[0].content)
+          and "x 的内容" in tool_messages(stream.calls[1])[0].content)
     check("流式：事件也被记录",
           "TOOL_CALL_COMPLETE" in [e["type"] for e in events5.list_events("s5")])
 
