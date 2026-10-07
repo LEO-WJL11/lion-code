@@ -54,3 +54,6 @@ runtime-vulkan/
 .bun-cache/
 # ── 对比评测（tasks.json 含答案，绝不能进仓库）────────────────────
 _bench/
+
+# ── 本地模型运行时日志（后端自己写的，别进仓库）────────────────────
+lionbox-model-*.log
