@@ -113,7 +113,7 @@ def build_tools(NS: dict) -> list:
             return (
                 "执行命令并拿到输出（装了什么、跑测试、用 git 等都用它）。\n"
                 "用法：\n"
-                "- 本机是 **Windows + PowerShell**：没有 `which`（用 `where 名字`）、"
+                "- 本机是 **Windows + PowerShell**：没有 `which`（用 **`where.exe 名字`** —— 裸 `where` 是 PowerShell 的 Where-Object 别名，什么都不输出）、"
                 "没有 `python3`（用 `python`）、**不要用 `&&` / `||`**"
                 "（PS 5.1 不认，用 `A; if ($?) { B }`）。\n"
                 "- 一条 command 只做一件相关的事；互不相关的拆成多个调用，一轮里一起发。\n"

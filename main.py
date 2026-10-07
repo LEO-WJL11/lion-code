@@ -22740,6 +22740,21 @@ def build_registry(workspace: Path) -> PluginRegistry:
         # 工具补全失败不该让整个后端起不来 —— 但也不能静默（本项目的教训）。
         import traceback as _tb
         print("[工具集] 注册失败，只有基础 8 个工具可用: " + _tb.format_exc()[-400:], flush=True)
+
+    # 第二批：把**剩下 33 个广告名**也全部落地（git 9 / 网络 4 / 编码文本 8 /
+    # 格式数据 6 / 进程 2 / 杂项 4）—— 真实现写在 工具集2.py，同样传基类进去。
+    # 【为什么分两个文件】每一批都能独立验证与回退；且两个文件互不影响。
+    # 【注意】ask_user / change_permissions / context_prune 这三个是**循环级**的：
+    # 它们的语义要 AgentLoop/客户端配合（真正的提问 UI、权限变更入口都在上层），
+    # 所以这里只做**只读报告 + 如实说明**，不假装能改权限或删历史。
+    try:
+        import 工具集2
+        for _cls in 工具集2.build_tools(globals()):
+            reg.register(_cls(workspace))
+    except Exception:                                      # noqa: BLE001
+        import traceback as _tb2
+        print("[工具集2] 注册失败（第二批 33 个不可用）: "
+              + _tb2.format_exc()[-400:], flush=True)
     return reg
 
 
