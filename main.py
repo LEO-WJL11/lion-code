@@ -13959,6 +13959,14 @@ class AgentLoop:
         result = re.sub(r"\btool_call\s*>", "", result)
         result = re.sub(r"</?function\b[^>]*>?", "", result)
         result = re.sub(r"</?parameter\b[^>]*>?", "", result)
+        # 【更狠的残片：从单词中间被切开】真模型实测泄漏的是
+        #   `unction=execute_command><parameter=command>git --version</parameter></function></tool_call>`
+        # —— 连 `<f` 都没了（`<function` 被切成 `unction` ✗），上面那些以 `<function`
+        # 开头的正则全都够不着。这里按"词尾片段"兜底：…unction=名字> / …arameter=名字>，
+        # 以及孤立的 </function> </parameter> 闭合标签。
+        result = re.sub(r"[A-Za-z_]*unction\s*=\s*[A-Za-z_][\w.\-]*\s*>", "", result)
+        result = re.sub(r"[A-Za-z_]*arameter\s*=\s*[A-Za-z_][\w.\-]*\s*>", "", result)
+        result = re.sub(r"</?(?:function|parameter|tool_call)\s*>", "", result)
         return result.strip()
 
     def parse_xml_tool_calls(self, text: str | None) -> list[ToolCall__agent_loop]:
@@ -23147,6 +23155,12 @@ def run_parser_samples() -> None:
                      "<tool_call><function=b></function></tool_call>正文二", "正文二"),
         ("未闭合", "<tool_call><function=read_file><parameter=path>a.py</parameter>正文三",
          "正文三"),
+        # 【真模型实测泄漏的原文（第二次 e2e 抓到的）】比上面三种更狠：标签从**单词中间**
+        # 被切开，连 `<f` 都没了（`<function` → `unction`），以 `<function` 开头的正则够不着。
+        ("从单词中间切开的残片",
+         "unction=execute_command><parameter=command>git --version</parameter>"
+         "</function></tool_call>1) main.py前10行：编码声明",
+         "1) main.py前10行：编码声明"),
     ):
         _out = str(AgentLoop.remove_tool_call_blocks(None, _text))
         _clean = not any(k in _out for k in ("<tool_call>", "tool_call>", "<function", "<parameter"))
