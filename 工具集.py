@@ -1023,9 +1023,41 @@ def build_tools(NS: dict) -> list:
                 text = re.sub(r"[ \t\r\f\v]+", " ", text)
                 text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
             return ToolResult.ok(_truncate(text, limit) if len(text) > limit else text)
+    # ── 权限等级覆盖（本次修正）──────────────────────────────────────────
+
+    # 【为什么需要】核查发现 20 个工具没声明 permission（属性是 None，不是基类
+
+    # 默认值），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` ——
+
+    # None 不成立，于是在**只读工作区**里连 base64/hash/json_format 这类纯计算
+
+    # 都被拦；git_status/diff/log/branch 又错标成 EXECUTE。这里按名字统一纠正，
+
+    # 一处收口、便于复查（不改各工具类本身，避免散落 24 处）。
+
+    _LEVEL_OVERRIDE = {}
+
+    for _n in ['base64', 'hash', 'generate_uuid', 'escape_string', 'string_utils', 'regex_test', 'number_convert', 'diff_text', 'json_format', 'yaml_process', 'cron_parse', 'format_code', 'markdown_render', 'translate', 'dns_lookup', 'get_env', 'http_get', 'ask_user', 'working_directory', 'context_window', 'system_info', 'timestamp', 'git_status', 'git_diff', 'git_log', 'git_branch']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
+
+    for _n in ['git_add', 'git_commit', 'git_stash', 'git_init', 'git_remote', 'context_prune']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
+
+    for _n in ['delete_file', 'move_file', 'change_permissions', 'git_reset']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
+
+    for _c in out:
+
+        _lv = _LEVEL_OVERRIDE.get(getattr(_c, "name", None))
+
+        if _lv is not None:
+
+            _c.permission = property(lambda self, _v=_lv: _v)
 
     return out
-
 
 def register_extra(reg, NS: dict) -> int:
     """把本模块的工具注册进 reg（同名会覆盖桩实现）。返回注册个数。"""

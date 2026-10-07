@@ -134,6 +134,16 @@ def build_tools(NS: dict) -> list:
                                                  "required": []}
             def execute(self, args):
                 cwd = str(self.resolve_path(args.get("path") or "."))
+                # 【防呆 · 血的教训】目标路径存在但是**文件**时直接拒绝。
+                # 曾经发生过：有人以 path="main.py" 调 git 类工具，而预检
+                # `git rev-parse --is-inside-work-tree` 对**外层仓库的子目录**会通过
+                # （main.py/ 若已被建成目录，它就在外层工作树里 → rc=0），
+                # 于是 git init 真的在里面跑起来，把 1.1 MB 的 main.py 覆盖成一个空仓库。
+                # 这条守卫对所有走这个壳的 git 工具生效。
+                if os.path.isfile(cwd):
+                    return ToolResult.fail(
+                        f"目标路径是一个**文件**，不是目录：{cwd}\n"
+                        "（拒绝执行：把文件当仓库目录会破坏它。要操作这个文件请用 read_file / modify_file）")
                 rc, _ = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd, 20)
                 if rc != 0:
                     return ToolResult.fail(
@@ -228,9 +238,51 @@ def build_tools(NS: dict) -> list:
              "列出分支（当前分支带 *）。不切换分支。",
              P_PATH, lambda a: ["branch", "-a", "-vv"])
 
-    git_tool("git_init", "tool.git.init",
-             "把一个目录初始化成 git 仓库（git init）。已经是仓库时会如实说明。",
-             P_PATH, lambda a: ["init"])
+    # 【git_init 必须独立实现，不能走公共壳】两个原因：
+    #   ① 公共壳开头就验"是不是仓库"，而 init 的对象**本来就不是**仓库 → 永远跑不通；
+    #   ② 更要命的是那句预检对"外层仓库的子目录"会**通过**（rc=0），
+    #      于是 git_init 会在一个子目录里再 init 一次 —— 实测就是这条把 main.py 覆盖了：
+    #      有人以 path="main.py" 调它，main.py 被建成目录后落在外层工作树里 →
+    #      预检通过 → git init 在里面跑 → 源文件变成一个空仓库 ✗
+    @tool
+    class _GitInit(ToolPlugin):
+        @property
+        def id(self): return "tool.git.init"
+        @property
+        def name(self): return "git_init"
+        @property
+        def description(self): return (
+            "把一个**目录**初始化成 git 仓库（git init）。"
+            "目标已存在且是仓库时会如实说明；**目标是文件时拒绝执行**。")
+        @property
+        def category(self): return CAT_SHELL
+        @property
+        def permission(self): return LV_EXEC
+        def parameters_schema(self):
+            return {"type": "object", "properties": P_PATH, "required": []}
+
+        def execute(self, args):
+            p = Path(str(self.resolve_path(args.get("path") or ".")))
+            # ① 目标是文件 → 拒绝（这是那次事故的形态）
+            if p.is_file():
+                return ToolResult.fail(
+                    f"目标是一个**文件**而不是目录：{p}\n"
+                    "（拒绝执行：git init 会把它变成目录并覆盖内容）")
+            # ② 已存在且已是仓库 → 如实说明，不重复 init
+            if p.is_dir():
+                rc, _ = _run(["git", "-C", str(p), "rev-parse", "--git-dir"], str(p), 20)
+                if rc == 0:
+                    return ToolResult.ok(f"已经是 git 仓库了，无需初始化：{p}")
+            else:
+                # ③ 不存在 → 这才是 init 的正常用法：建目录再 init
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    return ToolResult.fail(f"建目录失败：{p}（{type(e).__name__}: {e}）")
+            rc, text = _run(["git", "init"], str(p), int(args.get("timeout") or 60))
+            if rc != 0:
+                return ToolResult.fail(f"git init 失败（退出码 {rc}）：\n{text or '(无输出)'}")
+            return ToolResult.ok(text or f"已初始化：{p}")
 
     git_tool("git_remote", "tool.git.remote",
              "看/加远端。不带参数列出远端；带 name+url 则添加。",
@@ -1194,9 +1246,41 @@ def build_tools(NS: dict) -> list:
                 rows.append(f"（读配置失败：{type(e).__name__}）")
             rows.append("如果某操作被权限层拒绝：请让用户在设置里放行，或改用不需要该权限的做法。")
             return ToolResult.ok("\n".join(rows))
+    # ── 权限等级覆盖（本次修正）──────────────────────────────────────────
+
+    # 【为什么需要】核查发现 20 个工具没声明 permission（属性是 None，不是基类
+
+    # 默认值），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` ——
+
+    # None 不成立，于是在**只读工作区**里连 base64/hash/json_format 这类纯计算
+
+    # 都被拦；git_status/diff/log/branch 又错标成 EXECUTE。这里按名字统一纠正，
+
+    # 一处收口、便于复查（不改各工具类本身，避免散落 24 处）。
+
+    _LEVEL_OVERRIDE = {}
+
+    for _n in ['base64', 'hash', 'generate_uuid', 'escape_string', 'string_utils', 'regex_test', 'number_convert', 'diff_text', 'json_format', 'yaml_process', 'cron_parse', 'format_code', 'markdown_render', 'translate', 'dns_lookup', 'get_env', 'http_get', 'ask_user', 'working_directory', 'context_window', 'system_info', 'timestamp', 'git_status', 'git_diff', 'git_log', 'git_branch']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
+
+    for _n in ['git_add', 'git_commit', 'git_stash', 'git_init', 'git_remote', 'context_prune']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
+
+    for _n in ['delete_file', 'move_file', 'change_permissions', 'git_reset']:
+
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
+
+    for _c in out:
+
+        _lv = _LEVEL_OVERRIDE.get(getattr(_c, "name", None))
+
+        if _lv is not None:
+
+            _c.permission = property(lambda self, _v=_lv: _v)
 
     return out
-
 
 #: run_background 起的进程表（进程内有效；stop 只动这里面的）
 _BG: dict = {}

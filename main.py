@@ -13951,7 +13951,15 @@ class AgentLoop:
         result = re.sub(r"(?s)<tool_call>.*?</tool_call>", "", text).strip()
         result = parsing.strip_calls(result)
         result = re.sub(r"```(?:xml|json)\s*```", "", result).strip()
-        return result
+        # 【残片清理】真模型实测泄漏过 `tool_call>1) main.py前10行…`：
+        # 流式输出把前一个 `<tool_call>` 的开头切掉过，剩下的 `tool_call>` 是**残缺标签**
+        # （缺左尖括号），上面那条正则只吃完整标签，于是残片跟正文一起显示给用户 ✗。
+        # 这里把工具调用相关标签的各种残片一并扫掉：完整标签、缺左尖括号的、未闭合的。
+        result = re.sub(r"</?tool_call\s*>", "", result)
+        result = re.sub(r"\btool_call\s*>", "", result)
+        result = re.sub(r"</?function\b[^>]*>?", "", result)
+        result = re.sub(r"</?parameter\b[^>]*>?", "", result)
+        return result.strip()
 
     def parse_xml_tool_calls(self, text: str | None) -> list[ToolCall__agent_loop]:
         """从文本中解析 XML 格式的工具调用。
@@ -22632,6 +22640,61 @@ class ContextWindowTool(ToolPlugin):
         return ToolResult.ok("窗口 = " + str(args.get("tokens")))
 
 
+def _fetch_html(url: str, timeout: int = 15) -> tuple[str, str | None]:
+    """抓一个页面；成功返回 (html, None)，失败返回 ("", 原因)。**失败必须给原因**。"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"),
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(500_000)
+            charset = r.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, "replace"), None
+    except Exception as e:                                 # noqa: BLE001
+        return "", f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def _strip_tags(s: str) -> str:
+    """去标签 + 还原常见实体 + 压空白（搜索结果摘要用）。"""
+    t = re.sub(r"(?s)<[^>]+>", "", s or "")
+    for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                 ("&quot;", '"'), ("&#39;", "'")):
+        t = t.replace(a, b)
+    return " ".join(t.split())
+
+
+def _parse_search_html(engine: str, html: str, limit: int) -> list:
+    """从结果页里抠 (title, url, snippet)。**容错**：解析不出来就返回空表（由调用方如实报错）。"""
+    rows: list = []
+
+    def add(title: str, url: str, snippet: str) -> None:
+        title = _strip_tags(title)
+        if not title or not url or url.startswith("javascript:"):
+            return
+        rows.append({"title": title[:120], "url": url[:300],
+                     "snippet": _strip_tags(snippet)[:220]})
+
+    if engine == "bing":
+        # <li class="b_algo"> … <h2><a href="URL">TITLE</a></h2> … <p>SNIPPET</p>
+        for m in re.finditer(r'(?s)<li class="b_algo".*?(?=<li class="b_algo"|</ol>)', html):
+            block = m.group(0)
+            a = re.search(r'(?s)<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block)
+            if not a:
+                continue
+            p = re.search(r"(?s)<p[^>]*>(.*?)</p>", block)
+            add(a.group(2), a.group(1), p.group(1) if p else "")
+            if len(rows) >= limit:
+                break
+    else:  # baidu
+        for m in re.finditer(r'(?s)<h3[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html):
+            add(m.group(2), m.group(1), "")
+            if len(rows) >= limit:
+                break
+    return rows
+
+
 class WebSearchTool(ToolPlugin):
     """永久注册表里的「模式外」工具，用来验证极简模式拒绝。"""
 
@@ -22662,7 +22725,37 @@ class WebSearchTool(ToolPlugin):
                 "required": ["query"]}
 
     def execute(self, args):
-        return ToolResult.ok("搜索结果")
+        # 【原来是桩】只回一句 `"搜索结果"` ✗ —— 模型拿到空结果就会换别的工具瞎试，
+        # 这正是"工具不能用"的根源之一。现在真抓真解析。
+        #
+        # 【本机实测的联网可达性】百度 / Bing CN / 搜狗 / api.github.com **可达** ✓；
+        # google / duckduckgo **不可达** ✗（连接被重置或超时）—— 所以只打国内可用的两家。
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return ToolResult.fail("缺少 query 参数（写你想搜的那句话）")
+        limit = int(args.get("limit") or 8)
+        limit = max(1, min(limit, 20))
+        errors: list[str] = []
+        for engine, url in (
+            ("bing", "https://cn.bing.com/search?q=" + urllib.parse.quote(query)),
+            ("baidu", "https://www.baidu.com/s?wd=" + urllib.parse.quote(query)),
+        ):
+            html, err = _fetch_html(url)
+            if err is None:
+                rows = _parse_search_html(engine, html, limit)
+                if rows:
+                    head = f"「{query}」共 {len(rows)} 条（来源：{engine}）"
+                    body = "\n".join(
+                        f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}"
+                        for i, r in enumerate(rows, 1))
+                    return ToolResult.ok(head + "\n" + body)
+                errors.append(f"{engine}: 页面拿到了但没解析出结果（源站结构可能变了，"
+                              f"HTML 长度 {len(html)}）")
+            else:
+                errors.append(f"{engine}: {err}")
+        return ToolResult.fail(
+            "搜索失败 —— 两个源都没成：\n  " + "\n  ".join(errors) +
+            "\n（可用 fetch_url 直接抓已知网址；网络不通时请如实告知用户）")
 
 
 class ListDirectoryTool(ReadFileTool):
@@ -22755,6 +22848,30 @@ def build_registry(workspace: Path) -> PluginRegistry:
         import traceback as _tb2
         print("[工具集2] 注册失败（第二批 33 个不可用）: "
               + _tb2.format_exc()[-400:], flush=True)
+
+    # ── 权限等级覆盖（一处收口，便于复查）──────────────────────────────────
+    # 【为什么需要】核查发现 20 个工具**没声明** permission（属性是 None，而不是基类
+    # 默认值 ✗），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` —— None 不
+    # 成立，于是在**只读工作区**里连 base64 / hash / json_format 这类纯计算都被拦 ✗；
+    # 另外 git_status / git_diff / git_log / git_branch 是只读命令却错标成 EXECUTE ✗；
+    # change_permissions 会改权限、必须是 DANGEROUS ✗。
+    # 这里按名字统一纠正（不改各工具类本身，避免散落二十多处、以后没法复查）。
+    _LEVEL_OVERRIDE: dict[str, str] = {}
+    for _n in ("base64", "hash", "generate_uuid", "escape_string", "string_utils",
+               "regex_test", "number_convert", "diff_text", "json_format", "yaml_process",
+               "cron_parse", "format_code", "markdown_render", "translate",
+               "dns_lookup", "get_env", "http_get", "ask_user", "working_directory",
+               "context_window", "system_info", "timestamp",
+               "git_status", "git_diff", "git_log", "git_branch"):
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
+    for _n in ("git_add", "git_commit", "git_stash", "git_init", "git_remote", "context_prune"):
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
+    for _n in ("delete_file", "move_file", "change_permissions", "git_reset"):
+        _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
+    for _t in reg.all():
+        _lv = _LEVEL_OVERRIDE.get(getattr(_t, "name", None))
+        if _lv is not None:
+            _t.__class__.permission = property(lambda self, _v=_lv: _v)
     return reg
 
 
@@ -23018,6 +23135,31 @@ def run_parser_samples() -> None:
         "<tool_call><function=system_info></tool_call>")     # 未闭合 + 无参
     check("未闭合的无参工具也要收（兜底路径与严格路径行为一致）",
           len(tcs) == 1 and tcs[0].name == "system_info")
+
+    # 【回归 · 真模型实测泄漏过】流式输出把前一个 `<tool_call>` 的开头切掉后，
+    # 剩下的 `tool_call>` 是**残缺标签**（缺左尖括号），只吃完整标签的正则会漏掉它，
+    # 于是 `tool_call>1) main.py前10行…` 这样跟正文一起显示给用户 ✗。
+    for _label, _text, _want in (
+        ("残片 + 完整块", "tool_call><tool_call><function=execute_command>"
+                          "<parameter=command>git --version</parameter></function>"
+                          "</tool_call>正文一", "正文一"),
+        ("两块相邻", "<tool_call><function=a></function></tool_call>"
+                     "<tool_call><function=b></function></tool_call>正文二", "正文二"),
+        ("未闭合", "<tool_call><function=read_file><parameter=path>a.py</parameter>正文三",
+         "正文三"),
+    ):
+        _out = str(AgentLoop.remove_tool_call_blocks(None, _text))
+        _clean = not any(k in _out for k in ("<tool_call>", "tool_call>", "<function", "<parameter"))
+        # 【未闭合块会连后面一起删，这是有意的】块没闭合时无法区分"参数值"与"正文"
+        # （`<function=read_file><parameter=path>a.py</parameter>正文三` 里 a.py 与正文三
+        # 都在标签之外）。`parsing.strip_calls` 的选择是**从 <function= 删到结尾** ——
+        # 宁可多删一点，也不要让 `tool_call>` / 参数值漏到用户眼前（真模型实测泄漏的
+        # 正是这种残缺形态 ✓）。所以断言只硬性要求"标签没了"；完整块另要求正文还在。
+        _keep = (_label == "未闭合") or (_want in _out)
+        check(f"工具调用标签残片不再漏进正文：{_label}", _clean and _keep)
+    check("正常正文不该被清理逻辑误伤（含 'tool' 这个词）",
+          AgentLoop.remove_tool_call_blocks(None, "这是一段正常回答，提到 tool 这个词。").strip()
+          == "这是一段正常回答，提到 tool 这个词。")
 
     loose = "<name>read_file</name><arguments>{\"path\": \"b.txt\"}</arguments>"
     tcs = loop.parse_tool_calls_from_text(loose)
