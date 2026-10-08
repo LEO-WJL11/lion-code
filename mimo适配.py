@@ -691,7 +691,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"model": f"{PROVIDER_ID}/{MODEL_ID}",
                                "theme": "mimocode", "autoupdate": False})
         if p in ("/config/providers", "/provider"):
-            return self._json({"providers": [self._provider()], "default": {}})
+            # 【同一个响应要填三处，字段缺一个就崩】✓ 前端 tui/context/sync.tsx：
+            #   provider         ← 本响应的 .providers   ✓
+            #   provider_default ← 本响应的 .default     ✓
+            #   provider_next    ← **整个响应**           ✗
+            # 而 provider_next 的消费方（dialog-provider.tsx 用 remeda 的 sortBy/map ✓）
+            # 会 `...` 展开它的 .all ✗ —— 少了就是
+            #   "Spread syntax requires ...iterable not be null or undefined" ✓
+            # 真实现场：打开模型对话框直接 fatal error ✓（用户报的那个 ✓）
+            # ⇒ **all / default / connected / authenticated 四个字段缺一不可** ✓
+            _prov = self._provider()
+            return self._json({
+                "providers": [_prov],
+                "default": {},
+                # 全部已配置的 provider（前端按 id 排序/分组用 ✓）
+                "all": [_prov],
+                # 已连接 / 已认证的 id 列表（前端 `connected.includes(provider.id)` ✓）
+                "connected": [PROVIDER_ID],
+                "authenticated": [PROVIDER_ID],
+            })
         if p == "/provider/auth":
             return self._json({})
 
