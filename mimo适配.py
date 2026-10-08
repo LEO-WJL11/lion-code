@@ -677,7 +677,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json([{"workspaceID": w["id"], "status": "connected"}
                                for w in items])
         if p == "/experimental/console":
-            return self._json({"org": None, "orgs": []})
+            # 【字段名必须以 config/console-state.ts 的 ConsoleState 为准】✗
+            # 我原来返回 {"org", "orgs"} —— **名字全不对** ✓，前端拿到的
+            # `consoleManagedProviders` 是 undefined ✓ → provider-origin.ts 里
+            #   Array.isArray(x) ? x.includes(id) : x.has(id)
+            # 不是数组就走 .has() → `undefined.has` → **打开模型对话框就 fatal** ✓
+            # 规范形状（ConsoleState ✓）：
+            #   consoleManagedProviders: string[]（必填 ✗ 缺了就崩 ✓）
+            #   activeOrgName?: string
+            #   switchableOrgCount: number
+            # 我们不做 console 托管，所以给"空"的那一份 ✓ —— 但**字段一个不能少** ✓
+            return self._json({"consoleManagedProviders": [], "switchableOrgCount": 0})
         # 权限提问的超时（毫秒）；null = 不超时。前端启动时会探一次，
         # 不实现就吃 404 字典 —— 这里没人 .map，不至于崩，但补上更干净。
         if p == "/permission/ask-timeout":
