@@ -46,6 +46,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 VERSION = "1.5.46"
 AGENT = "build"
+#: agent 名 → 后端的工作模式（后端只认 STANDARD / MINIMAL ✓ 见 main.py 的
+#: SELECTABLE 与 `POST /api/sessions/{id}/mode` ✓）。
+#: 【为什么需要它】MiMo 的 agent 是它自己的概念 ✗，而我们只有"工作模式" ✓ ——
+#: 用 agent 名当这两者的桥：`Tab` 切到 minimal → 会话模式切成 MINIMAL ✓
+AGENT_MODES = {"build": "STANDARD", "minimal": "MINIMAL"}
 PROVIDER_ID = "lionbox"
 MODEL_ID = "lion-merged"
 
@@ -734,8 +739,17 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/question":
             return self._json([])
         if p in ("/agent", "/agent/"):
-            return self._json([{"name": AGENT, "description": "Lion Code 默认智能体",
-                                "mode": "primary", "builtIn": True}])
+            # 【这就是"切模式"的入口】MiMo 的 `Tab` 与 `/agents` 都读这个列表 ✓
+            # agent 切换是**本地 store**（tui/context/local.tsx 的 setAgentStore ✓），
+            # 切完随**消息**发出来（SDK: agent?: string ✓）—— 所以列表里必须有
+            # 第二个 agent，用户才切得动 ✗（原来只有一个 build ✓）。
+            # 名 → 后端工作模式的映射见 AGENT_MODES；实际切模式在收到消息时做。
+            return self._json([
+                {"name": "build", "description": "标准模式（STANDARD）—— 默认，能力全开",
+                 "mode": "primary", "builtIn": True},
+                {"name": "minimal", "description": "极简模式（MINIMAL）—— 提示词更短、更省 token",
+                 "mode": "primary", "builtIn": True},
+            ])
         if p == "/skill":
             r = _req("/api/skills") or {}
             data = r.get("data") if isinstance(r, dict) else None
@@ -1004,6 +1018,20 @@ class Handler(BaseHTTPRequestHandler):
                                   "time": {"created": now_ms(), "updated": now_ms()}}
                 _MESSAGES.setdefault(sid, [])
         text = _extract_text(body)
+        # 【按 agent 切工作模式】MiMo 的 `Tab` / `/agents` 切的是它自己的 agent
+        # （本地 store ✓），切完随消息发出来（SDK 字段 `agent` / `agentID` ✓）。
+        # 我们后端只有工作模式（STANDARD / MINIMAL ✓），所以在这里把 agent 名
+        # 翻译成模式并**真的切掉该会话的模式** ✓ —— 否则"切了但没生效" ✗。
+        # 只在变化时调一次（每轮都调会白多一次后端往返 ✓）。
+        want_mode = AGENT_MODES.get(str(body.get("agent") or body.get("agentID") or "").strip())
+        if want_mode:
+            _bid = backend_session(sid)
+            # 【直接 POST，不要先读当前模式】后端**没有** `GET /api/sessions/{id}/mode`
+            # ✗（只有 POST ✓ 见 main.py 的 `@router.post(".../mode")`）——
+            # 我第一版先 GET 再比较，拿到 404 → 当前模式是空串 → 条件恒假 →
+            # **从来不切** ✗。POST 是幂等的，直接设即可（一次本地调用，代价可忽略 ✓）。
+            if _bid:
+                _req("/api/sessions/" + _bid + "/mode", {"mode": want_mode}, method="POST")
         umid = new_message(sid, "user", text=text)
         if text:
             new_part_text(sid, umid, text, start=True, end=True)
