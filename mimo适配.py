@@ -828,10 +828,36 @@ class Handler(BaseHTTPRequestHandler):
 
         seen, out = set(), []
         for x in ids:
+            # 【必须只收"裸文件名"】`/api/models` 会把模型的**完整路径**也带出来
+            # （实测多出一条 `C:\Users\Leo\Desktop\lion-code\lion-merged-IQ4_XS.gguf` ✓），
+            # 混进列表后界面上就多出第 4 个选项，用户选中它必然失败 ✗ ——
+            # 用户报过这个 ✓。判据：含路径分隔符的一律跳过 ✓（后端只认文件名 ✓）。
+            if "\\" in x or "/" in x:
+                continue
             if x not in seen:
                 seen.add(x)
                 out.append(x)
         return out
+
+    def _restart_runtime(self, want: str) -> None:
+        """切完模型后重启本地运行时（异步线程里跑 ✓）。
+
+        【为什么必须做】只改配置不重启，llama-server 会继续用旧权重 ✓ ——
+        用户切了 Q4_K_M，跑的还是 IQ4_XS，现象是"切了没反应" ✗。
+        【失败要如实报】不许假装成功 ✗（本会话反复吃"静默"的亏 ✓）——
+        打到自己这份日志（→ `.lbcheck/adapter.log` ✓）里，用户查得到 ✓。
+        """
+        try:
+            r = _req("/api/runtime/local/restart", {}, timeout=180.0, method="POST")
+            ok = isinstance(r, dict) and r.get("success") is not False
+            if ok:
+                print(f"[模型] 已切到 {want}，本地运行时已重启 ✓", flush=True)
+            else:
+                print(f"[模型] 已切到 {want}，但运行时重启返回异常: {str(r)[:200]}",
+                      flush=True)
+        except Exception as e:                                 # noqa: BLE001
+            print(f"[模型] 已切到 {want}，但运行时重启失败: {type(e).__name__}: {e}",
+                  flush=True)
 
     def _provider(self) -> dict:
         """/models 面板读的是 providers[].models —— 这里给真实列表，
@@ -1076,10 +1102,21 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if want:
                 global MODEL_ID
+                changed = want != MODEL_ID
                 MODEL_ID = want
                 # 本地量化用 file 名切换；认不出来就当普通模型名交给 mode 接口
                 _req("/api/runtime/local/model", {"file": want}) or _req(
                     "/api/runtime/mode", {"mode": "local", "model": want})
+                # 【切完必须重启运行时】实测：切换只改了**配置**（`modelFile` 变成
+                # 新量化 ✓），但**正在跑的 llama-server 还是旧模型** ✗ ——
+                # 用户以为切了、实际没换 ✓（用户报过这个 ✓）。
+                # 后端有这个端点 ✓（`@router.post("/api/runtime/local/restart")` ✓
+                # —— 读出来的，不是猜的 ✗）。
+                # 【异步】重启要几十秒 ✗：卡住这个 PATCH 会让界面看起来像死了 ✓。
+                # 【只在真的变了时重启】用户重复选同一个模型不该触发重启 ✓。
+                if changed:
+                    threading.Thread(target=self._restart_runtime, args=(want,),
+                                     daemon=True).start()
             return self._json({"success": True})
 
         m = re.match(r"^/session/([^/]+)$", p)

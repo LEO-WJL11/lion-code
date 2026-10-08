@@ -2160,26 +2160,82 @@ class LocalModelRuntime:
         self.last_error = f"自动下载超时（{int(self.start_timeout)} 秒）"
         return False
 
+    def _runtime_port(self) -> int:
+        """本运行时的监听端口 —— **不要瞎猜属性名** ✗。
+
+        第一版我写成 `self.port` ✓ —— 那是**另一个类**的属性（`LocalModelRuntime`
+        里根本没有 ✓），于是 AttributeError →
+        `/api/runtime/local/model` 与 `/api/runtime/local/restart` **双双 500** ✗✓
+        —— 本来是要修"切模型不生效"，结果把切换接口整个搞挂了 ✓（记在这里 ✓）。
+        这个类存的是 `self._host_port`；取不到就退到模块常量 `LOCAL_RUNTIME_PORT`
+        （与 application.yml 一致 ✓）。
+        """
+        hp = getattr(self, "_host_port", None)
+        if isinstance(hp, (tuple, list)) and len(hp) >= 2:
+            try:
+                return int(hp[1])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(hp, int):
+            return hp
+        return int(LOCAL_RUNTIME_PORT)
+
+    def _proc_on_port(self) -> int | None:
+        """谁在监听我们的运行时端口（可能是个**本实例认不得**的孤儿 ✓）。
+
+        【为什么需要】`_kill_proc` 只认 `self._proc` ✗ —— 而下面这种真实场景里
+        它是 None：看门狗把后端重启过 ✓（`_start_mimo.py` ✓），llama-server 是
+        **上一个后端实例**拉起来的 ✓ → 新实例不认得它 ✗。
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-NetTCPConnection -LocalPort {self._runtime_port()} -State Listen "
+                 f"-ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"],
+                capture_output=True, text=True,
+                creationflags=_CREATE_NO_WINDOW, timeout=15)
+            v = (out.stdout or "").strip()
+            return int(v) if v.isdigit() else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
     def _kill_proc(self) -> None:
         p = self._proc
         self._proc = None
-        if p is None or p.poll() is not None:
-            return
-        try:
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                               capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
-            else:
-                p.terminate()
-        except (OSError, subprocess.SubprocessError):
-            pass
-        try:
-            p.wait(timeout=8)
-        except subprocess.TimeoutExpired:
+        if p is not None and p.poll() is None:
             try:
-                p.kill()
-                p.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
+                else:
+                    p.terminate()
+            except (OSError, subprocess.SubprocessError):
+                pass
+            try:
+                p.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                    p.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            return
+        # 【还要杀掉"本实例认不得"但占着我们端口的那个】—— 真实发生过 ✓：
+        #   看门狗重启过后端 ✓ → 新实例的 `self._proc` 是 None ✗ → 上面整段空转 ✓
+        #   → `start()` 一看 `healthy()` 为真就**直接复用** ✓
+        #   → **用户切了模型，权重根本没换** ✓✓（"切了没反应"就是这个 ✓）。
+        # 只杀**监听我们这个运行时端口**的 PID ✗ —— 不按进程名乱杀 ✓
+        # （机器上可能有别人的 llama-server ✓，杀了就是事故 ✓）。
+        orphan = self._proc_on_port()
+        if orphan and orphan != os.getpid():
+            try:
+                subprocess.run(["taskkill", "/PID", str(orphan), "/T", "/F"],
+                               capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
+                print(f"[运行时] 已终止占用端口 {self._runtime_port()} 的进程 {orphan}"
+                      f"（本实例不认得它，但它会让模型切换不生效）", flush=True)
+            except (OSError, subprocess.SubprocessError):
                 pass
 
     def stop(self) -> dict[str, Any]:
