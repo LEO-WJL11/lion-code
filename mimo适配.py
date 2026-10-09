@@ -117,7 +117,17 @@ def _parse_tokens(v) -> int | None:
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return int(v)
+        # 【非有限值必须返回 None，不许抛出去】JSON 能写出 NaN / Infinity / 1e999
+        # （Python 的 json 解析后就是 float('nan') / float('inf')）：
+        #     int(nan) → ValueError        int(inf) → **OverflowError**
+        # 而下面那个 `except ValueError` **接不住 OverflowError** ✗。
+        # `extract_context_limit` 的文档承诺是"解析不了 → (True, None) → 400"，
+        # 可 `do_PATCH` 那侧没有 try —— 抛出去的结果是**客户端断连而不是 400** ✗
+        # （audit2 实测：`{"contextLimit":1e999}` 就能让连接被掐 ✗）。这里兜住 → None → 正常 400。
+        try:
+            return int(v)
+        except (ValueError, OverflowError):
+            return None
     s = str(v or "").strip().upper()
     if not s or s.endswith("%"):
         return None
@@ -128,7 +138,8 @@ def _parse_tokens(v) -> int | None:
         mul, s = 1_000_000, s[:-1]
     try:
         return int(float(s) * mul)
-    except ValueError:
+    except (ValueError, OverflowError):
+        # OverflowError：`"1e999K"` 之类 float() 得 inf 后 int(inf) 抛
         return None
 
 
@@ -401,7 +412,13 @@ def backend_sessions() -> list:
             "directory": ws,
             "parentID": None,
             "title": _title_of(uuid, x.get("name"), extra=ws),
-            "titleSource": "user" if x.get("name") else "auto",
+            # 【必须是合法枚举】SDK 的 Session.titleSource 只认
+            # `fallback | generated | user`（types.gen.ts）。原来这里的 `"auto"` **不在枚举里** ✗ ——
+            # TUI 的 `mergeSessionTitle`（session-title.ts + sync.tsx）按 source 做优先级比较时
+            # 取不到优先级 ⇒ **旧标题永远压过新标题，侧栏标题再也不更新** ✗✓
+            # 没有自定义名字的会话属于"派生标题" → 用 `fallback`（本文件 L1387 那处也是 fallback ✓），
+            # 这样 TUI 本地生成的 `generated` 与用户改的 `user` 都能正常盖过它 ✓。
+            "titleSource": "user" if x.get("name") else "fallback",
             "titleRevision": 1,
             "version": VERSION,
             "backendID": uuid,
