@@ -8,7 +8,7 @@ cd /d "%~dp0"
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
-"%PY%" "%~dp0main.py" %*
+"%PY%" "%~dp0main.py" --app-root "%~dp0." %*
 
 rem 出错时留住窗口，方便看信息（正常退出就关掉）
 if errorlevel 1 (

@@ -319,8 +319,12 @@ def java_path(path: str | os.PathLike[str]) -> str:
 
 def now_instant() -> str:
     """Java `Instant.now()` 的 JSON 形态：`2026-10-03T11:55:28.690Z`（UTC、毫秒、Z 结尾）。"""
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{_dt.datetime.now(_dt.timezone.utc).microsecond // 1000:03d}Z"
+    # 【必须只读一次时钟】旧写法把两次 now() 拼起来：秒取自第一次、毫秒取自第二次，
+    # 跨秒时（第一次 28.9998 → 秒 "28"，第二次 29.0001 → 毫秒 "000"）输出 ...:28.000Z，
+    # 比真实时刻早近 1 秒；更早发生的事件（28.500 → ...:28.500Z）反而拿到更晚的时间戳，
+    # 事件按时间排序会倒挂（now_instant 是错误体/窄桩路径时间戳的唯一来源，60 多处调用）。
+    now = _dt.datetime.now(_dt.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 def to_instant(value: Any) -> str:
@@ -1179,6 +1183,93 @@ def workspace_default_path() -> Path:
     return Path(v) if v else home_dir() / "lion-code-workspace"
 
 
+def _coerce_llama_field(key: str, value: Any, default: Any) -> Any:
+    """把 llama 配置的一个字段按 `DEFAULTS["llama"]` 里该键默认值的类型强制归一；转不动抛 ValueError。
+
+    【为什么必须有】写入口 `POST /api/runtime/local/config` 原来只按**键名**过滤、完全不看类型
+    （2784-2789 只做 `k in allow`），坏值原样落盘且跨重启存活；而读取端全是裸转换：
+    `_host_port()` 的 `int(llama.get("port", 8788))` 见到 `""` 抛 ValueError、见到 null 抛
+    TypeError → `GET /api/runtime/local`、`GET /api/runtime/mode` **全部 500**，`start()` 里
+    phase 停在 "loading" 永远出不来，只能手改 `~/.lioncode/app-config.json` 才能恢复。
+    这里做两件事：
+      · 写入端（`clean_llama_updates`）调用它做校验，转不动 → 400 拒绝落盘；
+      · 读取端（`AppConfigStore.llama()`）调用它兜底，坏存储值**降级成默认值**而不是 500。
+    只处理数值/布尔键：字符串键（host/extraArgs/kvCacheType*…）`str()` 永不抛错，
+    且 `kvCacheType*` 存 null 是"关闭量化缓存"的合法写法，不能被默认值顶掉。
+    """
+    if isinstance(default, bool):                     # flashAttn
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in (
+                "true", "false", "1", "0", "yes", "no", "on", "off"):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        raise ValueError(f"{key} 必须是布尔值")
+    if isinstance(default, int):                      # port/ctxSize/ngl/…
+        if isinstance(value, bool):                   # bool 是 int 子类，True 当端口 1 用是事故
+            raise ValueError(f"{key} 必须是整数")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+            return int(value.strip())
+        raise ValueError(f"{key} 必须是整数")
+    if isinstance(default, float):                    # temperature/topP/minP/…
+        if isinstance(value, bool):
+            raise ValueError(f"{key} 必须是数字")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                raise ValueError(f"{key} 必须是数字") from None
+        raise ValueError(f"{key} 必须是数字")
+    return value                                      # 字符串键不在这里拦（见函数头说明）
+
+
+def clean_llama_updates(updates: Any, allow: set[str]) -> tuple[dict[str, Any], str | None]:
+    """`POST /api/runtime/local/config` 的入参归一：返回 (可落盘的干净字段, 错误文案或 None)。
+
+    【为什么加这一层】旧实现只按键名过滤就 `update_llama` 原样落盘（2784-2789），
+    `port` 写成 `"abc"`/null 之后所有 runtime 接口持续 500、且**修复用的 POST 自己也会 500**
+    （响应里的 `local_config_payload()` 立刻走 `_host_port()` 炸掉）——值已写入却报失败，
+    UI 再也修不回来。现在：类型不对/给了 null → 返回错误文案，**一个字节都不落盘**。
+    """
+    if not isinstance(updates, dict):
+        return {}, "请求体必须是 JSON 对象"
+    defaults = DEFAULTS["llama"]
+    clean: dict[str, Any] = {}
+    problems: list[str] = []
+    for k, v in updates.items():
+        if k not in allow:                      # 只认 llama() 里已有的键（与旧行为一致）
+            continue
+        if v is None:
+            problems.append(f"{k} 不能是 null")
+            continue
+        if k not in defaults:
+            clean[k] = v                        # 存储里多出来的自定义键：无类型可依，原样放行
+            continue
+        if isinstance(defaults[k], str):         # host/modelFile/…：必须是字符串
+            if not isinstance(v, str):
+                problems.append(f"{k} 必须是字符串")
+                continue
+            if k in ("host", "modelFile") and not v.strip():
+                problems.append(f"{k} 不能为空")   # 空 host 拼出 http://:8788，空 modelFile 找不到权重
+                continue
+            clean[k] = v
+            continue
+        try:
+            clean[k] = _coerce_llama_field(k, v, defaults[k])
+        except ValueError as e:
+            problems.append(str(e))
+    if problems:
+        return {}, "；".join(problems)
+    return clean, None
+
+
 class AppConfigStore:
     def __init__(self, base: Path | None = None) -> None:
         self.base = Path(base) if base else _default_base()   # 允许传字符串，别让调用方踩这个坑
@@ -1243,9 +1334,27 @@ class AppConfigStore:
     def llama(self) -> dict[str, Any]:
         with self._lock:
             cur = self._data.get("llama")
-            merged = dict(DEFAULTS["llama"])
+            defaults = DEFAULTS["llama"]
+            merged = dict(defaults)
             if isinstance(cur, dict):
                 merged.update(cur)
+            # 【读时归一：坏配置最多降级成默认值，绝不 500】存储值不校验类型（load/save 只走
+            # json.dumps，`"port": ""`/`null` 落盘毫无障碍），而下游全是裸 int()/float()：
+            # `_host_port()`(1838 一带)、`_local_base_url()`、warm_up 的 url、`build_command()`
+            # 里十几个转换。一条坏值会让 /api/runtime/local、/api/runtime/mode 恒 500、
+            # start() 卡死在 phase="loading"。这里按默认值类型归一（键不存在时本来就是默认值，
+            # 不受影响）。字符串键只把 null 顶回默认值：host=None 会被 str() 拼成 "None"，
+            # 之后 port_free() 的 getaddrinfo 抛 gaierror（OSError）→ status() 照样 500；
+            # 空串等其它字符串原样放行（kvCacheType* 存 "" 是"关闭量化缓存"的合法写法）。
+            for k, dv in defaults.items():
+                if isinstance(dv, str):
+                    if merged.get(k) is None:
+                        merged[k] = dv
+                    continue
+                try:
+                    merged[k] = _coerce_llama_field(k, merged[k], dv)
+                except ValueError:
+                    merged[k] = dv
             return merged
 
     def update_llama(self, updates: dict[str, Any]) -> dict[str, Any]:
@@ -1904,12 +2013,22 @@ class LocalModelRuntime:
 
         超时给 0.2 秒就够：端口开着时 TCP 握手由内核即时完成，不需要等；
         给 0.6 秒时实测这个探测要吃掉整整 600 ms，白拖慢状态接口（界面轮询会感觉到）。
+
+        【OSError 必须吞掉】connect_ex 对**解析不了的 host**（坏配置把 host 存成
+        "None"/"abc" 时）不是返回错误码而是抛 gaierror —— 实测
+        `connect_ex(("None", 8788))` → `gaierror [Errno 11001] getaddrinfo failed`，
+        异常穿出 healthy() → status() → GET /api/runtime/local 全线 500，
+        正是 bug「一条坏配置让核心接口永久 500」的字符串键变体。探测不了 = 判"没在跑"，
+        让状态接口照常回 200（运行态显示未运行，比 500 好）。
         """
         import socket
         host, port = self._host_port()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.2)
-            return s.connect_ex((host, port)) != 0
+            try:
+                return s.connect_ex((host, port)) != 0
+            except OSError:
+                return True
 
     # ------------------------------------------------------------------ 拉起
     def build_command(self, ngl: int | None = None) -> list[str]:
@@ -1956,7 +2075,16 @@ class LocalModelRuntime:
         cmd += ["--host", host, "--port", str(port)]
         extra = str(llama.get("extraArgs") or "").strip()
         if extra:
-            cmd += shlex.split(extra)
+            # 【Windows 下绝不能用 POSIX 分词】shlex.split 默认 posix=True，`\` 是转义符：
+            # 实测 shlex.split(r'C:\temp\x.gguf --lora D:\a b\c.gguf') →
+            # ['C:temx.gguf', '--lora', 'D:a', 'bc.gguf'] —— 反斜杠被静默吃掉、路径被改写，
+            # llama-server 拿到错参数直接退出，日志只见"llama-server 退出"，完全看不出是分词问题。
+            # posix=False 保留反斜杠（Windows 路径原样进 argv），但会把成对引号留在 token 上
+            # （'--lora "C:\a b\x.gguf"' → '"C:\a b\x.gguf"'）→ 再手动剥一层。
+            for tok in shlex.split(extra, posix=False):
+                if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+                    tok = tok[1:-1]
+                cmd.append(tok)
         return cmd
 
     def _open_log(self):
@@ -2167,18 +2295,20 @@ class LocalModelRuntime:
         里根本没有 ✓），于是 AttributeError →
         `/api/runtime/local/model` 与 `/api/runtime/local/restart` **双双 500** ✗✓
         —— 本来是要修"切模型不生效"，结果把切换接口整个搞挂了 ✓（记在这里 ✓）。
-        这个类存的是 `self._host_port`；取不到就退到模块常量 `LOCAL_RUNTIME_PORT`
-        （与 application.yml 一致 ✓）。
+
+        【第二版的 bug：把方法当成了属性】`_host_port` 是**方法**（1836 行 `def _host_port`，
+        1859/1888/1909/1955/2339 全是 `self._host_port()` 调用，从未被赋值成 tuple/int），
+        旧代码 `getattr(self, "_host_port", None)` 拿到的是 bound method，后面两个
+        isinstance 判定**恒为 False** → 永远返回常量 8788：配置里改过端口的机器上，
+        `_proc_on_port()` 去查/杀 **8788 上的无关进程**（还可能 taskkill 别人的程序），
+        真正监听自定义端口的孤儿反而查不到杀不掉 —— 2225-2230 声称修掉的"切模型不生效"
+        在改端口的机器上原样复现。现在直接调方法取配置里的真实端口（spawn 用的也是它），
+        只在异常时才退到模块常量 `LOCAL_RUNTIME_PORT`（与 application.yml 一致 ✓）。
         """
-        hp = getattr(self, "_host_port", None)
-        if isinstance(hp, (tuple, list)) and len(hp) >= 2:
-            try:
-                return int(hp[1])
-            except (TypeError, ValueError):
-                pass
-        if isinstance(hp, int):
-            return hp
-        return int(LOCAL_RUNTIME_PORT)
+        try:
+            return int(self._host_port()[1])
+        except Exception:  # noqa: BLE001 端口探测/杀孤儿前的取值，配置再坏也不能在这里抛
+            return int(LOCAL_RUNTIME_PORT)
 
     def _proc_on_port(self) -> int | None:
         """谁在监听我们的运行时端口（可能是个**本实例认不得**的孤儿 ✓）。
@@ -2422,6 +2552,10 @@ class LocalModelRuntime:
                     if already > 0:          # 服务器不支持续传：重头下
                         already = 0
                         mode = "wb"
+                        # 【计数也必须清零】self.download_bytes 在上面已被旧 .part 的残留
+                        # 偏移播种过，这里只重置局部变量的话，进度 = 旧偏移 + 全长
+                        # （3GB 残留 + 8.87GB ≈ 134%，/api/runtime/local 的进度字段失真）。
+                        self.download_bytes = 0
                     self.download_total = length
                 with open(part, mode) as f:
                     while True:
@@ -2435,6 +2569,17 @@ class LocalModelRuntime:
             return False
         finally:
             self.downloading_file = ""
+        # 【必须比对字节数，否则截断传输会被当成功】http.client 对"比 Content-Length 短的
+        # **干净**提前 EOF"不抛异常（实测：声明 1000 字节、服务端只发 100 就关 → 异常=None），
+        # 旧代码读到空块直接 break → 落到下面 os.replace 把半截 .part 改名成正式文件；
+        # 下游 `_verify_gguf` 只查 GGUF 魔数和最小体积（8.87GB 模型截一半照样过）→
+        # "权重已就绪"、is_model_downloaded 恒真 → **永不重下**，llama-server 加载半截文件失败，
+        # 用户只能手动删文件。这里只在服务器明确给了长度（length > 0）时比对：不匹配就
+        # 返回 False 并**保留 .part**（续传还能接着下），绝不改名成正式文件。
+        if length > 0 and self.download_bytes != self.download_total:
+            self.last_error = (f"下载不完整: 收到 {self.download_bytes}/{self.download_total} 字节"
+                               f"（已保留 .part，可续传）")
+            return False
         os.replace(part, target)
         return True
 
@@ -2781,9 +2926,16 @@ class RuntimeApi:
 
         @router.post("/api/runtime/local/config")
         def update_local_config(req: Request):
+            # 【为什么要做类型校验】这里原来只按键名过滤就原样落盘：`port` 写成 ""/null 后，
+            # `_host_port()` 的裸 int() 抛错 → /api/runtime/local、/api/runtime/mode、本接口
+            # 全部 500、start() 卡死 phase="loading"，而本 POST 响应自己也走
+            # local_config_payload()→_host_port()，**值已写入却报失败**，界面再也修不回来。
+            # 现在坏值直接 400 拒绝、一个字节都不落盘（clean_llama_updates 里逐键归一/校验）。
             updates = req.json_obj()
             allow = set(api.cfg.llama().keys())
-            clean = {k: v for k, v in updates.items() if k in allow}
+            clean, problem = clean_llama_updates(updates, allow)
+            if problem is not None:
+                return ApiResponse.error(problem)
             if not clean:
                 return ApiResponse.error("没有可更新的字段")
             api.cfg.update_llama(clean)
@@ -2841,6 +2993,16 @@ class RuntimeApi:
                 how = "（权重已就绪）" if file in known else "（本地现成的）"
                 return ApiResponse.ok(st, f"已切换到 {file}{how}，发消息或点「重启本地模型」即可生效")
 
+            # 【已下载的官方模型不许再报"尚未下载"】known（官方清单）不看磁盘、local_files
+            # 只收非官方的自定义 GGUF（两集合构造上不相交），下面 want_download 的三条分支
+            # 对**已下载的官方模型**全回错文案：不带 download 字段 →"（尚未下载）"、
+            # download=true → start_download 回 {started:False, downloaded:True} →
+            # "（尚未下载：）"（空错误）—— 而同一响应体里 status().modelInstalled 已经是 true，
+            # 前端文案与数据自相矛盾（mimo适配.py:1214 就是不带 download 字段调的这个端点）。
+            # 先按磁盘判定：真下好了就说就绪，没下好才走进度/下载分支。
+            if api.runtime.is_model_downloaded(file):
+                return ApiResponse.ok(st, f"已切换到 {file}（权重已就绪），发消息或点「重启本地模型」即可生效")
+
             want_download = str(body.get("download", "")).lower() not in ("false", "0", "no", "")
             if not want_download:
                 return ApiResponse.ok(st, f"已切换到 {file}（尚未下载）")
@@ -2850,6 +3012,9 @@ class RuntimeApi:
             r = starter(file) or {}
             if r.get("started"):
                 return ApiResponse.ok(st, f"已切换到 {file}，权重正在下载（进度就在界面上的下载窗口里），下完就能用")
+            if r.get("downloaded"):
+                # 竞态兜底：判完 is_model_downloaded 之后又被别人下完了 —— 同样是就绪，别报空错误
+                return ApiResponse.ok(st, f"已切换到 {file}（权重已就绪），发消息或点「重启本地模型」即可生效")
             return ApiResponse.ok(st, f"已切换到 {file}（尚未下载：{r.get('error')}）")
         @router.post("/api/runtime/local/download")
         def download_local(req: Request):
@@ -3030,8 +3195,24 @@ class LionBox:
                  port: int = 8080, config: AppConfigStore | None = None,
                  extra: dict[str, str] | None = None) -> None:
         self.t0 = time.perf_counter()
-        # 程序目录：默认取包所在目录的上一级（python/），打包后由启动器传 --app-root
-        self.app_root = Path(app_root) if app_root else Path(_ORIG_FILE_app).resolve().parent.parent
+        # 程序目录：默认取包所在目录的上一级（python/），打包后由启动器传 --app-root。
+        # 【默认值必须"不存在就回退"】`_ORIG_FILE_app` 是内联前 `python\lionbox\app.py` 的
+        # 路径，其 parent.parent = `<仓库>\python` —— 单文件布局下这个目录**不存在**
+        # （实测 Test-Path=False），而 llama-server.exe（runtime-vulkan\）和两份 4.87/5.24GB
+        # gguf 都在**仓库根**。不回退的话双击启动时 exe_path/search_dirs 全部落空：
+        # runtime_installed=False、is_model_downloaded 恒 False → startup_prepare_model
+        # 判"没下"→ 对磁盘上已存在的 5GB 权重**重复下载**（_setup_runtime.py:18-19、
+        # _start_mimo.py:80-83 都写明了这个坑）。默认目录不存在（或没有运行时）时回退到
+        # main.py 所在目录（仓库根）；显式传入的 --app-root 永远优先。
+        default_root = Path(_ORIG_FILE_app).resolve().parent.parent
+        here_root = Path(__file__).resolve().parent
+        try:
+            has_runtime = (default_root / RUNTIME_EXE_REL).is_file()
+        except OSError:
+            has_runtime = False
+        if not default_root.is_dir() or (not has_runtime and (here_root / RUNTIME_EXE_REL).is_file()):
+            default_root = here_root
+        self.app_root = Path(app_root) if app_root else default_root
         self.config = config or AppConfigStore()
         self.http = HttpApp(host=host, port=port)
         # 预热开机触发：等价于 Java 的 -Dlionbox.prewarm.on-start=true
@@ -3333,15 +3514,36 @@ _RAW_PREFIX_ESCAPED = r"\u0000lionts:"
 _RAW_RE = re.compile(r'"\\u0000lionts:(-?[0-9.]+)"', re.IGNORECASE)
 
 
+#: _pure_python_json 的并发保护：一把锁 + 引用计数（见下面的说明）
+_json_encoder_lock = threading.Lock()
+_pure_json_users = 0            # 正处于"纯 Python 编码"状态的线程数
+_pure_json_original: Any = None  # 第一个进入者存下的原编码器（可能是 None，但那是**存下来的**值）
+
+
 @contextmanager
 def _pure_python_json() -> Iterator[None]:
-    """临时把 json 模块的全局 C 编码器关掉（只影响 `_one_shot` 那条快路径）。"""
-    original = _json_encoder.c_make_encoder
-    _json_encoder.c_make_encoder = None
+    """临时把 json 模块的全局 C 编码器关掉（只影响 `_one_shot` 那条快路径）。
+
+    【为什么必须加锁 + 引用计数】旧实现是裸的读-改-写：A 进时存 original=c、置 None；
+    B 随后进时存到的 original 已经是 None；A 先退恢复 c，B **最后**退把 None 写回去 →
+    `json.encoder.c_make_encoder` 被**永久**置 None，此后全进程的 `_one_shot` dumps
+    都无声退化成纯 Python 编码（属性能/全局状态竞态，且没有任何代码会恢复它）。
+    现在：进入/退出都在锁内做引用计数，只有第一个进入者负责保存原值、最后一个退出者
+    才恢复 —— 并发序列化（会话 worker、HTTP 线程、事件线程同时 dumps）不再互相踩。
+    """
+    global _pure_json_users, _pure_json_original
+    with _json_encoder_lock:
+        if _pure_json_users == 0:
+            _pure_json_original = _json_encoder.c_make_encoder
+            _json_encoder.c_make_encoder = None
+        _pure_json_users += 1
     try:
         yield
     finally:
-        _json_encoder.c_make_encoder = original
+        with _json_encoder_lock:
+            _pure_json_users -= 1
+            if _pure_json_users == 0:
+                _json_encoder.c_make_encoder = _pure_json_original
 
 
 def parse_timestamp(raw: Any) -> datetime | None:
@@ -3966,8 +4168,11 @@ class EventStore:
             # 真错误全被淹没。首次给完整原因，之后只累计计数，收尾时汇总一条。
             self._persist_failures += 1
             if self._persist_failures == 1:
+                # 【字段名是 event_id 不是 eventId】LionEvent 是 slots 数据类（字段下划线命名），
+                # `eventId` 只是 to_dict() 里的**键名**，getattr 拿不到 → "只报这一次"的那条
+                # 关键日志恒显示 `? : ...`，磁盘不可写时根本定位不到是哪条事件。
                 print(f"[事件] 持久化失败（只报这一次，之后只计数）"
-                      f" {getattr(event, 'eventId', '?')}: {e}", flush=True)
+                      f" {getattr(event, 'event_id', '?')}: {e}", flush=True)
             elif self._persist_failures % 500 == 0:
                 print(f"[事件] 持久化累计失败 {self._persist_failures} 次（磁盘不可写？）", flush=True)
 
@@ -4252,8 +4457,16 @@ class EventStore:
                 if limit > 0 and len(events) > limit:
                     dropped += len(events) - limit
                     events = events[len(events) - limit:]
-                # 已有内存事件（启动后新写的）在后，磁盘历史在前
+                # 已有内存事件（启动后新写的）在后，磁盘历史在前。
+                # 【按 event_id 去重】后台加载是**与写入并发**的：record() 先把事件追进
+                # 内存桶、再落盘；若这条事件刚好在 load 读到它所在分片**之前**落了盘，
+                # 它会同时出现在"磁盘读回的 events"和"内存 existing"里 —— 不去重的话
+                # 同一条事件在时间线里出现两次（load_from_disk 被再次调用时同理）。
+                # 磁盘那份优先，内存里独有的（落盘失败的）原样保留。
                 existing = self._session_events.get(sid)
+                if existing:
+                    disk_ids = {e.event_id for e in events}
+                    existing = [e for e in existing if e.event_id not in disk_ids]
                 merged = events + existing if existing else events
                 self._session_events[sid] = merged
                 for e in merged:
@@ -5530,24 +5743,32 @@ class ConversationHistory:
         return self.history_dir / f"{session_id}.json"
 
     def save_to_disk(self, session_id: str) -> bool:
+        # 【快照→序列化→写盘必须整段在锁内】原来只在锁里取快照，json.dumps 与
+        # write_atomically 都在锁外：Agent worker 线程写工具结果、审批/HTTP 线程经
+        # _HistoryProxy.add_message 写【人工审核】记录时，T1 取完快照、T2 追加并先落盘，
+        # T1 的 os.replace **最后**落地 → 磁盘回退成 T1 的旧快照，T2 刚写的那条消息在磁盘上
+        # 永久丢失（内存是对的，此后没有新消息就重启 → 读文件就没了）。
+        # 持锁后"取快照"与"落盘"顺序一致（后写者后落地），内存追加顺序 = 落盘顺序。
+        # _lock 是 RLock，add_message/prune 里再进来不会死锁；锁内只做本地文件 IO，
+        # 不碰别的锁，最坏只是写盘期间读历史的线程等几十毫秒。
         with self._lock:
             messages = self._conversations.get(str(session_id))
             snapshot = list(messages) if messages else None
-        if not snapshot:
-            return False
-        # 非法 id 不参与拼路径（会话 id 从 REST 路径参数进来时是客户端可控的）
-        if not ids.is_safe(session_id):
-            print(f"[对话] 拒绝按非法会话 id 保存历史: {session_id}", flush=True)
-            return False
-        try:
-            payload = json.dumps([m.to_dict() for m in snapshot], ensure_ascii=False, indent=2,
-                                 cls=LionJsonEncoder)
-            SessionPersistence.write_atomically(self.file_for(session_id), payload)
-        except OSError as e:
-            print(f"[对话] 保存会话历史失败 {session_id}: {e}", flush=True)
-            return False
-        print(f"[对话] 会话历史已保存: {session_id} ({len(snapshot)}条消息)", flush=True)
-        return True
+            if not snapshot:
+                return False
+            # 非法 id 不参与拼路径（会话 id 从 REST 路径参数进来时是客户端可控的）
+            if not ids.is_safe(session_id):
+                print(f"[对话] 拒绝按非法会话 id 保存历史: {session_id}", flush=True)
+                return False
+            try:
+                payload = json.dumps([m.to_dict() for m in snapshot], ensure_ascii=False, indent=2,
+                                     cls=LionJsonEncoder)
+                SessionPersistence.write_atomically(self.file_for(session_id), payload)
+            except OSError as e:
+                print(f"[对话] 保存会话历史失败 {session_id}: {e}", flush=True)
+                return False
+            print(f"[对话] 会话历史已保存: {session_id} ({len(snapshot)}条消息)", flush=True)
+            return True
 
     def load_from_disk(self, session_id: str) -> bool:
         if not ids.is_safe(session_id):
@@ -5572,6 +5793,13 @@ class ConversationHistory:
               + (f"，跳过 {dropped} 条坏数据" if dropped else "") + ")", flush=True)
         return True
     def delete_from_disk(self, session_id: str) -> bool:
+        """删掉历史文件。返回**删除操作是否成功**（幂等：文件本来就没有也算成功）。
+
+        【为什么不返回"文件是否存在"】_destroy_one 要按返回值判断"这个会话删干净没有"，
+        旧实现返回 `existed` —— 文件不存在时回 False，会被误判成"磁盘删除失败"（其实已经
+        是想要的状态）。真正的失败只有两种：id 非法、unlink 抛 OSError（Windows 上被杀毒/
+        索引器短暂锁住时就会发生）——这两种才回 False。
+        """
         if not ids.is_safe(session_id):
             print(f"[对话] 拒绝按非法会话 id 删除历史文件: {session_id}", flush=True)
             return False
@@ -5583,7 +5811,7 @@ class ConversationHistory:
             return False
         if existed:
             print(f"[对话] 会话历史文件已删除: {session_id}", flush=True)
-        return existed
+        return True
 
     def get_saved_session_ids(self) -> list[str]:
         try:
@@ -5706,9 +5934,11 @@ class SessionManager:
             updated = Session(old.session_id, old.workspace_id, old.mode, old.created_at, cleaned,
                               old._extra)
             self._sessions[session_id] = updated
-            persistence = self.persistence
-        if persistence is not None:
-            persistence.save_session(updated)
+            # 【落盘必须在锁内】原来在锁外 save_session：并发改名时 T2 的新名字先落盘、
+            # T1 的旧名字**后落盘** → 磁盘回退成旧值（内存是新的，重启读文件又变回去）。
+            # save_session 只做本地原子写、不回头拿本锁，放进锁内不会死锁。
+            if self.persistence is not None:
+                self.persistence.save_session(updated)
         print(f"[会话] 会话已重命名: {session_id} -> {cleaned}", flush=True)
         return True
 
@@ -5727,9 +5957,10 @@ class SessionManager:
             updated = Session(old.session_id, str(workspace_id), old.mode, old.created_at, old.name,
                               old._extra)
             self._sessions[session_id] = updated
-            persistence = self.persistence
-        if persistence is not None:
-            persistence.save_session(updated)
+            # 【落盘必须在锁内】与 rename_session 同一个丢更新问题：两个并发的换工作区/改名
+            # 交错落盘时，后写的旧快照会盖掉先写的新值 → 重启读文件回退。
+            if self.persistence is not None:
+                self.persistence.save_session(updated)
         print(f"[会话] 会话已换工作区: {session_id} -> {workspace_id}", flush=True)
         return True
 
@@ -6597,7 +6828,11 @@ class _SessionPersistenceStub:
 
     def delete_session(self, session_id: str) -> bool:
         with self._lock:
-            return self._saved.pop(str(session_id), None) is not None
+            self._saved.pop(str(session_id), None)
+            # 幂等返回 True：桩的存储本来就在内存，"没有可删的"就是删干净了。
+            # 返回 False 会被 _destroy_one 当成"磁盘删除失败"（真实现 unlink 用 missing_ok，
+            # 文件不存在也不算失败）—— 语义必须对齐，否则桩路径下销毁会话永远报失败。
+            return True
 
 
 class _SkillRepositoryStub:
@@ -6708,15 +6943,29 @@ class SessionsApi:
         self.history()
         self.persistence()
 
-    def _destroy_one(self, session_id: str) -> None:
-        """Java `destroySession` 里那串清理（单删与"清空所有"共用一套）。"""
+    def _destroy_one(self, session_id: str) -> bool:
+        """Java `destroySession` 里那串清理（单删与"清空所有"共用一套）。
+
+        返回 True = **磁盘上也删干净了**；False = 至少一个删除操作失败（只打了日志）。
+        【为什么必须汇总】被调方失败时只 `print` + `return False`
+        （SessionPersistence.delete_session 的 unlink OSError、ConversationHistory
+        .delete_from_disk 同理 —— Windows 上被杀毒/索引器短暂锁住 .json 就会发生），
+        旧实现把返回值全丢了 → 路由无条件回"会话已销毁"、destroy_all 的 failed **永远 0**，
+        而残留的 <id>.json 会在重启时被 load_all_sessions 读回来 —— "删掉了又复活"。
+        只统计 bool 返回值：None 是 void 方法/窄桩（clear_session、_clear_events）→ 视为成功；
+        _clear_events 装配缺失时抛 DependencyMissing，照抛（那是部署问题，必须暴露）。
+        """
+        ok = True
         self.sessions().destroy_session(session_id)
-        self.persistence().delete_session(session_id)
+        if self.persistence().delete_session(session_id) is False:
+            ok = False
         history = self.history()
         history.clear_history(session_id)
-        history.delete_from_disk(session_id)
+        if history.delete_from_disk(session_id) is False:
+            ok = False
         self.skills().clear_session(session_id)
         _clear_events(self.events(), session_id)
+        return ok
 
     # ---- 注册 ----
     def register__api_sessions(self, router) -> None:
@@ -6804,7 +7053,12 @@ class SessionsApi:
             # 先确认真的存在：不校验就删等于"删任意 id 都算成功"
             if api.sessions().get_session(session_id) is None:
                 return ApiResponse.error("会话不存在: " + session_id)
-            api._destroy_one(session_id)
+            # 【磁盘删失败必须报错】_destroy_one 现在回传汇总结果：持久化/历史文件 unlink
+            # 抛 OSError（Windows 杀毒/索引器短锁）时旧实现照样回"会话已销毁"——
+            # 重启后 load_all_sessions 把残留的 <id>.json 读回来，界面"删掉了又复活"。
+            if not api._destroy_one(session_id):
+                return ApiResponse.error(
+                    "删除会话失败（磁盘文件未删掉，重启后可能还在列表里；原因见后端日志）")
             return ApiResponse.ok(None, "会话已销毁")
 
         @router.delete("/api/sessions")
@@ -6815,8 +7069,13 @@ class SessionsApi:
             failed = 0
             for session_id in ids:
                 try:
-                    api._destroy_one(session_id)
-                    deleted += 1
+                    # False = 磁盘文件没删掉（被调方只打了日志）——旧实现把它算进 deleted，
+                    # failed 只统计抛异常的，OSError 被吞掉后永远是 {"failed": 0}。
+                    if api._destroy_one(session_id):
+                        deleted += 1
+                    else:
+                        failed += 1
+                        log__api_sessions.warning("清空对话时删除会话失败（磁盘文件未删掉）: %s", session_id)
                 except Exception as e:     # Java 的刻意设计：一个失败不影响其余，最后报数量
                     failed += 1
                     log__api_sessions.warning("清空对话时删除会话失败: %s - %s", session_id, e)
@@ -17142,9 +17401,13 @@ class SoundNotifier:
         """播放提示音（AgentLoop 的触发点调用）：严格按配置过一遍开关、音量、节流。"""
         self._emit(kind, preview=False)
 
-    def preview(self, kind: str | None) -> None:
-        """试听（设置界面的"试听"按钮）：不过总开关也不过节流，但仍尊重音量。"""
-        self._emit(kind, preview=True)
+    def preview(self, kind: str | None) -> str | None:
+        """试听（设置界面的"试听"按钮）：不过总开关也不过节流，但仍尊重音量。
+
+        返回 None = 已真正发起播放；否则返回失败原因 —— 试听接口必须如实回报，
+        资源缺失/非 Windows/声卡异常以前被吞进 degraded 后仍回"已播放"（审查 17699）。
+        """
+        return self._emit(kind, preview=True)
 
     def is_enabled(self) -> bool:
         """总开关当前是否打开。"""
@@ -17190,34 +17453,55 @@ class SoundNotifier:
     # ------------------------------------------------------------------
     # 内部实现
     # ------------------------------------------------------------------
-    def _emit(self, kind: str | None, preview: bool) -> None:
-        """统一入口；`preview=True` 时跳过开关与节流。"""
+    def _emit(self, kind: str | None, preview: bool) -> str | None:
+        """统一入口；`preview=True` 时跳过开关与节流。
+
+        返回 None = 已按规则发起播放；返回非空字符串 = 这次播放**没有发生**的原因。
+        【为什么】`play()` 主流程忽略返回值（fire-and-forget 照旧），但试听接口必须
+        拿到真实结果 —— 资源缺失/非 Windows/声卡异常以前被吞进 degraded 后接口仍回
+        "已播放"，试听按钮彻底失去诊断能力（审查 main.py:17699）。
+        """
         if kind is None or kind not in Kind.SPEC:
-            return
+            return f"未知的音效类型: {kind}"
         try:
             cfg = self._config()
             if not preview:
                 if not bool_of(cfg, "enabled", self.DEFAULT_ENABLED):
-                    return                                   # 总开关关着
+                    return "音效提醒总开关已关闭"              # 总开关关着
                 if not bool_of(cfg, Kind.config_key(kind), True):
-                    return                                   # 这一类关着
+                    return f"音效类别已关闭: {kind}"            # 这一类关着
 
             volume = clamp(int_of__misc_sound(cfg, "volume", self.DEFAULT_VOLUME), 0, 100)
             if volume <= 0:
-                return                                       # 静音
+                return "音量是 0（静音），没有播放"             # 静音
 
             if not preview and not self._allow_by_throttle(
                     kind, max(0, int_of__misc_sound(cfg, "minIntervalMs", self.DEFAULT_MIN_INTERVAL_MS))):
-                return                                       # 太密了，跳过
+                return "距上次播放不足最小间隔（节流跳过）"      # 太密了，跳过
 
             wav = self._load_sound(kind)
             if not wav:
-                self._degrade(f"提示音资源缺失，跳过: {Kind.file_name(kind)}")
-                return
-            self._start_async(kind, wav, volume)
+                reason = f"提示音资源缺失，跳过: {Kind.file_name(kind)}"
+                self._degrade(reason)
+                return reason
+            if not preview:
+                self._start_async(kind, wav, volume)           # 主流程：不阻塞
+                return None
+            # 试听：同步等起播结果。_play_wav 用 SND_ASYNC"起播即返回"，这里 join 等的
+            # 是"起播成败"而不是播完整段音效 —— 不等就拿不到声卡失败，接口照样假成功。
+            outcome: list[str] = []
+            thread = self._start_async(kind, wav, volume, outcome)
+            thread.join(10.0)
+            if thread.is_alive():
+                return "起播结果超时未返回（播放线程 10 秒未收尾）"
+            if outcome:
+                return outcome[0]          # 播放线程里的原始失败原因（同 degraded 那条）
+            return None
         except Exception as t:
             # 兜底：声音相关的一切问题都不该影响主流程
-            self._degrade(f"播放提示音失败（忽略）: {t}")
+            reason = f"播放提示音失败: {type(t).__name__}: {t}"
+            self._degrade(reason)
+            return reason
 
     def _allow_by_throttle(self, kind: str, min_interval_ms: int) -> bool:
         """节流：每种音效各自计时，距上次播放不足间隔就跳过。
@@ -17234,21 +17518,33 @@ class SoundNotifier:
             self._last_played_at[kind] = now
             return True
 
-    def _start_async(self, kind: str, wav: bytes, volume: int) -> None:
-        """守护线程里异步播放（绝不阻塞调用方）。"""
+    def _start_async(self, kind: str, wav: bytes, volume: int,
+                     outcome: list[str] | None = None) -> threading.Thread:
+        """守护线程里异步播放（绝不阻塞调用方）。返回播放线程，试听要 join 它拿真实结果。
+
+        `outcome` 非 None 时，起播失败的原因会 append 进去（与 degraded 记的是同一句）——
+        试听接口据此如实报错，而不是无条件回"已播放"（审查 main.py:17699）。
+        """
 
         def worker() -> None:
             try:
                 if not _play_wav(wav, Kind.file_name(kind), volume):
-                    self._degrade(f"音频设备不可用或系统不支持，跳过播放 {Kind.file_name(kind)}")
+                    reason = f"音频设备不可用或系统不支持，跳过播放 {Kind.file_name(kind)}"
+                    self._degrade(reason)
+                    if outcome is not None:
+                        outcome.append(reason)
                     return
                 with self._lock:
                     self._started_count += 1
             except Exception as e:                            # 播放线程里的异常绝不外泄
-                self._degrade(f"播放异常，跳过 {Kind.file_name(kind)}: {e}")
+                reason = f"播放异常，跳过 {Kind.file_name(kind)}: {e}"
+                self._degrade(reason)
+                if outcome is not None:
+                    outcome.append(reason)
 
         thread = threading.Thread(target=worker, name="lion-sound", daemon=True)
         thread.start()
+        return thread
 
     def _load_sound(self, kind: str) -> bytes | None:
         """读 WAV 字节，读到的缓存起来。"""
@@ -17552,12 +17848,18 @@ class NotificationApi:
 
             # 试听绕过节流与开关（允许连点），但音量仍按配置走
             volume = int_of__misc_sound(api._current(), "volume", SoundNotifier.DEFAULT_VOLUME)
-            api._sound().preview(kind)
+            if volume <= 0:
+                # 静音时 _emit 直接不播：必须在试听**之前**判，否则也是假"已播放"
+                return ApiResponse.ok_msg("音量是 0，听不到声音——把音量调大再试", kind)
+            # preview() 返回失败原因或 None：资源缺失/非 Windows/声卡异常以前全被吞进
+            # degraded，接口却永远回 200+"已播放 x 音效"（审查 main.py:17699）—— 现在如实回报
+            reason = api._sound().preview(kind)
+            if reason is not None:
+                # 【注意参数序】error 只带 message；失败原因与 degraded 最近一条是同一句
+                return ApiResponse.error(f"试听失败: {reason}")
             # 【注意参数序】Java 是 `ApiResponse.ok(String message, T data)`，与 Python 侧
             # `ApiResponse.ok(data, message)` 相反 —— 这里必须用 `ok_msg(message, data)`，
             # 否则 message 与 data 会互换（前端读的是 data，会显示成一串中文提示）。
-            if volume <= 0:
-                return ApiResponse.ok_msg("音量是 0，听不到声音——把音量调大再试", kind)
             return ApiResponse.ok_msg(f"已播放 {kind.lower()} 音效", kind)
 
 
@@ -18008,18 +18310,30 @@ class NativeDialogApi:
             log__api_native_dialog.info("文件夹选择脚本结束 exit=%s result=%s stdout=%s",
                      outcome.exit_code, result, stdout)
 
-            # 进程异常退出（崩溃/被杀）→ 明确报错，而非误判为取消
-            if outcome.exit_code != 0 and (result is None or not result.startswith("OK|")):
+            # 进程异常退出（崩溃/被杀）→ 明确报错，而非误判为取消。
+            # 【但协议优先于退出码】脚本把 FAIL|（AddType 编译失败/回退对话框失败）和
+            # 回退对话框的 CANCEL| 都写成"协议文本 + exit 1" —— 若先按 exit!=0 拦截，
+            # FAIL 分支是死代码、具体失败原因永远显示不出来，回退对话框点取消还会被报成
+            # "异常退出（exit=1）"而不是"用户取消选择"（审查 main.py:18257）。
+            if result is None or result == "":
+                # 结果文件缺失（写失败/极老路径）：脚本的兜底是把**协议行本身**打到
+                # stdout（Write-Result 的 catch 分支）—— 必须原样采用，绝不能再包一层
+                # "OK|"：'OK|路径' 包完 selected 会变成 'OK|C:\\..' 垃圾路径并当成功目录
+                # 返回；'CANCEL|' 包完变成 'OK|CANCEL|'，用户点取消却收到成功响应
+                # （审查 main.py:18267）。
+                if stdout.startswith(("OK|", "CANCEL|", "FAIL|")):
+                    log__api_native_dialog.info("结果文件为空，采用 stdout 协议行兜底: %s", stdout)
+                    result = stdout
+                elif stdout:
+                    # 无协议前缀的 stdout 噪音不能当目录返回：不静默，记日志后落到统一
+                    # 收尾（result 仍为空 → 走"用户取消选择/异常退出"分支）。
+                    log__api_native_dialog.info("结果文件为空且 stdout 无协议前缀，按取消处理: %s", stdout)
+
+            # 协议文本已分派完仍为空 + 非零退出，才是进程真的崩了（没写出任何协议）
+            if (result is None or result == "") and outcome.exit_code not in (None, 0):
                 log__api_native_dialog.error("文件夹选择脚本异常退出: exit=%s result=%s stdout=%s",
                           outcome.exit_code, result, stdout)
                 return ApiResponse.error(f"文件夹选择窗口异常退出（exit={outcome.exit_code}）")
-
-            if result is None or result == "":
-                # 结果文件缺失：极老路径或异常，看 stdout 兜底
-                fallback = stdout
-                if fallback and not fallback.startswith("FAIL"):
-                    log__api_native_dialog.info("结果文件为空，使用 stdout 兜底: %s", fallback)
-                    result = "OK|" + fallback
 
             if result is not None and result.startswith("OK|"):
                 selected = result[3:].strip()
@@ -18033,7 +18347,8 @@ class NativeDialogApi:
                 log__api_native_dialog.error("文件夹选择对话框失败: %s", msg)
                 return ApiResponse.error("打开对话框失败: " + msg)
 
-            # CANCEL 或未知
+            # CANCEL 或未知（含 exit=0 且无协议的极老路径/无协议 stdout：按"取消"处理，
+            # 与 Java 一致；绝不能把 stdout 噪音当目录返回）
             log__api_native_dialog.info("用户取消文件夹选择或未选择目录 (result=%s, stdout=%s)", result, stdout)
             return ApiResponse.error("用户取消选择")
         except Exception as e:                       # 与 Java 的 catch (Exception e) 对齐
@@ -21535,8 +21850,12 @@ class ChatApi:
                 return _error_response("会话不存在")
 
             dispatcher = api.dispatcher()
-            # 会话忙（有同步任务在跑/排队）时拒绝流式：否则两边同时写历史会写乱
-            if not dispatcher.try_acquire_stream(session_id):
+            # 会话忙（有同步任务在跑/排队）时拒绝流式：否则两边同时写历史会写乱。
+            # 【只做不改状态的预检查】真正占用挪进 _stream_frames 生成器第一句：
+            # 这里到生成器启动之间可能出异常（saved_model/expand_mentions 读盘），
+            # 或客户端在响应头写出前断开导致生成器从未被启动 —— 占用若记在这里，
+            # _streaming_sessions 的条目将没有任何释放路径，该会话之后永远"会话正忙"。
+            if dispatcher.is_busy(session_id):
                 return _error_response("会话正忙，请等待当前任务完成")
 
             level = _parse_level(level_name)
@@ -21678,7 +21997,16 @@ class ChatApi:
         否则那条会话会永远"正忙"。
         """
         dispatcher = self.dispatcher()
+        acquired = False
         try:
+            # 【占用放生成器第一句】生成器启动才加锁：未启动（连接在响应头前断开、
+            # 端点在构造 Response 前抛异常）则根本没加锁，finally 不需要释放；
+            # 已启动则 finally 必然执行 —— 消灭"acquire 之后生成器没跑"的锁泄漏。
+            # 预检查与这里的失败都回同一句"会话正忙"（端点已发 SSE 头，走错误帧）。
+            acquired = dispatcher.try_acquire_stream(session_id)
+            if not acquired:
+                yield _error_frame("会话正忙，请等待当前任务完成")
+                return
             loop = self.ctx.service("agent_loop", lambda: deps.AgentLoopStub())
             mode = self.sessions().get_effective_mode(session_id)
             for chunk in loop.process_message_stream(session_id, message, mode, level, model):
@@ -21691,7 +22019,10 @@ class ChatApi:
                       exc_info=True)
             yield _error_frame(f"处理消息失败: {type(e).__name__}: {e}")
         finally:
-            dispatcher.release_stream(session_id)
+            # 只释放自己拿到的占用：预检查/竞争失败时 acquired 为 False，
+            # 此时会话可能被别的流式请求占着，无条件 release 会把别人的锁摘掉。
+            if acquired:
+                dispatcher.release_stream(session_id)
 
 
 # --------------------------------------------------------------------------
@@ -22249,6 +22580,12 @@ def install_real_services(ctx: Any) -> dict[str, Any]:
         if budget is not None:
             ctx.install("context_budget", budget)
             step("上下文预算接线(context_window)", lambda: _hook_budget(budget))
+        # 【预热的 prompt_provider 必须在这里接线】PrewarmService 构造时没人传它，
+        # 一直用兜底的占位前缀（DEFAULT_PREFIX 几百 token + 空工具表）—— 而预热的全部价值
+        # 就是提前算"系统提示词 + 50 多个工具定义（3~9K token）"的前缀 KV（见 prewarm 模块头）。
+        # 不接线 = 每次都白烧几百 token 还报"预热完成：前缀 N token"，真实第一条消息照样全量
+        # prefill。AgentLoop 造好后这里把真实提供者注进去（与 2636/3081 的后台线程风格一致）。
+        step("预热提示词接线(prewarm.prompt_provider)", lambda: _hook_prewarm(ctx, loop))
 
     # ---- 7) 工具接线点 -----------------------------------------------------
     step("context_prune 接线", lambda: _hook_prune(history))
@@ -22279,6 +22616,14 @@ def _build_events(ctx: Any) -> Any:
     # 【必须先把事件 sink 换成它】否则插件注册/工具调用的事件写进插件系统自己那份
     # EventStore，而接口读的是另一个实例 —— 前端轮询的 🔧/✅/❌ 永远画不出来。
     set_default_event_sink(store)
+    # 【历史加载原来全工程零调用】构造处不传 auto_load（默认 False），而
+    # start_background_load/load_from_disk 只有定义、没有任何调用点 —— 查询路径
+    # get_session_events 又是纯内存的，于是**重启后旧会话的事件时间线恒为 []**：
+    # 会话列表由 SessionManager 正常恢复出来，点进去却没有时间线，分片里已持久化的事件
+    # 和迁移来的旧事件永远读不回来（写入侧一直在落盘，等于白写）。
+    # 这里补上后台加载：与上面的迁移线程同一风格 —— 端口立刻可用，加载在后台跑完；
+    # _merge_loaded 按 event_id 去重，加载期间新写的事件不会变成两条。
+    store.start_background_load()
     ctx.install("events", store)
     return store
 
@@ -22481,6 +22826,35 @@ def _permission_resolver(ctx: Any, sessions: Any):
     return resolve
 
 
+def _hook_prewarm(ctx: Any, loop: Any) -> None:
+    """把真实的「系统提示词 + 工具定义」注入预热服务（`PrewarmService.prompt_provider`）。
+
+    【不接线时预热是假的】`RuntimeApi.__init__` 构造 PrewarmService 时没传 prompt_provider
+    （全工作区也只有这一处构造），于是永远用兜底的 `(DEFAULT_PREFIX, [])` —— warm_up 白算
+    几百 token 的占位前缀、`if tools:` 永不生效，却照样打印"预热完成：前缀 N token"；
+    而预热的全部价值是提前算**真实**系统提示词 + 50 多个工具定义（3~9K token）的前缀 KV
+    （见 prewarm 模块头），这些只有 AgentLoop 造好之后才拿得到 —— 所以在这里注入。
+    AgentLoop 缺方法 / 提示词生成出错时退回占位前缀并留一条日志，绝不让预热线程炸掉。
+    ctx 没带 RuntimeApi（纯接口层自检的装配路径）时没有可注入对象，直接返回。
+    """
+    prewarm = getattr(ctx, "prewarm", None)
+    if prewarm is None or loop is None:
+        return
+
+    def _provide() -> tuple[str, list[dict[str, Any]]]:
+        try:
+            mode = AgentMode.STANDARD
+            # native_tools=True：warm_up 会把 tools 放进 body["tools"] 下发，
+            # 提示词里那段"本次请求已随消息下发 N 个工具定义"才是真的。
+            return (loop.build_system_prompt(mode, None, "", True, None),
+                    loop.build_tool_definitions(mode, None))
+        except Exception as e:  # noqa: BLE001 预热失败不能拖垮启动/接口
+            print(f"[预热] 生成真实预热前缀失败，退回占位前缀: {type(e).__name__}: {e}", flush=True)
+            return DEFAULT_PREFIX, []
+
+    prewarm.prompt_provider = _provide
+
+
 def _hook_budget(budget: Any) -> None:
     from lionbox.tools.context import context_window
     context_window.set_budget(budget)
@@ -22627,6 +23001,54 @@ def _apply_property_overrides(extra: dict[str, str]) -> None:
             os.environ[env] = str(extra[key])
 
 
+def _warn_late_snapshot_overrides(argv: list[str]) -> None:
+    """校验"空格写法"的启动属性是否对 import 期快照失效（审查 main.py:22953）。
+
+    文件头的 argv 预扫描只认 `--key=value`（本文件 144-149 行）；`--key value` 空格
+    写法要到 `_apply_property_overrides` 才落环境变量 —— 而内联单文件里所有模块体早在
+    导入本文件时就执行完了，`DEFAULT_WORKSPACE_PATH` / `DEFAULT_STORE_PATH` 这类
+    **导入期快照**常量拿到的是旧值，覆盖静默失效，启动横幅却还会把它打印成"覆盖配置"
+    让人误以为生效了。这里逐个对账：环境变量已是新值、快照常量却不是 → 打醒目警告
+    （不打断启动：仍读 os.environ 的懒加载消费者确实生效，只有快照那批是旧的）。
+    """
+    late: set[str] = set()
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        # 与 _collect_overrides 的取值规则一致：空格写法 = 后面跟一个不以 -- 开头的参数
+        if a.startswith("--") and "=" not in a and a[2:] in PROPERTY_ENV:
+            late.add(a[2:])
+            i += 2 if i + 1 < len(argv) and not argv[i + 1].startswith("--") else 1
+        else:
+            i += 1
+    if not late:
+        return
+    checks: list[tuple[str, str, tuple[str, ...]]] = [
+        ("lion.workspace.default-path", "LION_WORKSPACE_DEFAULT_PATH",
+         ("DEFAULT_WORKSPACE_PATH", "DEFAULT_WORKSPACE_PATH__sessions_history")),
+        ("lion.event.store-path", "LION_EVENT_STORE_PATH", ("DEFAULT_STORE_PATH",)),
+    ]
+    g = globals()
+    for key, env, const_names in checks:
+        if key not in late:
+            continue
+        want = os.environ.get(env, "").strip()
+        if not want:
+            continue                  # 空值等价于没覆盖（_collect_overrides 的缺值分支）
+        stale: list[str] = []
+        for name in const_names:
+            value = g.get(name)
+            if value is None:
+                continue
+            flat = os.fspath(value) if isinstance(value, (str, os.PathLike)) else str(value)
+            if flat != want:
+                stale.append(name)
+        if stale:
+            print(f"⚠ 启动覆盖 --{key} {want} 用的是空格写法，对导入期快照太晚 —— "
+                  f"{', '.join(stale)} 仍是旧值（相关目录还写到旧位置）。"
+                  f"改用 --{key}={want} 等号写法可让快照也生效。", file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lionbox", description="Lion Code 本地 AI 编程助手（Python 版）")
     p.add_argument("--server.port", dest="port", type=int, default=8080)
@@ -22663,6 +23085,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     extra, rest = _collect_overrides(argv)
     _apply_property_overrides(extra)      # 必须在下面这些 import 之前
+    _warn_late_snapshot_overrides(argv)   # 空格写法对 import 期快照太晚 —— 校验并如实告警
 
     from lionbox.app import VERSION, LionBox
     from lionbox.config.store import AppConfigStore
@@ -22673,9 +23096,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     host, port = args.host, args.port
-    if args.bind and ":" in args.bind:
-        h, p = args.bind.rsplit(":", 1)
-        host, port = h or host, int(p)
+    if args.bind:
+        if ":" in args.bind:
+            h, p = args.bind.rsplit(":", 1)
+            try:
+                port = int(p)
+            except ValueError:
+                # 裸 int() 会把 argparse 之后的启动变成一段 traceback（审查 main.py:22966）
+                print(f"--bind-addr 端口必须是数字: {args.bind!r}", file=sys.stderr)
+                return 2
+            host = h or host
+        else:
+            # code-server 习惯允许 `--bind-addr 127.0.0.1` 这种只给 host 的写法，
+            # 原来不带冒号整个参数被静默丢弃 —— 用户以为地址改成功了，服务还监听
+            # 在默认 127.0.0.1:8080（审查 main.py:22966）。至少要出声。
+            print(f"--bind-addr 格式应为 host:port，本次被忽略: {args.bind!r}", file=sys.stderr)
 
     app_root = Path(args.app_root) if args.app_root else None
     # 先把默认目录设成进程级：技能仓库/插件设置等模块各自 new AppConfigStore 时才一致
@@ -24653,12 +25088,25 @@ class SessionDispatcher:
     def release_stream(self, session_id: str) -> None:
         with self._lock:
             self._streaming_sessions.discard(session_id)
+            # 流式占用期间提交的同步消息会被 _start_worker 按下面的互斥规则拒绝起 Worker，
+            # 因此释放时必须在同一把锁里复查队列并拉起 —— 否则那些 future 永远没人消费，
+            # 同步请求只能干等超时（本批审查 24948 的配套修复）。
+            if self.message_queue.pending_count(session_id) > 0:
+                self._start_worker(session_id)
 
     # ------------------------------------------------------------ Worker
     def _start_worker(self, session_id: str) -> None:
         with self._lock:
             if session_id in self._active_sessions:
                 return          # 已有 Worker 在处理该会话
+            if session_id in self._streaming_sessions:
+                # 【互斥必须对称】is_busy()/try_acquire_stream() 查两个集合，这里也必须查：
+                # 流式进行中同会话再发同步消息时，若这里只查 _active_sessions 就会另起
+                # Worker —— 而 AgentLoop 的 process_message 与 process_message_stream
+                # 都不持会话级锁，两边并发 _append_history 会把同一会话历史交错写乱、
+                # 结果互相覆盖（本文件 ConversationHistory 已有同类并发写丢数据记录）。
+                # 流式期间排队的消息由 release_stream 在释放时拉起 Worker 消费。
+                return
             self._active_sessions.add(session_id)
         threading.Thread(target=self._worker_entry, args=(session_id,),
                          name="lion-session-worker", daemon=True).start()
@@ -25176,12 +25624,34 @@ def _ink_frontend_cmd() -> list | None:
     return [bun, "run", "--conditions=browser", app]
 
 
-def _wait_backend(port: int, proc, timeout: float = 90.0) -> bool:
-    """等后端开始监听（连不上时 urllib 抛异常，别拿返回值判断）。"""
+def _ink_int_option(name: str, raw: str) -> int | None:
+    """`_ink_main` 的数字选项解析：非法值给明确报错并返回 None。
+
+    【为什么】裸 `int()` 抛 ValueError 时用户看到的是裸 traceback，连 argparse 的
+    usage 提示都没有，而且这发生在后端子进程启动之前（审查 main.py:25499）。
+    """
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        print(f"{name} 必须是数字: {raw}", file=sys.stderr)
+        return None
+
+
+def _ink_probe_host(host: str) -> str:
+    """健康检查要探测的地址：通配绑定地址回落 127.0.0.1（0.0.0.0 上的 urllib 不可靠）。"""
+    return "127.0.0.1" if host in ("", "0.0.0.0", "*", "::") else host
+
+
+def _wait_backend(port: int, proc, timeout: float = 90.0, host: str = "127.0.0.1") -> bool:
+    """等后端开始监听（连不上时 urllib 抛异常，别拿返回值判断）。
+
+    `host` 必须是后端**实际监听**的地址（--bind-addr / --server.address 指定时）——
+    一律打 127.0.0.1 会空等 90 秒再误报"后端没能起来"（审查 main.py:25472）。
+    """
     import time as _t
     import urllib.request
     deadline = _t.time() + timeout
-    url = f"http://127.0.0.1:{port}/health"
+    url = f"http://{_ink_probe_host(host)}:{port}/health"
     while _t.time() < deadline:
         if proc.poll() is not None:
             return False
@@ -25201,6 +25671,12 @@ def _ink_main(argv: list | None = None) -> int:
 
     args = list(sys.argv[1:] if argv is None else argv)
     port = 8080
+    # 【健康检查/TUI 必须打"后端实际监听"的地址】原实现只认 --server.port：
+    # --bind-addr / --server.address 会原样透传给后端（后端真按它监听），而这里仍探
+    # 127.0.0.1:8080 → 全程连接被拒，空等 90 秒后误报"后端没能起来（端口可能被占用）"
+    # （审查 main.py:25472）。所以两类地址选项都要解析进 host/port。
+    host = "127.0.0.1"
+    bind_spec: str | None = None      # --bind-addr 最后统一生效（与后端解析顺序一致）
     workspace = None
     script_arg = ""
     rest: list = []
@@ -25208,10 +25684,32 @@ def _ink_main(argv: list | None = None) -> int:
     while i < len(args):
         a = args[i]
         if a.startswith("--server.port="):
-            port = int(a.split("=", 1)[1])
+            p = _ink_int_option("--server.port", a.split("=", 1)[1])
+            if p is None:
+                return 2
+            port = p
         elif a == "--server.port" and i + 1 < len(args):
             i += 1
-            port = int(args[i])
+            p = _ink_int_option("--server.port", args[i])
+            if p is None:
+                return 2
+            port = p
+        elif a.startswith("--server.address="):
+            host = a.split("=", 1)[1] or host
+            rest.append(a)
+        elif a == "--server.address" and i + 1 < len(args):
+            i += 1
+            rest.append(a)
+            rest.append(args[i])
+            host = args[i] or host
+        elif a.startswith("--bind-addr="):
+            bind_spec = a.split("=", 1)[1]
+            rest.append(a)
+        elif a == "--bind-addr" and i + 1 < len(args):
+            i += 1
+            rest.append(a)
+            rest.append(args[i])
+            bind_spec = args[i]
         elif a.startswith("--lion.workspace.default-path="):
             workspace = a.split("=", 1)[1]
             rest.append(a)
@@ -25220,6 +25718,19 @@ def _ink_main(argv: list | None = None) -> int:
         else:
             rest.append(a)
         i += 1
+
+    if bind_spec is not None:
+        # 后端 main() 的规则：有冒号 → host:port 覆盖 --server.address/--server.port；
+        # 没冒号 → 后端打警告并忽略。这里必须逐字对齐，否则探测地址会和后端实际监听
+        # 的地址各说各话（审查 main.py:25472）。
+        if ":" in bind_spec:
+            h, p = bind_spec.rsplit(":", 1)
+            port2 = _ink_int_option("--bind-addr", p)
+            if port2 is None:
+                return 2
+            host, port = (h or host), port2
+        else:
+            print(f"--bind-addr 格式应为 host:port，本次被忽略: {bind_spec}", file=sys.stderr)
 
     ink = _ink_frontend_cmd()
     if ink is None:
@@ -25260,7 +25771,16 @@ def _ink_main(argv: list | None = None) -> int:
         log_file = (log_dir / "backend.log").open("a", encoding="utf-8", errors="replace")
     except OSError:
         log_file = open(os.devnull, "w", encoding="utf-8")
-    server_args = [f"--server.port={port}", *rest]
+    # 【显式告诉后端"程序目录"在哪】不给 --app-root 时后端按内联前 python\lionbox\app.py
+    # 推默认（<仓库>\python），单文件布局下该目录不存在 → 找不到 llama-server/模型、
+    # 还触发对已存在权重的重复下载（LionBox.__init__ 里那条 bug 的完整链条）。
+    # 后端自己也有"不存在就回退仓库根"的兜底，这里再显式给一次是双保险；
+    # 用户自己传过 --app-root 时以用户的为准（不重复添加）。
+    if not any(str(a) == "--app-root" or str(a).startswith("--app-root=") for a in rest):
+        server_args = [f"--server.port={port}",
+                       f"--app-root={_Path(os.path.abspath(__file__)).parent}", *rest]
+    else:
+        server_args = [f"--server.port={port}", *rest]
     log_file.write(f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} 后端启动 "
                    f"{' '.join(server_args)} =====\n")
     log_file.flush()
@@ -25275,8 +25795,8 @@ def _ink_main(argv: list | None = None) -> int:
 
     rc = 0
     try:
-        if not _wait_backend(port, proc):
-            print("后端没能起来（端口可能被占用）。日志尾部：")
+        if not _wait_backend(port, proc, host=host):
+            print(f"后端没能起来（{_ink_probe_host(host)}:{port} 连不上，端口可能被占用）。日志尾部：")
             try:
                 log_file.flush()
                 for line in (log_dir / "backend.log").read_text(
