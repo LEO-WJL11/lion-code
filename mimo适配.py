@@ -341,6 +341,9 @@ def session_messages(sid: str) -> tuple:
         else:
             base.update({"parentID": parent, "modelID": MODEL_ID,
                          "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT})
+            # 历史消息同样必填 path/cost/tokens —— 重开/刷新会话读的就是这一条路径
+            # （对话框崩不崩只看数据形状，历史与流式一视同仁 ✓）
+            base.update(assistant_shape())
         msgs.append(base)
         mid_parts = []
         text = str(rec.get("content") or "")
@@ -430,6 +433,35 @@ def create_backend_session(directory: str = "") -> str:
     return str(data.get("sessionId") or data.get("id") or "")
 
 
+def assistant_shape() -> dict:
+    """AssistantMessage 必填、而适配层两处构造都漏掉的三组字段。
+
+    【以哪为准】`packages/sdk/src/v2/gen/types.gen.ts` 的 AssistantMessage（L1028）：
+        L1054  path:   {cwd, root}                                ← 必填
+        L1059  cost:   number                                     ← 必填
+        L1060  tokens: {input, output, reasoning, cache:{read,write}}  ← 必填
+    （UserMessage 没有这三项 ✓ 我们 user 分支本来就对 ✓）
+
+    【谁在读、为什么缺了就 fatal】全是**裸读**（没有 ?.）：
+        dialog-status.tsx:28   item.role === "assistant" && item.tokens.output > 0
+                               → 打开状态对话框直接 "Cannot read properties of
+                                 undefined (reading 'output')" ✓✓
+        dialog-status.tsx:38   last.tokens.input + … + last.tokens.cache.read
+                               + last.tokens.cache.write
+        acp/agent.ts:110/1386  msg.tokens.input / .output / .reasoning
+
+    【为什么先补 0】后端 SSE **不发 usage 帧**（main.py 里搜不到）、
+    `ConversationMessage`（main.py:4905）也没有 token 字段 ⇒ 真值拿不到 ✗。
+    补 0 是类型安全的：dialog-status 的 findLast 因 `> 0` 不命中该条 →
+    `last` 为 undefined → L37 三元给 undefined → 对话框正常打开、只是不显示用量 ✓。
+    要显示真用量得后端加 usage 帧 —— 已记入"未做"，不假装有数据 ✗。
+    """
+    return {"path": {"cwd": _DIRECTORY, "root": _DIRECTORY},
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}}
+
+
 def new_message(sid: str, role: str, parent: str = "", text: str = ""):
     """建一条消息（可选带一个文本 part），并按 MiMo 的事件协议广播出去。"""
     mid = ("msg_" if role == "user" else "msg_") + _slug(12)
@@ -443,6 +475,8 @@ def new_message(sid: str, role: str, parent: str = "", text: str = ""):
         base.update({"parentID": parent, "modelID": MODEL_ID,
                      "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT,
                      "time": {"created": now_ms()}})
+        # 必填三项（path/cost/tokens）—— 缺了 status 对话框一开就崩，见 assistant_shape()
+        base.update(assistant_shape())
     with _LOCK:
         _MESSAGES.setdefault(sid, []).append(base)
         _PARTS[mid] = []
@@ -519,14 +553,34 @@ def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> No
                     new_part_text(sid, mid, content)
                 elif typ == "TOOL_CALL":
                     tool = str(f.get("toolName") or "tool")
+                    # 【必须完全符合前端的 ToolPart 类型 —— 否则一有工具调用就 fatal】✗
+                    # 以 `packages/sdk/src/v2/gen/types.gen.ts` 的 ToolPart 为准：
+                    #   {id, sessionID, messageID, type:"tool", callID, tool, state}
+                    #   state（ToolStateCompleted）= {status, input, output, title,
+                    #                                metadata, time:{start,end}}
+                    # 逐条对上，"谁在读"都有出处：
+                    #   · state.metadata —— index.tsx:318-328 对**每个** tool part 调
+                    #     planSwitchTarget ✓，而 plan-switch.ts:5 是
+                    #     `part.state.metadata.switched`（**没有** ?. ✓）
+                    #     ⇒ metadata 缺失 = 一有工具调用就 "Cannot read properties
+                    #       of undefined (reading 'switched')" ✓✓
+                    #   · state.time —— index.tsx:3200 读 `state.time.compacted` ✓
+                    #     2343/2350 读 `state.time.start` ✓ 同样没有 ?. ✓
+                    #   · callID —— index.tsx:2146 用它对权限请求 ✓（缺了权限关联不上 ✓）
+                    # 我原来这三样**一个都没给** ✗（只给了 status/input/output/title ✓）
+                    _t = now_ms()
+                    part = {"id": "prt_" + _slug(12), "sessionID": sid, "messageID": mid,
+                            "type": "tool", "callID": "call_" + _slug(12), "tool": tool,
+                            "state": {"status": "completed", "input": {}, "output": content,
+                                      "title": tool, "metadata": {},
+                                      "time": {"start": _t, "end": _t}}}
+                    # 【存进消息里】原来只广播不存 ✗ → 刷新/重开这个会话时工具调用整段消失 ✓
+                    # （前端的会话正文是 GET /session/{id}/message 拿的 ✓）
+                    with _LOCK:
+                        _PARTS.setdefault(mid, []).append(part)
                     broadcast({"type": "message.part.updated",
                                "properties": {"sessionID": sid, "time": now_ms(),
-                                              "part": {"id": "prt_" + _slug(12),
-                                                       "sessionID": sid, "messageID": mid,
-                                                       "type": "tool", "tool": tool,
-                                                       "state": {"status": "completed",
-                                                                 "input": {}, "output": content,
-                                                                 "title": tool}}}})
+                                              "part": part}})
                 elif typ == "ERROR":
                     broadcast({"type": "session.error",
                                "properties": {"sessionID": sid,
@@ -645,7 +699,20 @@ class Handler(BaseHTTPRequestHandler):
                                "config": os.path.join(home, ".config", "lioncode"),
                                "worktree": _DIRECTORY, "directory": _DIRECTORY})
         if p == "/experimental/resource":
-            return self._json({"cpu": 0, "memory": 0, "uptime": 0})
+            # 【必须是"资源 map"，不是 CPU 指标】我原来返回 {"cpu","memory","uptime"}
+            # ✗ —— 那是按名字瞎猜的。真消费方（先读再改的）：
+            #   sync.tsx:923-924   guard(sdk.client.experimental.resource.list(...),
+            #                       (x) => setStore("mcp_resource", reconcile(x.data ?? {})))
+            #   sync.tsx:277-279    mcp_resource: { [key: string]: McpResource }  ← **dict**
+            #   types.gen.ts:3079   McpResource = {name, uri, description?, mimeType?, client}
+            #   autocomplete.tsx:317-318
+            #       for (const res of Object.values(sync.data.mcp_resource)) {
+            #         const text = `${res.name} (${res.uri})`   ← 无 ?. 保护 ✓
+            #   ⇒ 拿到 {cpu:0,...} 时 Object.values 给出三个**数字**，
+            #      res.name / res.uri 全是 undefined → 自动补全里凭空多出
+            #      3 条 "undefined (undefined)" 的垃圾选项（实测可见）✗
+            # 我们没有 MCP 资源 ⇒ 返回**空 map**（形状对、语义对、不产生垃圾）✓
+            return self._json({})
         # 【必须实现，且必须是数组】"新建工作区"对话框一打开就拉这个端点
         # （dialog-workspace-create.tsx:185），然后把结果直接 `.map`（L223）：
         #     list.map((item) => ({title: item.name, value: item.type, ...}))
@@ -786,8 +853,19 @@ class Handler(BaseHTTPRequestHandler):
                                 "description": str(x.get("description") or "")} for x in items])
         if p == "/command":
             return self._json([])
-        if p in ("/lsp", "/formatter", "/mcp", "/vcs", "/file/status"):
-            return self._json([] if p != "/vcs" else {})
+        if p in ("/lsp", "/formatter", "/vcs", "/file/status"):
+            # lsp/formatter 消费方是 `reconcile(x.data ?? [])` → **数组** ✓（sync.tsx:921/926）
+            # vcs 是 `reconcile(x.data)` 进 `vcs: VcsInfo | undefined`（sync.tsx:931），
+            #   VcsInfo = {branch?, default_branch?}（types.gen.ts:3355，两字段全可选 ✓）
+            #   plugin/api.tsx:143 有 `if (!sync.data.vcs) return` 兜底 ✓ ⇒ 空 dict 安全
+            return self._json({} if p == "/vcs" else [])
+        if p == "/mcp":
+            # 【必须是 dict 不是数组】sync.tsx:922
+            #   guard(sdk.client.mcp.status(...), (x) => setStore("mcp", reconcile(x.data ?? {})))
+            #   sync.tsx:274-276  mcp: { [key: string]: McpStatus }   ← **dict**
+            # 我原来和 lsp 一起返回 [] ✗ —— 数组塞进 dict store，
+            # reconcile 会按数字键处理（空数组时侥幸无害，非空即错位）⇒ 单独返 {} ✓
+            return self._json({})
         if p in ("/file", "/find", "/find/symbol"):
             return self._json([])
 
