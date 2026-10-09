@@ -85,6 +85,16 @@ _SUBS: list[queue.Queue] = []            # SSE 订阅者
 _WORKSPACES: list[dict] = []             # 工作区（/workspace 新建的）
 #: 默认工作区的 id —— 只生成一次，保证状态接口的键和列表对得上
 _WORKSPACE_DEFAULT_ID = ""
+#: /context-limit 设过的上下文窗口（token）；None = 从来没设过。
+#: 【为什么留这份】后端只有**会话级**入口（POST /api/context → ContextBudget.set，
+#: main.py:10789-10810 / 11630-11645），设一次只对当时存在的会话生效 ——
+#: 新建的会话要靠 create_backend_session 里的回填钩子补上，才算"全局配置"。
+_CONTEXT_LIMIT: int | None = None
+#: 回显给 GET /config、GET /global/config 的 config 片段。
+#: 前端 dialog-context-limit.tsx:83-101 写完会 dispose → bootstrap → 重读
+#: merged config 验证 `applied.effective`，不回显 compaction.max_context
+#: 就永远算 "shadowed" 报错 toast ✗（形状以 overflow.ts:44-51 的读法为准）。
+_GLOBAL_CFG: dict = {}
 _DIRECTORY = os.getcwd()
 #: 持久化根（.lioncode 所在处）。启动器用 --workspace= 传入，与 main.py 的
 #: --lion.workspace.default-path 取同一个值。留空则在候选根里搜。
@@ -98,6 +108,120 @@ def now_ms() -> int:
 
 def _slug(n: int = 8) -> str:
     return uuid.uuid4().hex[:n]
+
+
+def _parse_tokens(v) -> int | None:
+    """token 数解析：数字直接用；`"300K"` / `"1M"` 按前端 Token 的 K/M 后缀
+    （MiMo-Code-main 的 dialog-context-limit.tsx:165 用 Token.parseQuantity）。
+    百分比要模型窗口才能算，这里没有 → 返回 None（不猜 ✗）。"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v or "").strip().upper()
+    if not s or s.endswith("%"):
+        return None
+    mul = 1
+    if s.endswith("K"):
+        mul, s = 1000, s[:-1]
+    elif s.endswith("M"):
+        mul, s = 1_000_000, s[:-1]
+    try:
+        return int(float(s) * mul)
+    except ValueError:
+        return None
+
+
+def extract_context_limit(cfg) -> tuple[bool, int | None]:
+    """从 PATCH /global/config 的 config 里取"上下文上限"。
+
+    返回 ``(有没有设上限的字段, 该设的 token 数)``：
+      · ``(False, None)`` —— 压根没带这个字段：选模型/改 modalities/加 provider
+        的 PATCH 也走这里（dialog-model.tsx:293、dialog-modalities.tsx:72、
+        dialog-mimo-login.tsx:118 都发到同一端点），**一律别动后端**；
+      · ``(True, None)`` —— 带了但值解析不了：调用方回 400。用户明确写了预算却
+        静默忽略 = 又一次"报成功其实没生效" ✗；
+      · ``(True, n)`` —— 真要写的值（0 = 恢复模型默认 / 不设限）。
+
+    【两路来源，都读过消费方源码】
+      ① 真前端 `/context-limit`（dialog-context-limit.tsx:75-78）写的是
+         `{config:{compaction:{max_context:{ "<providerID>/<modelID>": tokens }}}}`
+         —— 按模型 key 记账、0 = 恢复模型默认（overflow.ts:44-57）；
+      ② 老客户端直接给标量 `{contextLimit|context_limit|limit|tokens}`。
+
+    【key 怎么选】后端预算是**会话级**、不分模型（ContextBudget.set，
+    main.py:11630），取值顺序：当前模型 key → `"*"` 通配（overflow.ts:49 的
+    Wildcard.all）→ 只写了一个 key 就用它（TUI 的 selected model 是**本地**选择
+    （local.model），不一定等于适配层 MODEL_ID，而 dialog 每次只写自己那一个 key
+    （L77））→ 多个 key 都不含当前模型 = 本模型无预算 → (True, None) 不动后端。
+    """
+    if not isinstance(cfg, dict):
+        return False, None
+    comp = cfg.get("compaction")
+    if isinstance(comp, dict) and "max_context" in comp:
+        mc = comp.get("max_context")
+        if isinstance(mc, dict):
+            if not mc:                                # {} = 清空 = 模型默认
+                return True, 0
+            v = mc.get(f"{PROVIDER_ID}/{MODEL_ID}")
+            if v is None:
+                v = mc.get("*")                       # Wildcard 兜底（overflow.ts:49）
+            if v is None and len(mc) == 1:
+                v = next(iter(mc.values()))           # 单 key：就是调用方当前模型的意图
+            if v is None:
+                return True, None                     # 多 key 都不含当前模型 → 别动后端
+            return True, _parse_tokens(v)             # None = 解析不了 → 400
+        return True, _parse_tokens(mc)                # 标量 300000 / "300K" / "50%"→None
+    for k in ("contextLimit", "context_limit", "limit", "tokens"):
+        if k in cfg:
+            return True, _parse_tokens(cfg.get(k))
+    return False, None
+
+
+def config_snapshot() -> dict:
+    """GET /config / GET /global/config 要回显的 config 片段（深一层拷贝，锁内取）。"""
+    with _LOCK:
+        out = {k: v for k, v in _GLOBAL_CFG.items() if not isinstance(v, dict)}
+        comp = _GLOBAL_CFG.get("compaction")
+        if isinstance(comp, dict):
+            out["compaction"] = {k: (dict(v) if isinstance(v, dict) else v)
+                                 for k, v in comp.items()}
+    return out
+
+
+def _apply_context_limit(limit: int) -> tuple[int, int, int]:
+    """把窗口上限写到**真实**后端会话上。返回 (成功, 失败, 尝试数)。
+
+    【为什么必须是真实会话 id】后端 set 里 `session_id is None` 只返回不落盘、
+    `sessionId=""` 写进 `_per_session[""]` 这个**幽灵键** —— 读取方
+    `effective_context_limit`（main.py:14828-14839）传的是真实 UUID，幽灵键
+    聊天时永远查不到（用 `GET ?sessionId=` 空值倒是能读回来，但没有任何会话
+    用它）—— 老代码就是靠它"报成功却不生效"，实测见 do_PATCH 注释 ✗。
+    会话 id 取两处并集：内存 _SESSIONS 的 backendID + 后端 /api/sessions 全量。
+    """
+    ids: set[str] = set()
+    with _LOCK:
+        for s in _SESSIONS.values():
+            b = str(s.get("backendID") or "")
+            if b:
+                ids.add(b)
+    listed = _req("/api/sessions") or {}
+    list_ok = isinstance(listed, dict) and bool(listed.get("success"))
+    for x in (listed.get("data") or [] if isinstance(listed, dict) else []):
+        if isinstance(x, dict) and x.get("sessionId"):
+            ids.add(str(x["sessionId"]))
+    ok = fail = 0
+    for b in sorted(ids):
+        resp = _req("/api/context", {"sessionId": b, "tokens": limit}, timeout=10.0)
+        if isinstance(resp, dict) and resp.get("success"):
+            ok += 1
+        else:
+            fail += 1
+            print(f"[上下文] 写入失败 session={b} 返回={resp!r}", flush=True)
+    if not list_ok:
+        fail += 1                                     # 连会话列表都没拿到 = 全靠内存里的漏网
+        print(f"[上下文] 会话列表不可达，返回={listed!r}"[:300], flush=True)
+    return ok, fail, len(ids)
 
 
 def broadcast(payload: dict) -> None:
@@ -430,7 +554,17 @@ def create_backend_session(directory: str = "") -> str:
         wsid = path
     made = _req("/api/sessions", {"workspaceId": wsid, "mode": "STANDARD"}) or {}
     data = made.get("data") or {}
-    return str(data.get("sessionId") or data.get("id") or "")
+    sid = str(data.get("sessionId") or data.get("id") or "")
+    # 【/context-limit 的回填钩子】全局设过的窗口上限，新建的会话也要带上 ——
+    # 后端的预算是**按会话**记的（ContextBudget.set，main.py:11630），不回填
+    # 就只有"设的那一刻已存在的会话"生效（_CONTEXT_LIMIT 为 None 时零开销 ✓）。
+    with _LOCK:
+        lim = _CONTEXT_LIMIT
+    if sid and lim is not None:
+        r = _req("/api/context", {"sessionId": sid, "tokens": lim}, timeout=10.0)
+        if not (isinstance(r, dict) and r.get("success")):
+            print(f"[上下文] 新会话回填失败 session={sid} 返回={r!r}", flush=True)
+    return sid
 
 
 def assistant_shape() -> dict:
@@ -642,13 +776,28 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- 工具
-    def _json(self, obj, code: int = 200) -> None:
-        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _encode(self, obj) -> bytes:
+        """JSON 序列化（纯 CPU、有界）——**持 _LOCK 时只允许做到这一步**。"""
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+    def _emit(self, raw: bytes, code: int = 200) -> None:
+        """把已编码的响应写到 socket（**必须在 _LOCK 之外调**）。
+
+        【为什么】协议是 HTTP/1.1 且 wbufsize=0：send_response / wfile.write
+        直接进内核发送缓冲，对端停读（浏览器后台标签页就是这么干的）时缓冲写满
+        这里就**阻塞**。以前 `with _LOCK: return self._json(...)` 把这种阻塞变
+        成全局锁持有 —— _LOCK 还管 broadcast(107)、SSE 订阅、所有会话读写，
+        一处卡 = 整个适配层停摆（审 #1180/#735/#829/#1080）。
+        约定：锁内算数据 + _encode，锁外 _emit。
+        """
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _json(self, obj, code: int = 200) -> None:
+        self._emit(self._encode(obj), code)
 
     def _workspace_of(self, body: dict | None = None) -> str:
         """当前请求属于哪个工作区（MiMo 侧 id）。
@@ -668,13 +817,25 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
+        # Content-Length 不是纯数字（"abc"、"10, 10"）时 int() 直接 ValueError ——
+        # 以前它逃出 do_POST 被 _Server.handle_error 静默吞掉（628-630，不开
+        # MIMO_ADAPTER_DEBUG 一行日志都不打）→ 客户端只看到连接被掐、服务端零痕迹
+        # （审 #671）。坏了就断开连接：body 长度未知，继续读会把残留字节当下一条
+        # 请求解析，HTTP/1.1 keep-alive 下后患更大。
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return {}
         if not n:
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8")) or {}
+            parsed = json.loads(self.rfile.read(n).decode("utf-8"))
         except Exception:                                 # noqa: BLE001
             return {}
+        # JSON 数组/字符串经 `or {}` 也会原样返回（非 dict），而调用方全按 dict 用
+        # （body.get(...) → AttributeError）→ 统一当空 dict（审 #671）。
+        return parsed if isinstance(parsed, dict) else {}
 
     def _path(self) -> str:
         return self.path.split("?")[0].rstrip("/") or "/"
@@ -732,7 +893,8 @@ class Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 if not _WORKSPACES:
                     _WORKSPACES.append(self._workspace())
-                return self._json(list(_WORKSPACES))
+                raw = self._encode(list(_WORKSPACES))   # 锁内只编码（快照原子）
+            return self._emit(raw)                      # socket 写在锁外（见 _emit）
         if p == "/experimental/workspace/status":
             # 【形状】前端读的是数组 [{workspaceID, status}, ...]
             # （context/project.tsx:64 直接对它 .map），返回字典会被整段丢掉。
@@ -760,13 +922,21 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/permission/ask-timeout":
             return self._json(None)
         if p == "/global/config":
-            return self._json({"theme": "mimocode", "model": MODEL_ID})
+            # 回显 /context-limit 写过的 compaction.max_context（形状以
+            # overflow.ts:44-51 的读法为准）—— 前端写完 dispose→bootstrap→重读
+            # merged config 验证 effective（dialog-context-limit.tsx:90-101），
+            # 不回显就永远弹 "shadowed" 错误 toast ✗
+            return self._json({"theme": "mimocode", "model": MODEL_ID,
+                               **config_snapshot()})
         if p == "/project/current" or p == "/project":
             return self._json(project())
 
         if p == "/config":
+            # 同上：sync.tsx:864 的 bootstrap 读的是 GET /config（sync.data.config
+            # 就是它），compaction 的回显必须挂在这条上才有人看到
             return self._json({"model": f"{PROVIDER_ID}/{MODEL_ID}",
-                               "theme": "mimocode", "autoupdate": False})
+                               "theme": "mimocode", "autoupdate": False,
+                               **config_snapshot()})
         if p in ("/config/providers", "/provider"):
             # 【同一个响应要填三处，字段缺一个就崩】✓ 前端 tui/context/sync.tsx：
             #   provider         ← 本响应的 .providers   ✓
@@ -822,11 +992,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json([])
         if re.match(r"^/session/([^/]+)/message/([^/]+)$", p):
             mid = p.rsplit("/", 1)[1]
+            raw = None
             with _LOCK:
                 for msgs in _MESSAGES.values():
                     for msg in msgs:
                         if msg["id"] == mid:
-                            return self._json({"info": msg, "parts": _PARTS.get(mid, [])})
+                            # 锁内只编码快照（dict(msg)/list() 拆引用），socket 写挪到锁外
+                            raw = self._encode({"info": dict(msg),
+                                                "parts": list(_PARTS.get(mid, []))})
+                            break
+                    if raw is not None:
+                        break
+            if raw is not None:
+                return self._emit(raw)
             return self._json({"error": "not found"}, 404)
 
         if p == "/permission":
@@ -846,11 +1024,27 @@ class Handler(BaseHTTPRequestHandler):
                  "mode": "primary", "builtIn": True},
             ])
         if p == "/skill":
+            # 【真实形状 —— 2026-10-09 打真后端 :18080 实测，不是猜的】
+            # GET /api/skills 走 _envelope（main.py:20640-20674）双写：
+            #   {ok, success, message, skillsDir, userSkillsDir,
+            #    skills:[{id,name,displayName,description,...}, …],   ← 顶层一份
+            #    data:{ok, skillsDir, skills:[…]}}                   ← data 也一份
+            # **data 是 dict 不是 list** —— 原来 `items = data if isinstance(data,
+            # list)` 恒为 [] ✗，/skill 永远返回空数组、前端技能面板静默为空。
+            # 改前实测：后端 skills 有 4 条（backend/client/document/frontend），
+            # GET /skill → []。取值首选 data.skills，envelope 顶层 skills 兜底。
             r = _req("/api/skills") or {}
             data = r.get("data") if isinstance(r, dict) else None
-            items = data if isinstance(data, list) else []
-            return self._json([{"name": str(x.get("name") or x.get("id") or x),
-                                "description": str(x.get("description") or "")} for x in items])
+            if isinstance(data, dict):
+                items = data.get("skills")
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = r.get("skills")
+            items = items if isinstance(items, list) else []
+            return self._json([{"name": str(x.get("name") or x.get("id") or ""),
+                                "description": str(x.get("description") or "")}
+                               for x in items if isinstance(x, dict)])
         if p == "/command":
             return self._json([])
         if p in ("/lsp", "/formatter", "/vcs", "/file/status"):
@@ -1074,10 +1268,15 @@ class Handler(BaseHTTPRequestHandler):
                 name = f"{name}-{i}"
 
             # 【同一目录重复登记】直接返回已有的那个，避免列表里出现两条一样的
+            # （锁内只算快照，socket 写挪到锁外 —— 见 _emit）
+            dup = None
             with _LOCK:
                 for w in _WORKSPACES:
                     if os.path.normcase(str(w.get("directory") or "")) == os.path.normcase(directory):
-                        return self._json(w)
+                        dup = dict(w)
+                        break
+            if dup is not None:
+                return self._json(dup)
 
             ws = {"id": "wrk_" + _slug(10), "type": str(body.get("type") or "local"),
                   "name": name, "branch": body.get("branch"),
@@ -1174,29 +1373,98 @@ class Handler(BaseHTTPRequestHandler):
         t.start()
         if blocking:
             t.join(timeout=600)
+            raw = None
             with _LOCK:
                 for msg in _MESSAGES.get(sid, []):
                     if msg["id"] == amid:
-                        return self._json({"info": msg, "parts": _PARTS.get(amid, [])})
-        return self._json({"info": {"id": amid, "sessionID": sid, "role": "assistant"},
-                           "parts": []})
+                        # 锁内编码快照、锁外写 socket（见 _emit）：这条响应带着该轮
+                        # 全部工具输出，可能上百 KB，阻塞写卡住全局锁就全盘停摆
+                        raw = self._encode({"info": dict(msg),
+                                            "parts": list(_PARTS.get(amid, []))})
+                        break
+            if raw is not None:
+                return self._emit(raw)
+        # 【兜底响应也必须是完整 AssistantMessage】以 `MiMo-Code-main\packages\sdk
+        # \src\v2\gen\types.gen.ts` 的 AssistantMessage（L1028）为准：
+        # time{created}、parentID、modelID、providerID、mode、agent、path、cost、
+        # tokens 全是必填（L1033-1069）；缺 path/cost/tokens 的后果见
+        # assistant_shape() 的注释 —— 消费方裸读：acp/agent.ts:1386
+        # `msg.tokens.input`（session.prompt 的返回就是这里，L1410-1416）✗。
+        # 触发点：prompt_async（上面 blocking=False 必经）+ 阻塞路径 600s 超时
+        # 或消息被并发删除。time.completed 此刻**不给**：流可能还在跑，给 completed
+        # 就是撒谎（真实完成时间由 _finish_message 写，types 里 completed 也是可选）。
+        n = now_ms()
+        info = {"id": amid, "sessionID": sid, "agentID": AGENT, "role": "assistant",
+                "parentID": umid, "modelID": MODEL_ID, "providerID": PROVIDER_ID,
+                "mode": "build", "agent": AGENT, "time": {"created": n}}
+        info.update(assistant_shape())      # path/cost/tokens（475-479 同款）
+        with _LOCK:
+            raw = self._encode({"info": info, "parts": list(_PARTS.get(amid, []))})
+        return self._emit(raw)
 
     def do_PATCH(self):                                   # noqa: N802
+        # Python 要求 global 声明先于函数内对该名字的**一切**使用（否则
+        # SyntaxError: name used prior to global declaration）—— 声明放最前面。
+        global MODEL_ID, _CONTEXT_LIMIT
         p = self._path()
         body = self._body()
 
-        # 【/context-limit 命令走这里】前端发 PATCH /global/config {config:{...}}
-        # 或直接 {contextLimit/...}；把上下文上限转给我们后端的 /api/context。
+        # 【/context-limit 命令走这里】前端 PATCH /global/config {config:{...}}
+        # 或老客户端直接 {contextLimit/...}；转成我们后端 POST /api/context 的
+        # 会话级预算（见 extract_context_limit / _apply_context_limit 的注释）。
         if p in ("/global/config", "/config"):
             cfg = body.get("config") if isinstance(body.get("config"), dict) else body
-            limit = None
-            for k in ("contextLimit", "context_limit", "limit", "tokens"):
-                if isinstance(cfg.get(k), (int, float)):
-                    limit = int(cfg[k])
-                    break
-            if limit is not None:
-                # 后端约定：tokens=0 表示不设限
-                _req("/api/context", {"sessionId": "", "tokens": limit})
+            # 【上下文上限：写**真实**会话 + 如实报错】审 #1199。
+            # 旧代码 `_req("/api/context", {"sessionId": "", "tokens": limit})`
+            # 写的是幽灵键：后端 set 把它记进 `_per_session[""]`（main.py:11630-
+            # 11645），而读取方 effective_context_limit 传的是**真实会话 UUID**
+            # （main.py:14828-14839）—— 幽灵键没有任何聊天会读到。实测
+            # （老代码+活后端，见 .lbcheck\verify_before_ghost.py）：PATCH
+            # {contextLimit:111111} → 200 {"success":true}，真实会话的
+            # GET /api/context 依旧 {"sessionLimit":16384,"overridden":false}
+            # ✗ **永不生效却报成功**。（幽灵键用 GET ?sessionId= 能读回来，
+            # 但聊天路径永远查不到它。）
+            intent, limit = extract_context_limit(cfg)
+            if intent:
+                comp_in = cfg.get("compaction") if isinstance(cfg, dict) else None
+                if limit is None:
+                    # 带了字段却换算不出来：静默跳过就是重蹈"报成功其实没生效" ✗
+                    raw = (comp_in.get("max_context")
+                           if isinstance(comp_in, dict) else None)
+                    if raw is None:
+                        raw = {k: cfg.get(k) for k in
+                               ("contextLimit", "context_limit", "limit", "tokens")
+                               if k in cfg}
+                    msg = ("无法应用的上下文上限（要整数 token 或 \"300K\"/\"1M\"，"
+                           "key 还要对得上当前模型）: "
+                           + json.dumps(raw, ensure_ascii=False, default=str))
+                    print("[上下文] " + msg, flush=True)
+                    return self._json({"message": msg, "error": msg}, 400)
+                # 【先写后端、看结果，成功才落本地状态】顺序反了就会"内存记着已设、
+                # 后端实际没设"，GET /config 还跟着谎报生效 ✗
+                ok_n, fail_n, total = _apply_context_limit(limit)
+                if fail_n:
+                    # 失败必须**非 2xx**：前端只看 res.error，而非 2xx 的
+                    # {success:false} 它当成功（client.gen.ts:129 / :227）。
+                    msg = (f"上下文上限未生效：{fail_n} 个写入失败"
+                           f"（成功 {ok_n}/{total}）")
+                    print("[上下文] " + msg, flush=True)
+                    return self._json({"message": msg, "error": msg}, 400)
+                with _LOCK:
+                    _CONTEXT_LIMIT = limit
+                    if isinstance(comp_in, dict) and "max_context" in comp_in:
+                        # 回显**原样 key**：写入方 dialog-context-limit.tsx:38 用的是
+                        # `${selected.providerID}/${selected.modelID}`，selected 是
+                        # TUI 的**本地**选择（local.model），不一定等于适配层
+                        # MODEL_ID —— 自己拼 key 会对不上，前端重读就报 shadowed ✗
+                        mc = comp_in.get("max_context")
+                        comp_cfg = _GLOBAL_CFG.setdefault("compaction", {})
+                        cur = comp_cfg.get("max_context")
+                        if isinstance(mc, dict) and isinstance(cur, dict):
+                            cur.update(mc)
+                        else:
+                            comp_cfg["max_context"] = (
+                                dict(mc) if isinstance(mc, dict) else mc)
                 broadcast({"type": "session.updated",
                            "properties": {"info": {"contextLimit": limit}}})
 
@@ -1207,7 +1475,6 @@ class Handler(BaseHTTPRequestHandler):
                     want = cfg[k]
                     break
             if want:
-                global MODEL_ID
                 changed = want != MODEL_ID
                 MODEL_ID = want
                 # 本地量化用 file 名切换；认不出来就当普通模型名交给 mode 接口
@@ -1236,7 +1503,11 @@ class Handler(BaseHTTPRequestHandler):
             if s:
                 broadcast({"type": "session.updated", "properties": {"info": s}})
             return self._json(s or {})
-        return self._json(True)
+        # 未知 PATCH 不再无条件回"假成功"（审 #1318）：与 do_POST 的 404 一致。
+        # 已核对 TUI 侧的 PATCH 调用只有 global.config.update 与 session.update
+        # （sdk.gen.ts 的 .patch< 共 5 个：global/config、/config、/session/{id}
+        # 都接住了，project/{id}、part/{id} 在 cli/src 里查无调用方）。
+        return self._json({"error": "not implemented: " + p}, 404)
 
     # -- 工作区删除（MiMo 有几个可能的入口，全部接住）
     def _remove_workspace(self, body: dict) -> dict:
@@ -1251,11 +1522,19 @@ class Handler(BaseHTTPRequestHandler):
         if not wid and q:
             for pair in q.split("&"):
                 if pair.startswith(("id=", "workspaceID=")):
-                    wid = pair.split("=", 1)[1]
+                    wid = urllib.parse.unquote(pair.split("=", 1)[1])
                     break
         if not wid:
-            m2 = re.match(r"^/experimental/workspace/([^/]+)/(remove|delete)?$", self._path())
-            wid = m2.group(1) if m2 else ""
+            # 裸 id 形态 `/experimental/workspace/wrk_xxx`（DELETE 的常规形态，
+            # 外层 do_DELETE 的正则明确接住了它）也必须解得出来 —— 原来的
+            # `([^/]+)/(remove|delete)?$` 里那个 "/" 是**必需**的（(remove|delete)?
+            # 只是可选组），没有后缀段整串不匹配 → wid 恒空 → 永远报
+            # "缺少工作区 id"，工作区永远删不掉（审 #1257；
+            # 改前实测 DELETE /experimental/workspace/wrk_bogus123 →
+            # {"success": false, "message": "缺少工作区 id"}）。
+            m2 = re.match(r"^/experimental/workspace/([^/]+)(?:/(?:remove|delete))?$",
+                          self._path())
+            wid = urllib.parse.unquote(m2.group(1)) if m2 else ""
         if not wid:
             return {"success": False, "message": "缺少工作区 id"}
 
@@ -1274,9 +1553,13 @@ class Handler(BaseHTTPRequestHandler):
         #   ① 在 <workspace_root>/workspaces/ 之下（适配层建的都在这）
         #   ② 目录为空（非空说明用户在里头放东西了，一律不碰）
         d = str(gone.get("directory") or "")
-        root = os.path.abspath(_WORKSPACE_ROOT or "")
-        made = os.path.join(root, "workspaces") if root else ""
-        if d and made and os.path.abspath(d).startswith(os.path.abspath(made) + os.sep):
+        # 根必须与**创建侧同源**：new_workspace_root()（见其 docstring）。
+        # 原来用 `os.path.abspath(_WORKSPACE_ROOT or "")` —— _WORKSPACE_ROOT 为空
+        # 时 abspath("") 是 **cwd**，而实际创建落在 <脚本目录>/.lbcheck/workspace，
+        # 前缀判断恒假 → 适配层自建的空目录永不回收（审 #1277）；`if root` 那个
+        # 守卫也因此恒真（abspath 永不返回空串），是死守卫。
+        made = new_workspace_root()
+        if d and os.path.abspath(d).startswith(os.path.abspath(made) + os.sep):
             target = os.path.abspath(d)
             if os.path.isdir(target) and not os.listdir(target):
                 try:
@@ -1301,21 +1584,50 @@ class Handler(BaseHTTPRequestHandler):
             sid = m.group(1)
             with _LOCK:
                 s = _SESSIONS.get(sid)
-            # 【必须落到后端】原来只删内存 → 重启后对话又回来了（看着成功其实没删）
+            # 【必须落到后端，而且必须看结果】原来只删内存 → 重启后对话又回来
+            # （看着成功其实没删）；后来补了 _req 却**丢弃返回值** —— _req 内部
+            # `except: return None` 永不抛，下面原来的 try/except 是死代码，
+            # 后端删失败照样回 true（审 #1308；旧代码 + 死后端实测：
+            # DELETE /session/ses_xxx → HTTP 200 `true`，后端根本没收到请求）。
             bid = (s or {}).get("backendID") or backend_session(sid)
             if bid:
-                try:
-                    _req("/api/sessions/" + str(bid), method="DELETE")
-                except Exception:                         # noqa: BLE001
-                    pass
+                resp = _req("/api/sessions/" + str(bid), method="DELETE")
+                # 后端返回（main.py:7048-7062，实测 HTTP 200 + ApiResponse 包封）：
+                #   成功   {"success":true,...}
+                #   已不在 {"success":false,"error":"会话不存在: …"}  ← 幂等当成功
+                #   真失败 {"success":false,"error":"删除会话失败…"}  ← 磁盘没删掉
+                #   None   网络不通 / 5xx（_req 在 61-75 行吞掉异常）
+                err = ""
+                if resp is None:
+                    err = "后端不可达，会话未删除: " + str(bid)
+                elif not (isinstance(resp, dict) and resp.get("success")):
+                    e = str(resp.get("error") or resp.get("message") or resp) \
+                        if isinstance(resp, dict) else str(resp)
+                    if "会话不存在" not in e:          # 幂等：后端说本来就没有 → 算删成
+                        err = "后端删除失败: " + e
+                if err:
+                    # 失败就不动内存、不广播 —— 前端要能看到"没删成"。返回必须是
+                    # **非 2xx**：SDK 只有非 2xx 才进 result.error（client.gen.ts:227），
+                    # 前端 sidebar.tsx:94-99 / dialog-session-list.tsx:244-259 才弹错误。
+                    print("[会话] 删除失败 " + err, flush=True)
+                    return self._json({"message": err, "error": err}, 400)
             with _LOCK:
                 s = _SESSIONS.pop(sid, None)
-                _MESSAGES.pop(sid, None)
-                _PARTS.clear() if False else None
+                msgs = _MESSAGES.pop(sid, None) or []
+                # 回收该会话全部消息的 parts（审 #1314：原来的
+                # `_PARTS.clear() if False else None` 是**恒 None 的死表达式**，
+                # 一个键都没删过 → 长驻进程里 parts 只增不减；也不能直接
+                # _PARTS.clear() —— 那会把**其它会话**的 parts 一起清掉）
+                for mm in msgs:
+                    _PARTS.pop(str(mm.get("id") or ""), None)
             if s:
                 broadcast({"type": "session.deleted", "properties": {"info": s}})
             return self._json(True)
-        return self._json(True)
+        # 未实现的 DELETE 不再无条件回 true（审 #1318）：有副作用的方法报"假成功"
+        # 比报错更糟，且与 do_POST 的 404 一致。已核对 TUI 只调用 session.delete 与
+        # experimental.workspace.delete（上面两段都接住了），其余 DELETE 端点
+        # （pty/worktree/share/message-part/auth）在 cli/src 里查无调用方。
+        return self._json({"error": "not implemented: " + p}, 404)
 
 
 def main(argv: list[str] | None = None) -> int:
