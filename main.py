@@ -7676,15 +7676,19 @@ class FileSystemApi:
             except InvalidJavaPath as e:
                 return ApiResponse.error("浏览失败: " + e.message)
             directory = _java_path_string(root, elements)
+            # 设备命名空间（`\\.\pipe` 这类）**必须在 isdir 之前判**：os.path.isdir/exists
+            # 对真实存在的管道也返回 False（实测 `\\.\pipe\lsass` → False），旧顺序下
+            # 上面的 isdir 分支先回"路径不存在"，这条分支对 `\\.\pipe\...` 永远执行不到
+            # —— 与 Java `File.listFiles()=null → 无法读取该目录` 的语义相反。
+            # （顺带纠正旧注释的错误假设：scandir 对管道不是给空迭代器，而是抛
+            #   OSError WinError 3 —— 真走到下面也会被 OSError 分支接住，文案才一致。）
+            if directory.startswith("\\\\.\\"):
+                return ApiResponse.error("无法读取该目录（权限不足或磁盘错误）: " + path)
             if not os.path.isdir(directory):
                 # 分开报"不存在"和"不是目录"：否则"权限不足/路径非法"看起来都像个空文件夹
                 return ApiResponse.error(
                     ("不是目录: " if os.path.exists(directory) else "路径不存在: ") + path)
             current = _to_absolute(root, elements)
-            if directory.startswith("\\\\.\\"):
-                # 设备命名空间（`\\.\pipe` 这类）：Java 那边 `File.listFiles()` 返回 null，
-                # 归到"无法读取该目录"；Python 的 scandir 只会给个空迭代器，得显式对齐
-                return ApiResponse.error("无法读取该目录（权限不足或磁盘错误）: " + path)
             try:
                 entries = _read_entries(directory, current, show_files)
             except OSError:
@@ -8879,6 +8883,17 @@ class OpenAICompatibleAdapter(ModelAdapter):
         root = json.loads(data)
         if not isinstance(root, dict):
             return ModelChunk()
+        # 流中途的 `data: {"error": {...}}`（没有 choices）以前落进下面的空 ModelChunk：
+        # 调用方 8790 只接 ValueError/TypeError → 既不抛也不记日志，端点中途报错
+        # 表现成"正常结束的截断回答"。改成抛 ModelCallError（RuntimeError，不会被
+        # 那个 except 吞掉；外层 finally 关连接），让 AgentLoop 能报错/重试。
+        err = root.get("error")
+        if err:
+            if isinstance(err, dict):
+                msg = text_of(err, "message", None) or json.dumps(err, ensure_ascii=False)
+            else:
+                msg = str(err)
+            raise ModelCallError(f"流式错误: {msg}")
         choices = root.get("choices")
         if not isinstance(choices, list) or not choices:
             return ModelChunk()
@@ -9093,7 +9108,13 @@ class AnthropicAdapter(ModelAdapter):
         for msg in messages:
             if msg.role == "system":
                 continue
-            node: dict[str, Any] = {"role": msg.role}
+            # Anthropic Messages API 的 `messages[].role` 只有 user/assistant 两个值，
+            # 而工具结果消息按本仓协议（8937 行：role=tool + tool_call_id → role=user +
+            # content[].type=tool_result）role 就是 "tool" —— 原样发出去服务端直接 400
+            # 「Input should be equal to 'user' or 'assistant'」，任何一轮工具调用的
+            # 结果回填都整轮失败。tool_result 块本就**必须**放在 user 消息里。
+            role = "user" if msg.role == "tool" else msg.role
+            node: dict[str, Any] = {"role": role}
             content: list[dict[str, Any]] = []
 
             if msg.tool_calls:
@@ -9183,6 +9204,20 @@ class AnthropicAdapter(ModelAdapter):
         etype = text_of(event, "type", "") or ""
         index = int_of(event, "index")
         index = 0 if index is None else index
+
+        if etype == "error":
+            # 端点中途报错（Anthropic 明确的 `event: error`，如 overloaded_error）以前
+            # 落到末尾 `return None` → 上层 9067 直接 continue，随后服务端关流、
+            # chat_stream_limited **正常结束**：上层拿到的是"截断但成功"的回答，
+            # 没有日志、没有错误事件。必须变成异常抛出去 —— 外层 9064 只接
+            # ValueError/TypeError（ModelCallError 是 RuntimeError，拦不住），
+            # 9079 的 finally 会负责关连接。
+            err = event.get("error")
+            if isinstance(err, dict):
+                msg = text_of(err, "message", None) or json.dumps(err, ensure_ascii=False)
+            else:
+                msg = str(err) if err is not None else ""
+            raise ModelCallError(f"Anthropic流式错误: {msg or '未知错误'}")
 
         if etype == "content_block_delta":
             delta = event.get("delta")
@@ -11117,6 +11152,15 @@ class ToolCallStreamFilter:
 
             # ② 没有标签：结尾若是"像标签开头"的残尾 → 扣住（结束时丢掉 ✗ 不能吐）
             hold = self._partial_tail_len(self._buf)
+            # 【结束时缓冲里根本没 `<` → 绝不丢】扣住的判据（11220-11225）只要求尾巴是
+            # `unction`/`arameter` 的前缀或后缀，**不要求出现过 `<`** —— 普通英文词
+            # “function/parameter” 甚至 `a`/`u` 这种单字母都会被扣；非结束时只是多等
+            # 一个字符，可 `final=True` 时下面这行会把扣住的部分直接清空 ⇒ 实测
+            # `…调用 function` 最终显示成 `…调用 f`（丢 7 字符）、`选择 a` 丢 1 字符，
+            # 界面上永久缺字（DONE 帧没人读）。没有 `<` 就不可能是被截断的标签，
+            # 结束时原样吐出；含 `<` 的残片照旧扣/丢（那才是真的半截标签）。
+            if final and "<" not in self._buf:
+                hold = 0
             if hold:
                 out.append(self._buf[: len(self._buf) - hold])
                 self._buf = "" if final else self._buf[len(self._buf) - hold:]
@@ -11975,10 +12019,21 @@ from lionbox.agent.approval import ApprovalAction, ApprovalPolicy
 #     与 Java 版、与 /api/sessions 读出来的结构完全一致；
 #   · 不在 → 用本模块的 `LocalConversationHistory`（内存桩），接口形状一致。
 try:  # pragma: no cover - 取决于并行施工进度
-    from lionbox.sessions.message import ConversationMessage as _SessionsMessage, ToolCallRecord__agent_loop as _SessionsToolCallRecord
-except Exception:  # noqa: BLE001 - 任何导入问题都退回内存桩，不让主循环起不来
+    # 两个名字都用 sessions 模块里的**真名**。`ToolCallRecord__agent_loop` 是内联器给
+    # 本模块自己的桩类（12027 行，在这句 import **下面**）改的名字，`lionbox.sessions.message`
+    # （别名指向本文件，45 行）里从来没有这个名字 → 旧写法必然 ImportError，连本来能成功
+    # 的 ConversationMessage 一起被下面的 except 置 None：AgentLoop 落盘就只剩 4 键残缺桩，
+    # 永久丢 timestamp/metadata。真类 ToolCallRecord 在 4878 行（@dataclass(slots=True)），
+    # 14720 行 `_SessionsToolCallRecord(id=..., name=..., arguments=...)` 关键字构造完全兼容。
+    from lionbox.sessions.message import ConversationMessage as _SessionsMessage, ToolCallRecord as _SessionsToolCallRecord
+except Exception as _exc:  # noqa: BLE001 - 任何导入问题都退回内存桩，不让主循环起不来
     _SessionsMessage = None
     _SessionsToolCallRecord = None
+    # 回退必须留痕：以前静默吞掉，把「内联改名写错」这种致命回归伪装成「并行施工没到位」，
+    # 事后无从诊断（历史文件从此只有 content/messageId/role/sessionId 四个键）。
+    logging.getLogger("lionbox.agent.loop").warning(
+        "[会话] 导入 lionbox.sessions.message 失败，回退内存桩"
+        "（历史落盘将缺 timestamp/metadata）: %r", _exc)
 
 __all__ = [
     "ChatClient", "ChatMessage", "ToolCall", "ToolCallRecord", "ModelResponse",
@@ -13752,7 +13807,16 @@ class AgentLoop:
         if g == "READ_ONLY":
             return required == PermissionLevel.READ_ONLY
         if g == "WORKSPACE_WRITE":
-            return required != "FULL_ACCESS"
+            # 【这里曾经恒为 True】旧写法 `required != "FULL_ACCESS"` 比的是一个
+            # **不存在的等级**：PermissionLevel（插件管理.py:157-167）只有
+            # READ_ONLY/WRITE/WORKSPACE_WRITE/EXECUTE/DANGEROUS，工具的 permission
+            # 也从不返回 "FULL_ACCESS" → 工作区默认档（WORKSPACE_WRITE）下
+            # DANGEROUS 工具（delete_file/git_reset…）全部直接放行，门禁形同虚设，
+            # 与上面 docstring「不可执行 FULL_ACCESS 工具」和 13857 的分工说明矛盾。
+            # 按 `_canonical_permission`（插件管理.py:1593-1599）的对齐语义
+            # DANGEROUS ≈ FULL_ACCESS，这一档才是要挡的；EXECUTE 按设计放行。
+            return str(required).strip().upper() not in (PermissionLevel.DANGEROUS,
+                                                         "FULL_ACCESS")
         if g == "FULL_ACCESS":
             return True
         return True
@@ -13805,10 +13869,16 @@ class AgentLoop:
         语义上关了、时间照旧花掉 ✓（测试可验：关闭时不会出现审查调用 ✓）。
         """
         try:
-            cfg = getattr(self, "cfg", None)
+            # 【这里曾经恒为 False】读的是 `self.cfg` —— AgentLoop 类上根本没有这个属性
+            # （__init__ 只存 `self.config_store`，见 12747），getattr 兜底恒 None →
+            # 开关 approvalReview 打开也没用、且无任何报错（13885 之后整段审查成死代码）。
+            cfg = self.config_store
             if cfg is None:
                 return False
-            return bool(cfg.get("approvalReview", False))
+            getter = getattr(cfg, "get", None)
+            if not callable(getter):          # 不是能按 key 取值的 store → 当作关闭
+                return False
+            return bool(getter("approvalReview", False))
         except Exception:                                 # noqa: BLE001 读不到就当关闭
             return False
 
@@ -23908,6 +23978,50 @@ def run_guard() -> None:
     check("规则表不越权：只读工具不由它判",
           AgentLoop._rule_based_tool_decision(_dummy, "read_file", {"path": "x"}) is None)
     check("模型审查默认关（approvalReview=False）", DEFAULTS.get("approvalReview") is False)
+
+    # ---- 权限等级门禁（check_permission）----------------------------------
+    # 【为什么补这组用例】WORKSPACE_WRITE 档原来写的是 `required != "FULL_ACCESS"` ——
+    # PermissionLevel 里**没有** FULL_ACCESS 成员（只有 READ_ONLY/WRITE/WORKSPACE_WRITE/
+    # EXECUTE/DANGEROUS），比较恒 True：默认工作区（WorkspaceStore 默认就是
+    # WORKSPACE_WRITE）下 delete_file/git_reset 这类 DANGEROUS 工具全放行，门禁形同虚设。
+    # 用例钉死：WORKSPACE_WRITE 必须挡 DANGEROUS，同时按设计放行其余三档。
+    def _loop_with(resolver, store=None):
+        return AgentLoop(client=FakeChatClient([]),
+                         event_store=LocalEventStore(), history=LocalConversationHistory(),
+                         budget=ContextBudget(16384), use_native_tools="prompt",
+                         permission_resolver=resolver, config_store=store)
+
+    def _tool_needing(permission):
+        # check_permission 只读 `tool.permission` 一个属性，桩类就够
+        return type("_Tool", (), {"permission": permission})()
+
+    ws = _loop_with(lambda _sid: "WORKSPACE_WRITE", {"approvalReview": False})
+    check("WORKSPACE_WRITE 挡下 DANGEROUS 工具（旧写法恒放行）",
+          ws.check_permission("s1", _tool_needing(PermissionLevel.DANGEROUS)) is False)
+    check("WORKSPACE_WRITE 放行只读工具",
+          ws.check_permission("s1", _tool_needing(PermissionLevel.READ_ONLY)) is True)
+    check("WORKSPACE_WRITE 放行工作区写工具",
+          ws.check_permission("s1", _tool_needing(PermissionLevel.WORKSPACE_WRITE)) is True)
+    check("WORKSPACE_WRITE 放行 EXECUTE（按设计，DANGEROUS 才是被挡的那档）",
+          ws.check_permission("s1", _tool_needing(PermissionLevel.EXECUTE)) is True)
+    ro = _loop_with(lambda _sid: "READ_ONLY")
+    check("READ_ONLY 只放行只读工具（写工具被挡）",
+          ro.check_permission("s1", _tool_needing(PermissionLevel.READ_ONLY)) is True
+          and ro.check_permission("s1", _tool_needing(PermissionLevel.WRITE)) is False)
+
+    # ---- approvalReview 开关（_approval_review_enabled）-------------------
+    # 【为什么补】旧写法读 `getattr(self, "cfg", None)` —— AgentLoop 类上没有 self.cfg
+    # （__init__ 只存 self.config_store），恒 None → 开关打开也静默失效、无任何报错。
+    on = _loop_with(None, {"approvalReview": True})
+    check("config_store 里 approvalReview=true 时开关是开的（不再看不存在的 self.cfg）",
+          on._approval_review_enabled() is True)
+    check("未配置/关着时开关是关的", ws._approval_review_enabled() is False)
+    try:
+        _review_out = on._approval_review("s1", "delete_file", {"path": "x"})
+        _review_ok = isinstance(_review_out, (str, type(None)))
+    except Exception:                                       # noqa: BLE001
+        _review_ok = False
+    check("开关打开时 _approval_review 能真正走一次（不抛异常）", _review_ok)
 
 
 # ==========================================================================
