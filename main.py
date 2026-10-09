@@ -15348,7 +15348,7 @@ def first_not_none(*values: Any) -> Any:
 
 自验（157 项，纯标准库、不碰网络/模型）：
 
-    python -m lionbox.agent._verify
+    python main.py --verify
 """
 
 
@@ -15709,7 +15709,10 @@ class MentionResolver:
                     block = self._expand_history(token, arg)
                 else:
                     block = self._expand_skill(token, arg)
-                budget -= len(block.text)
+                # 【按字节扣】MAX_TOTAL_BYTES 是字节常量（80KB 防烧 token 硬上限），
+                # 原来按字符数扣会让 CJK 内容（UTF-8 每字 3 字节）把上限放大约 3 倍 ——
+                # 同模块的 MAX_FILE_BYTES 一直按字节算，口径必须一致（审查 main.py:15591）
+                budget -= len(block.text.encode("utf-8"))
             out.append("\n" + block.text + "\n")
             notes.append(block.note)
 
@@ -15743,16 +15746,29 @@ class MentionResolver:
         body: list[str] = []
         used_bytes = 0
         taken = 0
+        byte_cut = False
         for line in lines:
             if taken >= MAX_FILE_LINES:
                 break
             length = len(line.encode("utf-8")) + 1
             if used_bytes + length > MAX_FILE_BYTES:
+                # 【单行超限也必须给内容】minified JS/打包产物/单行 JSON 很常见：
+                # 原来首行就超 20KB 时直接 break → taken=0、引用块 0 行内容，头还写
+                # "第 1-0 行" —— 对这类文件 @引用完全失效（审查 main.py:15629）。
+                # 按剩余字节截断该行入 body：taken>=1、内容非空，头不再出现 1-0。
+                if taken == 0:
+                    remain = MAX_FILE_BYTES - used_bytes
+                    piece = line.encode("utf-8")[:max(1, remain - 1)]   # 留 1 字节给换行
+                    # 可能切在多字节序列中间：replace 让坏字节显示成 � 而不是抛错
+                    body.append(piece.decode("utf-8", errors="replace") + "\n")
+                    used_bytes += len(piece) + 1
+                    taken += 1
+                    byte_cut = True
                 break
             body.append(line + "\n")
             used_bytes += length
             taken += 1
-        truncated = taken < total_lines or cut_by_size
+        truncated = taken < total_lines or cut_by_size or byte_cut
         display = self.roots.display_path(root, target)
 
         head = (f"--- 引用开始：文件 {display}（第 1-{taken} 行，共 {total_lines} 行")
@@ -16135,10 +16151,16 @@ class _Hit:
 class _Ctx:
     """遍历状态（文件数、命中、截止时间）。"""
 
-    __slots__ = ("root", "query", "hits", "files", "truncated", "deadline")
+    __slots__ = ("root", "query", "hits", "files", "truncated", "deadline", "real_root")
 
     def __init__(self, root: Path, query: str, deadline: float) -> None:
         self.root = root
+        # 根目录的 realpath（对账用，遍历里每个链接都拿它判"出去没有"）：
+        # 与 @file 展开时 contain() 的 realpath 校验同一口径，保证"能列出的一定能展开"
+        try:
+            self.real_root = os.path.realpath(str(root))
+        except OSError:
+            self.real_root = str(root)
         self.query = query
         self.hits: list[_Hit] = []
         self.files = 0
@@ -16222,6 +16244,7 @@ class MentionSearchService:
             name = entry.name
             try:
                 is_dir = entry.is_dir()
+                is_link = entry.is_symlink()
             except OSError:
                 continue
             if is_dir:
@@ -16229,8 +16252,28 @@ class MentionSearchService:
                 # node_modules 里的文件对用户没有任何意义，还白花遍历时间
                 if name.startswith(".") or name.lower() in SKIP_DIRS:
                     continue
+                # 【越界链接/junction 不递归】is_symlink 对 junction 的判定在各 Python
+                # 版本间不稳（mount-point 与 symlink 的 reparse tag 不同），所以目录一律
+                # 拿 realpath 对账而不是只看链接位：工作区内指向 C:\Windows 的 junction
+                # 一旦递归，外部文件名/大小会进 @候选，而展开时 contain() 按 realpath
+                # 必拒 —— 候选与沙箱自相矛盾（审查 main.py:16103）。能列出的必须能展开。
+                try:
+                    real = os.path.realpath(entry.path)
+                except OSError:
+                    continue
+                if not _is_within(Path(real), Path(ctx.real_root)):
+                    continue
                 self._walk(Path(entry.path), depth + 1, ctx)
                 continue
+            if is_link:
+                # 文件级符号链接指向根外时同理：展开必被 contain() 的 realpath 校验拒掉，
+                # 候选先跳过，别把永远用不了的条目（还泄露外部文件名/大小）放进弹窗
+                try:
+                    real = os.path.realpath(entry.path)
+                except OSError:
+                    continue
+                if not _is_within(Path(real), Path(ctx.real_root)):
+                    continue
             ctx.files += 1
             if ctx.files > MAX_FILES:
                 ctx.truncated = True
@@ -17189,10 +17232,22 @@ class UserQuestionService:
             # 回给模型一句"请基于现有信息继续"。用户明明点了停止，模型却继续干活。
             if waiter.cancelled:
                 return self._cancelled(session_id, question_id)
-            if waiter.answer is not None and waiter.answer.strip():
+            # 【超时判定与 answer() 的写入必须在同一把锁里一次性交接】否则用户恰在超时瞬间
+            # 提交会翻车：answer() 先取到 waiter 引用、这里判 waiter.answer 为 None 返回
+            # TIMEOUT 之后，answer() 才写入并回 True —— 前端显示"已回答"，模型拿到的却是
+            # 超时文案，用户的回答被静默丢弃（审查 main.py:17101）。锁内判完即摘 waiter：
+            # 这边判超时，之后的 answer() 就拿不到 waiter → 回 False；那边先写进来，
+            # 这边必然读到 → 回 ANSWERED。谁先进锁谁赢，两条路互斥。
+            with self._lock:
+                final_answer = waiter.answer
+                if not (final_answer is not None and final_answer.strip()):
+                    self._pending.pop(question_id, None)
+                    self._waiters.pop(question_id, None)
+                    final_answer = None
+            if final_answer is not None:
                 print(f"[提问] 用户已回答: 会话={session_id}, 问题ID={question_id}, "
-                      f"答案={_abbreviate(waiter.answer)}", flush=True)
-                return Result__misc_question(Status.ANSWERED, waiter.answer, waiter.answer)
+                      f"答案={_abbreviate(final_answer)}", flush=True)
+                return Result__misc_question(Status.ANSWERED, final_answer, final_answer)
             print(f"[提问] 等待用户回答超时: 会话={session_id}, 问题ID={question_id}", flush=True)
             return Result__misc_question(Status.TIMEOUT, None,
                           f"（用户 {timeout} 秒内没有回答。请不要再重复提问，"
@@ -17215,13 +17270,17 @@ class UserQuestionService:
         """用户提交回答；返回是否命中了一个正在等待的问题。"""
         if question_id is None or not str(question_id).strip():
             return False                            # dict.get(None) 在 Java 会抛，这里直接挡掉
+        # 【取 waiter 与写 answer 必须同一把锁】与 ask() 的超时判定做一次性交接：
+        # 判超时的一方在锁里摘掉 waiter，之后这里 get 不到 → 回 False（前端如实显示
+        # "未命中"）；这里先写进来，ask() 必然读到 → 回 ANSWERED。写在锁外曾让
+        # "返回 True"与"ask 已判超时"同时成立，回答被静默丢弃（审查 main.py:17101）。
         with self._lock:
             waiter = self._waiters.get(str(question_id))
-        if waiter is None:
-            return False                            # 超时过了或者 ID 不对
-        waiter.answer = "" if answer is None else str(answer).strip()
-        waiter.event.set()
-        return True
+            if waiter is None:
+                return False                        # 超时过了、已取消或 ID 不对
+            waiter.answer = "" if answer is None else str(answer).strip()
+            waiter.event.set()
+            return True
 
     def pending_of(self, session_id: str | None) -> Pending | None:
         """取某会话当前待回答的问题（前端轮询用）。"""
@@ -17625,7 +17684,12 @@ def int_of__misc_sound(cfg: dict[str, Any], key: str, default: int) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)
+        # 裸 NaN/Infinity（json.loads 认、标准 JSON 禁止）会把 int() 打爆成
+        # ValueError/OverflowError —— 夹成 default 与字符串解析失败同一出口（审查 19682）
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return default
     if isinstance(value, str):
         try:
             return int(value.strip())
@@ -19045,7 +19109,13 @@ def _jackson_long(value: Any) -> int | None | _Invalid:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)               # Jackson 对浮点取整（截断）
+        # json.loads 接受裸 NaN/Infinity（标准 JSON 禁止，但 curl/手改 app-config.json
+        # 能发出来）：int(float('nan')) 抛 ValueError、int(float('inf')) 抛 OverflowError。
+        # 不兜住，"该被 400 拒/取默认值"的输入会变成未捕获异常 → 500（审查 main.py:19682）
+        try:
+            return int(value)               # Jackson 对浮点取整（截断）
+        except (ValueError, OverflowError):
+            return INVALID
     if isinstance(value, str):
         try:
             return int(value.strip())
@@ -19750,7 +19820,13 @@ def _long_of(value: Any) -> int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)
+        # 【与字符串分支对齐】json.loads 的裸 NaN/Infinity 进来时 int() 会抛
+        # ValueError/OverflowError —— 这里返回 None 走"取默认值"路径而不是 500
+        # （_int_of 拿到 None 会回 0，调用方本就把 0 当缺省处理）（审查 main.py:19682）
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
     try:
         return int(str(value).strip())
     except ValueError:
@@ -20504,25 +20580,37 @@ def _project_sort_key(path: Any) -> tuple[str, str]:
 
 
 def _literal_routes_first(router: Any, handlers: list[Any]) -> None:
-    """把本控制器登记的**字面量**路由排到 `/{pluginId}` 这类占位路由前面。
+    """把本控制器登记的**字面量**路由排到匹配顺序的最前面。
 
-    【为什么必须做】Spring 的路径匹配是"字面量优先"：`GET /api/plugins/dev-mode`
-    永远命中 PluginDevController，不会被 PluginController 的 `@GetMapping("/{pluginId}")`
-    抢走（Java 注释里专门写了这件事）。Python 侧的 Router 是**先登记先匹配**
-    （`http/server.py` 的 `find` 顺序遍历），而装配顺序里 `plugins` 在 `plugin_dev` 之前 ——
-    不调整的话 `GET /api/plugins/dev-mode` 会被当成"插件 id 叫 dev-mode"，
-    回一套完全不同的结构，前端直接崩。
+    【为什么必须动 _static/_dynamic】Spring 的路径匹配是"字面量优先"：`GET
+    /api/plugins/dev-mode` 永远命中 PluginDevController，不会被 PluginController 的
+    `@GetMapping("/{pluginId}")` 抢走。但 Python 侧 `Router.find()` 只遍历
+    `_static`/`_dynamic` 两张匹配表，**从不读 `_routes`** —— 原实现只重排 `_routes`
+    等于零效果，"字面量优先"的保护实际并不存在，纯属撞巧 find() 静态优先
+    （审查 main.py:20436：死防御会误导维护者）。现在两张匹配表一起调，保护才真实成立：
+    字面量条目在 `_static` 内提到最前，将来即使有人改 find 的分组逻辑、或出现同前缀
+    的字面量冲突，`/api/plugins/dev-mode` 也不会被吃掉。
 
     只移动**自己刚登记的那几条**（按处理函数对象同一性判定），别人的路由顺序不动；
     拿不到路由表内部结构就安静跳过（不影响任何功能，只是退回先登记先匹配）。
     """
+    def is_mine(entry: Any) -> bool:
+        return isinstance(entry, tuple) and len(entry) >= 3 and \
+            any(entry[2] is h for h in handlers)
+
     routes = getattr(router, "_routes", None)
-    if not isinstance(routes, list):
-        return
-    mine = [r for r in routes if any(r[2] is h for h in handlers)]
-    if not mine or routes[:len(mine)] == mine:
-        return
-    routes[:] = mine + [r for r in routes if not any(r[2] is h for h in handlers)]
+    if isinstance(routes, list):
+        mine = [r for r in routes if is_mine(r)]
+        if mine and routes[:len(mine)] != mine:
+            routes[:] = mine + [r for r in routes if not is_mine(r)]
+    # 【匹配表才是 find() 真正读的】_routes 只用于 size/枚举；两张表各自把"我的"提到表头
+    for name in ("_static", "_dynamic"):
+        table = getattr(router, name, None)
+        if not isinstance(table, list):
+            continue
+        mine_t = [e for e in table if is_mine(e)]
+        if mine_t and table[:len(mine_t)] != mine_t:
+            table[:] = mine_t + [e for e in table if not is_mine(e)]
 
 
 # --------------------------------------------------------------------------
@@ -21241,7 +21329,12 @@ class RuntimeExtraApi:
 
     def __init__(self, ctx: deps.ApiContext) -> None:
         self.ctx = ctx
-        self.models = LocalModelsSupport(ctx)
+        # 【必须是进程单例】"同一时刻只允许一个下载"的互斥靠 self._lock/_downloading_now，
+        # 是**实例字段** —— 这里 new 一份、_hook_auto_download 再 new 一份的话，界面按钮
+        # （本类）和开机后台补齐（那份）各持一把锁，同一文件两条路径都判"没在下"，
+        # 两个句柄交错写同一个 .part → 体积膨胀但 GGUF 魔数仍在、校验放行，磁盘上是坏
+        # 权重而 llama-server 永远加载失败（审查 main.py:21174）。走 ctx.service 取同一份。
+        self.models = ctx.service("local_models_support", lambda: LocalModelsSupport(ctx))
 
     # ------------------------------------------------------------ 依赖
     def agent_loop(self) -> Any:
@@ -21939,7 +22032,13 @@ class ChatApi:
             if base_url is not None:
                 cfg["baseUrl"] = base_url
             if api_key is not None:
-                cfg["apiKey"] = api_key
+                # 【掩码 = 没改】GET /api/chat/config 回的是 "sk-••••wxyz" 掩码，界面原样
+                # 回填、用户不改就原样提交 —— 只判 is not None 会把掩码串同时写进内存适配器
+                # （立即生效）和 app-config.json（落盘），真 key 被覆盖、之后所有云端调用拿
+                # 掩码鉴权失败（审查 main.py:21871）。与 providers 保存口（is_mask 判定，
+                # 见 19543 行）同一套写法；空串仍照写（Java 语义：显式清空）。
+                if not deps.SecretMask.is_mask(api_key):
+                    cfg["apiKey"] = api_key
             target.update_config(cfg)
 
             key = _adapter_key(target_type)
@@ -22229,7 +22328,11 @@ def query_session_id(req: Request) -> str | None | Response:
     raw = req.q("sessionId")
     if raw is None:                         # 参数整个缺失：Spring 必填校验 → 400
         return deps.spring_error(400, req.path)
-    return None if not raw.strip() else raw
+    # 【Java trim 语义：只裁 <= U+0020】不能用 Python 的 str.strip() —— 它把 NBSP(U+00A0)/
+    # NNBSP(U+202F) 也当空白裁掉，而实测这俩是**能暂停的 sessionId**（pause 侧原样存键），
+    # 这里折成 None 后 get_state(None) 恒回 RUNNING —— 同一会话 POST /pause 回"已暂停"、
+    # GET /status 却回 RUNNING，两个接口互相打脸（审查 main.py:22150）。
+    return None if not java_trim(raw) else raw
 
 
 class AgentControlApi:
@@ -22887,7 +22990,10 @@ def _hook_auto_download(ctx: Any) -> Any:
     """
     from lionbox.api.runtime_extra import LocalModelsSupport
     from lionbox.local import runtime as local_runtime
-    support = LocalModelsSupport(ctx)
+    # 【与 RuntimeExtraApi.models 必须是同一份实例】下载互斥（_downloading_now/_lock）
+    # 是实例字段，两处各 new 一份就互相看不见对方在下载 —— 界面下载与开机补齐会并发写
+    # 同一个权重文件把数据写坏（审查 main.py:21174）。ctx.service 保证进程内单例。
+    support = ctx.service("local_models_support", lambda: LocalModelsSupport(ctx))
     local_runtime.set_auto_downloader(support.start_download)
     return support
 
@@ -23135,7 +23241,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__lionbox_inlined__":  # 内联后不再作为入口
+if __name__ == "__lionbox_inlined__":  # 恒假（没人赋这个名字）；后端入口走 --backend-only → main()
     raise SystemExit(main())
 
 
@@ -23144,9 +23250,10 @@ if __name__ == "__lionbox_inlined__":  # 内联后不再作为入口
 # ========================================================================
 """Agent 核心的自验脚本（**只依赖标准库与本包**，可随时重跑）。
 
-跑法：
-    cd C:\\Users\\Leo\\Desktop\\lion-code\\python
-    .\\.venv\\Scripts\\python.exe -m lionbox.agent._verify
+跑法（单文件仓库没有 lionbox 包，`-m lionbox.agent._verify` 会 ModuleNotFoundError；
+真实入口在文件末尾 `_host_main` 的 `--verify` 分发）：
+    cd C:\\Users\\Leo\\Desktop\\lion-code
+    .\\.venv\\Scripts\\python.exe main.py --verify
 
 覆盖：
   A. 解析器：12 个「本地模型风格」的坏工具调用样本，逐个走
@@ -24762,7 +24869,7 @@ def main__agent__verify() -> int:
     return 1 if FAIL else 0
 
 
-if __name__ == "__lionbox_inlined__":  # 内联后不再作为入口
+if __name__ == "__lionbox_inlined__":  # 恒假；自验真实入口：python main.py --verify（_host_main 分发）
     sys.exit(main__agent__verify())
 
 
@@ -24774,7 +24881,7 @@ if __name__ == "__lionbox_inlined__":  # 内联后不再作为入口
 `_verify.py` 用的是内存桩（保证 agent 包自己永远能跑）；这个脚本用并行施工的
 邻座模块的真实类型跑一遍，确认"窄接口"真的对得上：
 
-    python -m lionbox.agent._verify_integration
+    python main.py --verify-integration
 
 注意：`lionbox/sessions/`、`lionbox/events/` 由别的同事负责，**还在变**。
 这个脚本只做只读式的对接验证，不修改它们的任何文件；它们改了形状这里会先红。
@@ -24967,7 +25074,7 @@ def _delta(index, call_id, name, arguments):
     return ToolCallDelta(index=index, id=call_id, name_delta=name, arguments_delta=arguments)
 
 
-if __name__ == "__lionbox_inlined__":  # 内联后不再作为入口
+if __name__ == "__lionbox_inlined__":  # 恒假；真实入口：python main.py --verify-integration（_host_main 分发）
     sys.exit(main__agent__verify_integration())
 
 
@@ -25166,6 +25273,11 @@ class SessionDispatcher:
         with self._lock:
             self._active_sessions.clear()
             self._streaming_sessions.clear()
+        # 队列表一并清掉：原来只清两个 set，_queues 里的会话队列（及残留 QueuedMessage/
+        # future 引用链）停机后仍留着（审查 main.py:25143 的后半句）。
+        clearer = getattr(self.message_queue, "clear", None)
+        if callable(clearer):
+            clearer()
 
 
 def _level_name(thinking_level: Any) -> str:
@@ -25277,12 +25389,33 @@ class MessageQueue:
         return message
 
     def poll(self, session_id: str, timeout: float) -> QueuedMessage | None:
-        """取出会话的下一条消息；超时返回 None（Worker 靠它空闲退出）。"""
+        """取出会话的下一条消息；超时返回 None（Worker 靠它空闲退出）。
+
+        空手而归时顺手摘掉空队列：`_queues` 原来只增不减（没有任何 pop/remove 路径，
+        shutdown 也不清它），而会话 id 由前端不断新建 —— 长期常驻就是慢性内存泄漏
+        （审查 main.py:25143）。摘除与 submit 拿同一把锁、按 qsize==0 判定，
+        不会把刚入队的消息一起丢掉。
+        """
         try:
             _, _, message = self._queue_of(session_id).get(timeout=timeout)
             return message
         except _queue.Empty:
+            self.remove_if_idle(session_id)
             return None
+
+    def remove_if_idle(self, session_id: str) -> bool:
+        """队列为空就从 `_queues` 摘掉（Worker 空闲退出时调用）。返回是否真的摘了。"""
+        with self._lock:
+            q = self._queues.get(session_id)
+            if q is not None and q.qsize() == 0:
+                del self._queues[session_id]
+                return True
+            return False
+
+    def clear(self) -> None:
+        """停机清理：把残留的会话队列全摘掉（`SessionDispatcher.shutdown` 调用）。"""
+        with self._lock:
+            self._queues.clear()
 
     # ------------------------------------------------------------ 统计
     def pending_count(self, session_id: str) -> int:
@@ -25837,6 +25970,15 @@ def _ink_main(argv: list | None = None) -> int:
 # ==========================================================================
 def _host_main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    # 【自验的真实入口】文件里三处 `if __name__ == "__lionbox_inlined__"` 守卫恒为 False
+    # （内联后没有任何地方给这个名字赋值），而 docstring 给的 `python -m lionbox.agent._verify`
+    # 在"只有 main.py 单文件"的仓库里 ModuleNotFoundError —— run_parser_samples..run_change_review
+    # 这套"只依赖标准库、可随时重跑"的自验一直没有可用入口（审查 main.py:24618）。
+    # 这里补上：python main.py --verify / --verify-integration。
+    if "--verify-integration" in args:
+        return int(main__agent__verify_integration() or 0)
+    if "--verify" in args:
+        return int(main__agent__verify() or 0)
     if "--backend-only" in args:
         rest = [a for a in args if a != "--backend-only"]
         print("Lion Code 后端启动中（只有接口，没有界面）… Ctrl+C 结束", flush=True)
