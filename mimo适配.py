@@ -1161,12 +1161,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def _provider(self) -> dict:
         """/models 面板读的是 providers[].models —— 这里给真实列表，
-        否则只能看到一个模型，等于没法切换。"""
+        否则只能看到一个模型，等于没法切换。
+
+        【limit 三件套缺一不可 —— 没有它，前端一算窗口就 fatal】（清单外第 11 条，
+        bun 实测复现：`TypeError: undefined is not an object (evaluating
+        'input.model.limit.context')`）。消费方全是**裸读**：
+          · session/overflow.ts:81/101/123   hard = model.limit.context …
+            → dialog-status.tsx:35、dialog-context-limit.tsx:31/90 打开即抛
+            （审 #6 补 tokens 只挡住了 :28 那一处 —— :33-35 走 local.model.current()
+             还是会走到这里，所以状态对话框当时并没有真正修好）；
+          · acp/agent.ts:75   model?.limit.context（model 在、limit 没有照样抛）
+          · provider.ts:1161-1163 同上。
+        store 是**原样 reconcile**（sync.tsx:901），没有哪一步会补 limit ✗。
+        【数值来源，不许猜】context/input = 32768 ← main.py:12683
+        `FALLBACK_CONTEXT_TOKENS`（后端 effective_context_limit 查不到模型窗口时
+        用的同一个兜底，main.py:14870）；output = 1024 ← main.py:14903-14907
+        （本地运行时每轮生成封顶 1024 —— 本适配层的对话全部走后端本地运行时）。
+        实测 `/api/models/local` 是空数组、`/api/models` 的 maxContextTokens 是
+        null（2026-10-09），等后端给得出真值再按模型回填。
+        【还缺 providerID / api —— 同一条崩溃链的下一环】bun 实测补完 limit 后
+        下一抛是 `model.api.id`：reserves() → ProviderTransform.maxOutputTokens →
+        usesLargeModelDefaults（transform.ts:1890 起，读 `providerID` + `api.id`）。
+        形状照运行时构造 fromModelsDevModel（provider.ts:1145-1164）：
+        providerID 挂模型级；api.npm 钉死 `@ai-sdk/openai-compatible`（provider.ts
+        :1134-1136：本项目模型只说 OpenAI 兼容协议），api.url 取 `?? ""` 默认。
+        """
         models = {}
         for mid in self._model_ids():
             models[mid] = {"id": mid, "name": mid, "attachment": False,
                            "reasoning": True, "temperature": True,
-                           "tool_call": True, "cost": {"input": 0, "output": 0}}
+                           "tool_call": True, "cost": {"input": 0, "output": 0},
+                           "providerID": PROVIDER_ID,
+                           "api": {"id": mid, "url": "",
+                                   "npm": "@ai-sdk/openai-compatible"},
+                           "limit": {"context": 32768, "input": 32768,
+                                     "output": 1024}}
         return {"id": PROVIDER_ID, "name": "Lion Code", "source": "custom",
                 "env": [], "options": {}, "models": models}
 
