@@ -456,7 +456,11 @@ BINARY_SAMPLE_BYTES = 8192
 """二进制取样长度：与 Java 版 `FileWcTool.looksBinary` 的 8KB 一致。"""
 
 _CONTROL_OK = (0x09, 0x0A, 0x0D, 0x0C, 0x08)  # \t \n \r \f \b
-_ASCII_WS = " \t\n\r\f\v"
+
+#: `String.trim()` 去掉的是**所有 codePoint <= U+0020** 的首尾字符（0x00-0x20 共 33 个），
+#: 不是"列出来的那几个空白"——`str.strip(" \t\n\r\f\v")` 只去 6 个，
+#: 以 \x00、\x1f 这类控制字符开头的文本就漏掉了（count_words 判空/file_search 清洗都会偏）。
+_JAVA_TRIM_WS = "".join(chr(i) for i in range(0x21))
 
 
 def java_trim(text: str) -> str:
@@ -465,7 +469,7 @@ def java_trim(text: str) -> str:
     【别用 `str.strip()`】Python 的 strip 还会去掉 U+3000（全角空格）、U+00A0 这些，
     Java 的 trim 不会。判空/判 null 的字面量走的是 Java 语义，差一个字符结论就反了。
     """
-    return text.strip(_ASCII_WS)
+    return text.strip(_JAVA_TRIM_WS)
 
 
 # --------------------------------------------------------------------------
@@ -607,6 +611,12 @@ def looks_binary(data: bytes) -> bool:
 # --------------------------------------------------------------------------
 # 路径与遍历
 # --------------------------------------------------------------------------
+
+
+#: "不设层数上限"用的深度。统计类工具（line_count / word_count 的目录累计）问的是
+#: "这个目录里一共多少行"，Java 那边用的就是不带 maxDepth 的 `Files.walk(dir)`；
+#: file_glob / file_search 显式传 10 是为了对齐 `Files.walk(dir, 10)`，两回事，别混用。
+WALK_UNLIMITED_DEPTH = 1_000_000
 
 
 def walk_files(root: Path, max_depth: int = 10) -> list[Path]:
@@ -1150,10 +1160,13 @@ class FileChmodTool(ToolPlugin):
             else:
                 # Windows：Java 退到 File.setReadable/setWritable/setExecutable。
                 # 只有"可写"这一位是真实生效的（只读属性），其余两位 Windows 上无对应语义。
+                # 【OSError 不能吞】路径不存在/被占用时 os.chmod 会抛 FileNotFoundError/
+                # PermissionError，原来 `except OSError: pass` 之后照样回"权限已修改"，
+                # 模型据此以为改好了继续往下走（失败仍报成功）。这里如实报错。
                 try:
                     os.chmod(file_path, stat.S_IREAD | (stat.S_IWRITE if writable else 0))
-                except OSError:
-                    pass
+                except OSError as e:
+                    return self.error(f"修改权限失败: {type(e).__name__}: {e}")
 
             return self.success(f"权限已修改: {path}")
         except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
@@ -1628,10 +1641,17 @@ class FileHeadTailTool(ToolPlugin):
                 return self.error(
                     f"文件不存在: {path}{similar_path_hint(str(path), self.current_workspace())}")
 
-            # mode 缺省当 head
+            # mode 缺省当 head；【必须归一化 + 校验取值】原来只判 `mode == "head"`，
+            # 传 "Head"/"HEAD"/手滑写成 "heda" 全部落进 else → 不报错地返回**文件末尾**，
+            # 与调用方"看开头"的意图正好相反（静默给错数据，比报错更难查）。
             mode = self.get_string_arg(args, "mode", "head")
-            if not mode or not mode.strip():
+            mode = (mode or "").strip().lower()
+            if mode == "":
                 mode = "head"
+            if mode not in ("head", "tail"):
+                return self.error(
+                    f"mode 必须是 head 或 tail（当前: {mode}）。"
+                    "例：mode=head 看开头、mode=tail 看结尾")
             lines = self.get_int_arg(args, "lines", 10)
             if lines < 1:
                 return self.error(
@@ -1826,7 +1846,10 @@ class FileLineCountTool(ToolPlugin):
                 total = 0
                 files = 0
                 skipped = 0
-                for candidate in walk_files(target):
+                # 【统计不设层数上限】walk_files 的默认 10 层是给 file_glob/file_search
+                # 对齐 Java `Files.walk(dir, 10)` 用的；"这个目录一共多少行"没有层数上限
+                # （node_modules/.venv 深处的文件原来会被静默漏掉、少算还不吭声）。
+                for candidate in walk_files(target, WALK_UNLIMITED_DEPTH):
                     try:
                         # 【二进制必须真的跳过】按字节判，不靠"解码抛不抛"（它永远不抛）
                         with candidate.open("rb") as fh:
@@ -1847,6 +1870,16 @@ class FileLineCountTool(ToolPlugin):
 
             if not target.exists():
                 return self.error(f"文件不存在: {path}")
+
+            # 【单文件也要判二进制】decode_text 三级容错永不抛，.zip/.exe/图片走到下面
+            # 会按垃圾字节里的 \n 切出一堆"假行数"返回成功；同一个文件 word_count 会明说
+            # "看着是二进制"，两个工具对同一个文件给出不同答案 —— 这里补齐同一套判据。
+            with target.open("rb") as fh:
+                head = fh.read(BINARY_SAMPLE_BYTES)
+            if looks_binary(head):
+                return self.success(
+                    f"（{path} 看着是二进制（含 NUL 或大量控制字符），不统计行数；"
+                    "要大小/类型用 file_info）")
 
             # 容错读：记事本存的 ANSI/GBK 中文文件按 UTF-8 严格解码会抛
             # MalformedInputException，word_count 早就容错读了，这里对齐。
@@ -2113,14 +2146,28 @@ class FileModifyTool(ToolPlugin):
                     "或直接用 create_file / write_file）")
 
             lines = read_text_lines(file_path)
-            # 留一份原文：审核要拿它和"改完之后"比对（lines 后面会被就地改）
-            original_full = "\n".join(lines)
+            # 留一份原文：审核要拿它和"改完之后"比对（lines 后面会被就地改）。
+            # 用**真原文**（保留原分隔符与末尾换行），否则闸门里的 diff 看不到
+            # "末尾换行被改掉"这类差异，人工审核等于白看。
+            original_text = read_text_file(file_path)
+            sep = detect_line_separator(original_text)
+            had_trailing = original_text.endswith("\n")
             start_line = self.get_int_arg(args, "startLine", 0)
             content = self.get_string_arg(args, "content", "")
 
             if operation_low in _CREATE_OPS:
-                # 文件已经在了：create 没法"再建一次"，直接把它要的内容当作整体覆盖
-                gate = intercept(self.name, str(path), "\n".join(lines), content)
+                # 【已存在文件 + 没传 content 时绝不能覆盖】get_string_arg 把缺失兜成 ""，
+                # 直接写回就把整个文件清空了还回"已覆盖写入" —— touch/write/new 都会踩
+                # （文件已存在时模型只是想"确认它在"，并不是要清空）。
+                if args.get("content") is None:
+                    if operation_low == "touch":
+                        # 与 create_file 对已存在文件的口径一致：什么都没动，也如实说
+                        return self.success(f"文件已存在，未做任何改动: {path}")
+                    return self.error(
+                        f"要覆盖已有文件必须带 content（要写进去的完整内容）：{path}。"
+                        "不带 content 不会动这个文件；只想在末尾加内容用 operation=append")
+                # 文件已经在了：create 没法"再建一次"，把它明确给的 content 当作整体覆盖
+                gate = intercept(self.name, str(path), original_text, content)
                 if gate is not None:
                     return gate
                 write_text_preserving_charset(file_path, content)
@@ -2138,10 +2185,12 @@ class FileModifyTool(ToolPlugin):
                     replace_all = self.get_bool_arg(args, "all", False)
                     replaced = (full.replace(old_text, content) if replace_all
                                 else full.replace(old_text, content, 1))
-                    gate = intercept(self.name, str(path), full, replaced)
+                    # full 是 LF 形式：写回时要转回原分隔符并补回末尾换行
+                    new_text = _to_file_text(replaced, sep, had_trailing)
+                    gate = intercept(self.name, str(path), original_text, new_text)
                     if gate is not None:
                         return gate
-                    write_text_preserving_charset(file_path, replaced)
+                    write_text_preserving_charset(file_path, new_text)
                     times = _count_occurrences(full, old_text) if replace_all else 1
                     return self.success(f"已替换 {times} 处（按原文匹配）：{path}")
 
@@ -2173,9 +2222,18 @@ class FileModifyTool(ToolPlugin):
                     lines.insert(start_line - 1 + offset, new_line)
 
             elif operation_low == "delete":
-                end_line = self.get_int_arg(args, "endLine", start_line)
                 if start_line < 1 or start_line > len(lines):
-                    return self.error(f"行号超出范围: {start_line}")
+                    return self.error(
+                        f"行号超出范围: {start_line}（这个文件只有 {len(lines)} 行）")
+                end_line = self.get_int_arg(args, "endLine", start_line)
+                if end_line < start_line:
+                    # 反过来 range 会是空的：一行都不删却照样回"文件已修改"（空操作报成功）
+                    return self.error(
+                        f"endLine({end_line}) 不能小于 startLine({start_line})，"
+                        "一行都没删（不谎报成功）")
+                # 【必须夹取，和 replace 分支一样】模型常写 endLine=9999 表示"删到末尾"，
+                # 不夹就 `del lines[9998]` 抛 IndexError → 整个删除失败、报"参数错误"
+                end_line = min(end_line, len(lines))
                 for i in range(end_line, start_line - 1, -1):
                     del lines[i - 1]
 
@@ -2183,23 +2241,30 @@ class FileModifyTool(ToolPlugin):
                 # 实测模型会写 operation=append，以前只回"未知操作类型: append"，白跑一轮
                 if args.get("content") is None:
                     return self.error("append 操作需要 content 参数（要追加的内容）")
-                append_content = str(args.get("content"))
-                if lines:
-                    lines.append("")
-                # Java: split("\r?\n", -1) —— 保留末尾空串
-                lines.extend(_split_keep_trailing(append_content))
+                # 【直接拼在原文末尾】原来走 lines.append("") + sep.join：每追加一次都凭空
+                # 多一个空行（"a\nb\n" 追加 "c" → "a\nb\n\nc"），与 append_file
+                # （直接写字节、不加分隔行）也对不上。追加就是字节接字节。
+                appended = original_text + str(args.get("content"))
+                gate = intercept(self.name, str(path), original_text, appended)
+                if gate is not None:
+                    return gate
+                write_text_preserving_charset(file_path, appended)
+                return self.success(f"文件已修改: {path} (操作: {operation})")
 
             else:
                 return self.error(
                     f"未知操作类型: {operation}"
                     "。支持 replace / insert / delete / append（想直接追加也可以用 append_file）")
 
-            gate = intercept(self.name, str(path), original_full, "\n".join(lines))
+            # 【末尾换行必须补回来】read_text_lines 会把末尾那个空串 pop 掉，
+            # 只 join 不补的话，以换行结尾的文件被任意改一次就永久丢掉末尾换行
+            # （git 会显示 "\ No newline at end of file"）。
+            new_text = _to_file_text("\n".join(lines), sep, had_trailing)
+            gate = intercept(self.name, str(path), original_text, new_text)
             if gate is not None:
                 return gate
             # 按文件原本的编码 + 原本的换行风格写回
-            sep = detect_line_separator(read_text_file(file_path))
-            write_text_preserving_charset(file_path, sep.join(lines))
+            write_text_preserving_charset(file_path, new_text)
             return self.success(f"文件已修改: {path} (操作: {operation})")
 
         except OSError as e:
@@ -2220,10 +2285,41 @@ def _count_occurrences(haystack: str, needle: str) -> int:
     return n
 
 
-def _split_keep_trailing(text: str) -> list[str]:
-    """Java `text.split("\\r?\\n", -1)`：会按 CRLF 切，并保留末尾空串。"""
-    normalized = text.replace("\r\n", "\n")
-    return normalized.split("\n")
+def _to_file_text(lf_text: str, sep: str, had_trailing: bool) -> str:
+    """把 **LF 形式**的正文转回文件原本的分隔符，并按原样补回末尾换行。
+
+    【两件事都不能省】
+    1. `read_text_lines` 把 `\\r` 剥掉、末尾空串 pop 掉了，只 join 写回会把 CRLF 文件
+       变成 LF、以换行结尾的文件丢掉那个换行（git 直接显示 "\\ No newline at end of file"）；
+    2. 删光所有行时空串不能补换行 —— 那会写出一个只含一个换行的"非空文件"。
+    """
+    text = lf_text.replace("\r\n", "\n").replace("\n", sep)
+    if had_trailing and text and not text.endswith("\n"):
+        text += sep
+    return text
+
+
+def _read_lines_with_encoding(path: Path, encoding: str) -> list[str]:
+    """按调用方声明的 encoding 严格解行；没声明/不认识/解不开就退回容错读。
+
+    【为什么要有这条退路】read_file 的 encoding 参数是"模型的声明"，不是文件的事实：
+    声明错了（或文件其实不是那个编码）时，硬按声明解会把整个文件读成乱码/抛异常 ——
+    那比"没生效"更糟。所以严格解码成功才用它，LookupError/UnicodeDecodeError 都退回
+    decode_text 的三级容错（UTF-8 → GBK → 替换），最差也和没有这个参数时一样。
+    """
+    name = (encoding or "").strip().lower().replace("_", "-")
+    if name in ("", "utf-8", "utf8"):
+        return read_text_lines(path)          # 默认口径，别为它多读一遍文件
+    try:
+        text = path.read_bytes().decode(name)
+    except (LookupError, UnicodeDecodeError):
+        return read_text_lines(path)
+    text = _strip_leading_bom(text)
+    lines = text.split("\n")
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 # ========================================================================
@@ -2236,6 +2332,7 @@ id / name / description / parameters_schema 与 Java 版**逐字一致**。
 """
 
 
+import errno
 import shutil
 from pathlib import Path
 from typing import Any
@@ -2306,13 +2403,28 @@ class FileMoveTool(ToolPlugin):
             if target_path.parent != Path(""):
                 target_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # 【目标已存在且是目录时必须先说清楚】os.replace 对"目标是目录"必然失败，
+            # 退到 shutil.move 的语义是"搬进目录里"（真实落点是 target/<源文件名>），
+            # 而返回文案照旧写 "source -> target" —— 调用方按文案去找文件会找不到。
+            # Java 的 REPLACE_EXISTING 此时抛 DirectoryNotEmptyException 直接报错，这里对齐：
+            # 先拒绝，把真实落点告诉调用方，别先斩后奏。
+            if target_path.is_dir():
+                return self.error(
+                    f"目标已存在且是目录: {target}"
+                    f"（要移动到目录里就写完整落点 {target.rstrip('/\\') + os.sep + source_path.name}；"
+                    "或者把 target 写成一个文件名）")
+
             # Java: Files.move(source, target, REPLACE_EXISTING) —— 同盘是原子改名，
             # 目标已存在就替换（目录被替换时要求它为空，非空会报 DirectoryNotEmptyException）。
-            # Python 的 os.replace 语义一致；跨盘失败才退到 shutil.move（Java 会抛
-            # AtomicMoveNotSupportedException 之外的东西，这里做得比它宽一点，属已知差异）。
+            # Python 的 os.replace 语义一致；**只有跨盘（EXDEV）**才退到 shutil.move ——
+            # 其它失败（权限、目标是目录、被占用）原来也无脑兜底，会把"没搬成"报成"已移动"。
             try:
                 source_path.replace(target_path)
-            except OSError:
+            except OSError as e:
+                cross_device = (getattr(e, "errno", None) == errno.EXDEV
+                                or getattr(e, "winerror", None) == 17)   # ERROR_NOT_SAME_DEVICE
+                if not cross_device:
+                    raise
                 shutil.move(str(source_path), str(target_path))
 
             return self.success(f"已移动: {source} -> {target}")
@@ -2382,6 +2494,10 @@ class FileReadTool(ToolPlugin):
             path = self.resolve_path(self.get_required_string_arg(args, "path"))
             offset = self.get_int_arg(args, "offset", 1)
             limit = self.get_int_arg(args, "limit", 1000)
+            # schema 里声明了 encoding（还带 default），execute 却从头到尾没读过它 ——
+            # 模型传 encoding="utf-16"/"gb18030" 会被静默忽略，读出来的内容和它声明的
+            # 编码毫无关系。这里真的按它解一次（解不开再退回三级容错，别把读文件变硬失败）。
+            encoding = self.get_string_arg(args, "encoding", "") or ""
 
             file_path = Path(path)
             if not file_path.exists():
@@ -2402,7 +2518,7 @@ class FileReadTool(ToolPlugin):
             if not file_path.is_file():
                 return self.error(f"不是普通文件: {path}（可能是设备/管道文件）")
 
-            lines = read_text_lines(file_path)
+            lines = _read_lines_with_encoding(file_path, encoding)
             if limit < 1:
                 # limit 传 0 或者负数时，下面一行都取不到，然后会掉进"（空文件）"的兜底 ——
                 # 一个非空文件被说成空的，模型会据此判断"文件是空的"。
@@ -2816,7 +2932,8 @@ def _directory_stats(directory: Path) -> str:
     words = 0
     size = 0
     binary = 0
-    for candidate in walk_files(directory):
+    # 与 line_count 的目录分支同口径：统计不设层数上限（默认 10 层会静默漏数深处的文件）
+    for candidate in walk_files(directory, WALK_UNLIMITED_DEPTH):
         try:
             raw = candidate.read_bytes()
             size += len(raw)
@@ -2906,9 +3023,13 @@ class FileWriteTool(ToolPlugin):
             if file_path.parent != Path(""):
                 file_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 覆盖已有文件时保留它原来的编码（新文件用 UTF-8）
-            file_path.write_bytes(content.encode(charset_of(file_path), "replace"))
-            return self.success(f"文件已写入: {path} ({len(content)}字节)")
+            # 覆盖已有文件时保留它原来的编码（新文件用 UTF-8）。
+            # 【回显必须是真实写字节数】len(content) 是**字符数**：中文在 utf-8 下 3 字节/
+            # 字符、gbk 下 2 字节/字符，拿它当"字节数"报，调用方拿 file_info 的 st_size
+            # 一并对账永远对不上。
+            data = content.encode(charset_of(file_path), "replace")
+            file_path.write_bytes(data)
+            return self.success(f"文件已写入: {path} ({len(data)}字节)")
 
         except OSError as e:
             return self.error(f"写入文件失败: {e}")
@@ -3697,14 +3818,21 @@ def _convert(target: str, action: str, text: str) -> str:
     un = action == "unescape"
     if target in ("html", "xml"):
         if un:
-            return (text.replace("&amp;", "&").replace("&lt;", "<")
-                    .replace("&gt;", ">").replace("&quot;", "\""))
+            # 【&amp; 必须**最后**换】反转义是转义的逆运算：转义时第一步就是 `& → &amp;`
+            # （见下面 escape 分支），所以还原时 `&amp;` 要最后处理。放在最前面会把
+            # 正文里本来就有的字面量 `&lt;`（被正确转义成 `&amp;lt;`）先拆成 `&lt;`、
+            # 第二步又当成实体换成 `<` —— escape→unescape 往返必错。
+            return (text.replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&quot;", "\"").replace("&amp;", "&"))
         return (text.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace("\"", "&quot;"))
     if target in ("java", "json"):
         if un:
-            return (text.replace("\\n", "\n").replace("\\t", "\t")
-                    .replace("\\\"", "\"").replace("\\\\", "\\"))
+            # 【不能逐条串行 replace】转义（下面 escape）第一步是 `\\ → \\\\`：字面量
+            # `\n`（反斜杠+n）被转成 `\\n`（3 字符），串行规则会先在它的第 2 位命中
+            # `\\n → 换行`，得到 `\<换行>`，最后 `\\\\ → \\` 又无从折叠 —— 往返必错。
+            # 这里单趟从左到右扫描，和转义互为逆运算；不认识的转义原样保留。
+            return _unescape_c_style(text)
         return (text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
                 .replace("\r", "\\r").replace("\t", "\\t"))
     if target == "url":
@@ -3720,6 +3848,31 @@ def _convert(target: str, action: str, text: str) -> str:
             return text.replace("'\\''", "'")
         return "'" + text.replace("'", "'\\''") + "'"
     return text
+
+
+#: java/json 反转义的映射（与 `_convert` 里 escape 的 5 种一一对应，别少也别多）
+_C_UNESCAPE = {"n": "\n", "t": "\t", "r": "\r", "\"": "\"", "\\": "\\"}
+
+
+def _unescape_c_style(text: str) -> str:
+    """单趟从左到右解 `\\n \\t \\r \\" \\\\`；不认识的转义（如 `\\x`）原样保留。
+
+    【为什么不能串行 replace】见 `_convert` 里 java/json 分支的注释：转义先把 `\\`
+    翻成 `\\\\`，反转义若按规则表逐条替换，字面量 `\\n` 会在错的位置先命中 `\\n → 换行`，
+    escape→unescape 往返就不回来了。单趟扫描才是转义的真正逆运算。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in _C_UNESCAPE:
+            out.append(_C_UNESCAPE[text[i + 1]])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _java_url_encode(text: str) -> str:
@@ -5812,7 +5965,12 @@ def _resolve_scalar(text: str) -> Any:
             return sign * int(digits[2:], 16)
         if digits.startswith(("0o", "0O")):
             return sign * int(digits[2:], 8)
-        if len(digits) > 1 and digits.startswith("0"):
+        if len(digits) > 1 and digits.startswith("0") and digits[1:].isalnum() \
+                and all(c in "01234567_" for c in digits[1:]):
+            # 【只有整串都是八进制数字才按八进制】_INT_RE 的兜底分支 `[0-9][0-9_]*`
+            # 会把 "09"、"09123456789" 也认成整数（首字符是 0 就行），直接
+            # int("09", 8) 抛 ValueError → 合法 YAML（port: 09、工号/电话）被判语法错误。
+            # 08/09 这种 SnakeYAML 是按**十进制**解析的，这里回退到下面的十进制分支。
             return sign * int(digits, 8)
         return int(body, 10)
     if text in _SPECIAL_FLOAT:
@@ -6317,15 +6475,23 @@ def run(args: list[str], cwd: str | Path | None,
     起不来时（目录不存在、没装 git、没权限）抛 `OSError`：调用方按 Java 版的
     老路径接住它 → `error("…失败: " + 原始消息 + hint(消息))`，也就是模型能照着改的提示。
     """
-    completed = subprocess.run(
-        [executable(), *args],
-        cwd=str(cwd) if cwd else None,
-        env=env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,          # 与 Java 的 redirectErrorStream(true) 一致
-        timeout=timeout,
-        creationflags=(0x08000000 if sys.platform == "win32" else 0),
-    )
+    try:
+        completed = subprocess.run(
+            [executable(), *args],
+            cwd=str(cwd) if cwd else None,
+            env=env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,          # 与 Java 的 redirectErrorStream(true) 一致
+            timeout=timeout,
+            creationflags=(0x08000000 if sys.platform == "win32" else 0),
+        )
+    except subprocess.TimeoutExpired:
+        # 【这里必须接】subprocess.run 超时是 **kill + raise**，从不返回 None ——
+        # 不接的话文档里"超时返回 None"和 13 处 `result is None` 分支全是恒假死代码，
+        # 超时会一路冒到最外层 except，模型看到的是英文
+        # "Command '[…]' timed out after 30 seconds"，写好的中文提示永远出不来。
+        # 进程已被 subprocess.run 杀干净并回收，直接按契约返回 None 即可。
+        return None
     return completed.returncode, decode_text__tools_git__git(completed.stdout or b"")
 
 
@@ -6441,7 +6607,10 @@ class GitBranchTool(ToolPlugin):
             return False
         if result is None:
             return False                               # 超时（已强杀）：当成"没这个分支"
-        return bool(result[1].strip())
+        # 【退出码也要看】非仓库目录里这条命令 exit=128、stderr 是 "fatal: not a git
+        # repository"（stderr 已合并到 result[1]），只看"输出非空"会把 fatal 当成
+        # "分支已存在" → create 直接回"分支已存在，无需重复创建"，仓库根本没动。
+        return result[0] == 0 and bool(result[1].strip())
 
     def execute(self, args: dict[str, Any]) -> ToolResult:
         try:
@@ -6491,7 +6660,16 @@ class GitBranchTool(ToolPlugin):
             if result is None:
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
                                   "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            output = result[1]
+            # 【必须看退出码】checkout 一个不存在的分支（pathspec 'typo' did not match）、
+            # branch -d 删未合并分支（not fully merged）、非仓库目录（fatal: not a git
+            # repository）全是 exit!=0 —— 原来这里一律 self.success，模型以为已切换/已删除，
+            # 后续步骤全建立在假状态上（同文件 git_log 早就写了这条，这里补齐）。
+            exit_code, output = result
+            if exit_code != 0:
+                if "not a git repository" in output:
+                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
+                return self.error("git " + " ".join(command)
+                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
             return self.success(output if output else "操作完成")
         except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
             return self.error("Git分支操作失败: " + str(exc) + _git.hint(str(exc)))
@@ -6671,7 +6849,21 @@ class GitDiffTool(ToolPlugin):
             if result is None:
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
                                   "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            output = result[1]
+            # 【必须看退出码】rev 写错时 git diff 是 exit=128 + "fatal: ambiguous
+            # argument 'xyz'"，非仓库目录同样是 128 —— 原来把这段 fatal 文本当"差异内容"
+            # success 吐回去，模型会照着分析一段根本不是 diff 的报错文本。
+            exit_code, output = result
+            if exit_code != 0:
+                # 已知文案按**小写**比对：git 对 `diff` 在非仓库里回的是
+                # "warning: Not a git repository"（大写 N）+ 退出码 129，
+                # 只匹配小写会漏掉、退化成一句没有指向的"失败"。
+                low = output.lower()
+                if "ambiguous argument" in low:
+                    return self.error("rev 没解析出来（写错了？例如 HEAD~1 / main..dev）:\n"
+                                      + output)
+                if "not a git repository" in low:
+                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
+                return self.error("git diff 失败（退出码 " + str(exit_code) + "）:\n" + output)
             return self.success(output if output else "（无差异）")
         except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
             return self.error("Git差异获取失败: " + str(exc) + _git.hint(str(exc)))
@@ -6746,7 +6938,13 @@ class GitInitTool(ToolPlugin):
             if result is None:
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
                                   "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            return self.success("Git仓库已初始化:\n" + result[1])
+            # 【退出码不能丢】目录只读/被占用/已有损坏的 .git 时 init 会 exit!=0，
+            # 原来照样拼上 "Git仓库已初始化:\n<fatal...>" —— 明确的谎报成功。
+            exit_code, output = result
+            if exit_code != 0:
+                return self.error("Git初始化失败（退出码 " + str(exit_code) + "）:\n"
+                                  + output + _git.hint(output))
+            return self.success("Git仓库已初始化:\n" + output)
         except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
             return self.error("Git初始化失败: " + str(exc) + _git.hint(str(exc)))
 
@@ -6952,7 +7150,16 @@ class GitRemoteTool(ToolPlugin):
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
                                   "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
 
-            output = result[1].strip()
+            # 【退出码不能丢】remote add 重复加（error: remote origin already exists.）、
+            # remove 不存在的远程、非仓库目录（fatal）全是 exit!=0 而 stderr 已合并进
+            # output —— 原来"有输出就 success"，等于把 error 文本当成功结果还给模型。
+            exit_code, raw_output = result
+            output = raw_output.strip()
+            if exit_code != 0:
+                if "not a git repository" in output:
+                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
+                return self.error("git remote " + action
+                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
             if output:
                 return self.success(output)
             # 没输出 != 失败：git remote add / set-url / remove 成功时本来就不打印任何东西。
@@ -7152,7 +7359,19 @@ class GitStashTool(ToolPlugin):
             if result is None:
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
                                   "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            output = result[1]
+            # 【退出码不能丢】stash pop 撞冲突（CONFLICT / local changes would be
+            # overwritten）、空栈上 drop/apply/pop（No stash entries found）全是 exit!=0，
+            # 原来一律 self.success —— 模型以为改动已恢复/暂存已删，工作区其实没动。
+            exit_code, output = result
+            if exit_code != 0:
+                if "No stash entries found" in output or "No stash entries" in output:
+                    return self.error("没有可执行的 stash（栈是空的）:\n" + output)
+                if "CONFLICT" in output or "would be overwritten" in output:
+                    return self.error("stash " + action + " 有冲突（退出码 "
+                                      + str(exit_code) + "，改动没有完整恢复，先看下面的输出）:\n"
+                                      + output)
+                return self.error("git stash " + action
+                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
             return self.success(output if output else "操作完成")
         except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
             return self.error("Git stash操作失败: " + str(exc) + _git.hint(str(exc)))
@@ -7218,7 +7437,15 @@ class GitStatusTool(ToolPlugin):
             result = _git.run(list(command), path, _GIT_TIMEOUT__tools_git_git_status)
             if result is None:
                 return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据")
-            output = result[1]
+            # 【退出码不能丢】非仓库目录里 git status --short 是 exit=128 +
+            # "fatal: not a git repository"，原来这句 fatal 被当"状态文本" success 吐回去，
+            # 模型会把它读成"仓库没改动"（同文件 git_log 对同一文案做了分流，这里对齐）。
+            exit_code, output = result
+            if exit_code != 0:
+                if "not a git repository" in output:
+                    return self.error("这不是 git 仓库（先 git_init，path 指向工作区目录）:\n"
+                                      + output)
+                return self.error("git status 失败（退出码 " + str(exit_code) + "）:\n" + output)
             return self.success(output if output else "（无变更）")
         except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
             return self.error("Git命令执行失败: " + str(exc) + _git.hint(str(exc)))
@@ -7396,6 +7623,8 @@ class _Session:
         self._control: list[str] = []             # 哨兵行/错误行：**永远不丢**（见 _trim_locked）
         self._scan_pos = 0                        # 主线程已经扫到哪（避免重复扫描）
         self._cond = threading.Condition()
+        #: 一次 run 的执行锁（begin → send → 等哨兵 整段持有，见 PersistentShell._exec）
+        self.exec_lock = threading.Lock()
 
         self._reader = threading.Thread(target=self._read_loop, name="lionbox-shell-reader",
                                         daemon=True)
@@ -7586,9 +7815,13 @@ def shell_executable() -> str:
     probe = shutil.which("pwsh")
     if probe:
         try:
+            # 【必须带 NO_WINDOW】Lion Code 是 GUI 进程，CreateProcess 一个控制台程序会
+            # 新开控制台窗口（_start_process / run_background 都带了这个 flag，唯独这次
+            # 探测没带 → 装了 pwsh 的机器第一次用终端会闪一下黑框，用户当成 bug）。
             completed = subprocess.run(
                 [probe, "-NoLogo", "-NoProfile", "-Command", "exit 0"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                creationflags=NO_WINDOW)
             if completed.returncode == 0:
                 return probe
         except Exception:                          # noqa: BLE001 —— 没有 pwsh，继续用 powershell
@@ -7634,10 +7867,14 @@ def build_payload_sh(command: str, workdir: str | None, token: str) -> str:
         lines.append("cd " + _sh_quote(workdir) + " || true")
     lines.append(command)
     lines.append("__lc=$?")
-    token_part = _sh_quote(token) + ' " ok=" '
-    status_part = '"$([ $__lc -eq 0 ] && echo True || echo False)"'
-    tail_part = '" code=$__lc cwd=$(pwd -P)"'
-    lines.append("printf '%s\\n' " + token_part + status_part + tail_part)
+    # 【哨兵必须是 printf 的**一个**参数】POSIX printf 在参数多于格式符时会**重复使用
+    # 格式串**：`printf '%s\n' tok " ok=" True " code=0…"` 输出 4 行，协议要求的单行
+    # "<token> ok=… code=… cwd=…" 就碎了 —— 扫描侧拿到的 tail 里没有 "ok=True"，
+    # 每条命令都会被报成失败。所以把几段拼成一个词：单引号放 token（无须展开），
+    # 双引号放要展开的 `$?`/`$(pwd)`，相邻引号在 shell 里会拼成同一个参数。
+    lines.append("printf '%s\\n' " + _sh_quote(token)
+                 + '" ok=' + "$([ $__lc -eq 0 ] && echo True || echo False)"
+                 + ' code=$__lc cwd=$(pwd -P)"')
     return "\n".join(lines)
 
 
@@ -7787,6 +8024,21 @@ class PersistentShell:
     # ---- 真正执行：写命令 → 等哨兵 → 收输出 ----
     def _exec(self, session: _Session, session_key: str, command: str,
               workdir: str | None, timeout: int, max_output_bytes: int) -> RunResult:
+        """执行一条命令：**同一会话整段串行**（begin → send → 等哨兵 持锁）。
+
+        【为什么必须串行】工具执行跑在线程池里，两个调用方可能拿到同一个会话：
+        B 线程的 begin() 会清空 A 正在读的缓冲/扫描位，A、B 的输出与哨兵交错，
+        谁先到的哨兵都会被对方 scan_for 收走（控制行只认 token 前缀、不认归属）——
+        先等的一方永远等不到自己的 token，白等到 deadline 后连终端一起被杀，
+        另一方立刻看到"终端进程已退出"。_acquire 还可能把刚建、握手还没做完的会话
+        交给第二个调用者，两条命令直接交错执行。锁在这里一并解决这两件事。
+        """
+        with session.exec_lock:
+            return self._exec_locked(session, session_key, command, workdir,
+                                     timeout, max_output_bytes)
+
+    def _exec_locked(self, session: _Session, session_key: str, command: str,
+                     workdir: str | None, timeout: int, max_output_bytes: int) -> RunResult:
         token = MARK + format(int(time.time() * 1_000_000) & 0xFFFFFFFF, "x") + "__"
         if is_windows__tools_shell_persistent_shell():
             line = encode_line(session_key, build_payload(command, workdir, token))
@@ -7857,14 +8109,17 @@ class PersistentShell:
                 with self._lock:
                     self._sessions.pop(session_key, None)
                 session.destroy()
-                return RunResult(output=_strip_trailing_newlines("".join(collected)),
+                # 【必须按行 join】collected 的元素是不含换行的输出行，
+                # 这里用 "".join 会把 "line1line2line3" 黏成一行（超时/终端退出两条路径），
+                # 模型拿到的"已收到的输出"完全不可读，排障线索作废。
+                return RunResult(output=_strip_trailing_newlines("\n".join(collected)),
                                  timed_out=True, restarted=True, truncated=truncated,
                                  error_text=("命令执行超时（" + str(timeout) + "秒），已强制重启终端"
                                              "（超时通常是在等输入，例如 pause/read-host/set /p）"))
             if not session.is_alive():
                 with self._lock:
                     self._sessions.pop(session_key, None)
-                return RunResult(output=_strip_trailing_newlines("".join(collected)),
+                return RunResult(output=_strip_trailing_newlines("\n".join(collected)),
                                  restarted=True, truncated=truncated,
                                  error_text=("终端进程已退出（命令里可能有 exit）—— "
                                              "下次调用会自动重开一个终端"))
@@ -7963,12 +8218,18 @@ def tails(key: str) -> dict[str, list[str]]:
 
 
 def drain(stream: Any, tail: list[str]) -> None:
-    """把子进程的输出读掉（丢弃 + 留最后 50 行），不读的话管道满了会把子进程堵死。"""
+    """把子进程的输出读掉（丢弃 + 留最后 50 行），不读的话管道满了会把子进程堵死。
+
+    【为什么这里要自己解码】调用方按**字节**收管道（不能用 encoding="utf-8" 的 text 模式：
+    PS 5.1 写的是 GBK 字节，会被解成 U+FFFD 乱码）。解码退路与 read_text 一致：
+    UTF-8 严格 → GBK → 替换，中文机器上的中文输出才留得住。
+    """
     def reader() -> None:
         try:
             for line in stream:
+                text = decode_text(line) if isinstance(line, (bytes, bytearray)) else line
                 with _TABLES_LOCK:
-                    tail.append(line.rstrip("\n"))
+                    tail.append(text.rstrip("\r\n"))
                     if len(tail) > _TAIL_LINES:
                         del tail[0]
         except Exception:                          # noqa: BLE001 —— 进程结束了
@@ -8104,11 +8365,14 @@ class ShellBackgroundTool(ToolPlugin):
             else:
                 argv = ["sh", "-c", command]
 
+            # 【不能用 text=True + encoding="utf-8"】PS 5.1 子进程按系统 ANSI/OEM 代码页
+            # （中文机器 = CP936/GBK）往管道写字节，utf-8 + errors="replace" 会把中文输出
+            # 全解成 U+FFFD 乱码（"留最后 50 行方便排查"拿到的是废文本）。
+            # 这里按字节收，drain 里走 UTF-8 → GBK → 替换 的退路（同 read_text/git 输出）。
             process = subprocess.Popen(
                 argv,
                 cwd=directory,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
                 creationflags=NO_WINDOW,
             )
 
@@ -8302,6 +8566,11 @@ def looks_like_cmd(command: str) -> bool:
 
     判据：用了 cmd 的内置命令 + `/x` 风格开关（`rmdir /s /q`、`del /f`、`xcopy /e`…），
     或者 cmd 独占的命令名（`dir`、`type`、`findstr`、`tasklist`、`taskkill`）。
+
+    【命令名后面只能是空白或结尾】本机 execute_command 走的是 **PowerShell**，
+    用 `\b` 判词边界会把 `Set-Content`、`Where-Object`、`Set-Item` 这些 cmdlet 的前缀
+    （`set`/`where` 后面紧跟 `-`，`\b` 照样成立）当成 cmd 语法送进 `cmd /c`，
+    合法命令必然失败（exit 9009）。裸 `set x=1` / `where.exe git` 才是 cmd。
     """
     if not command or not command.strip():
         return False
@@ -8311,7 +8580,7 @@ def looks_like_cmd(command: str) -> bool:
         for name in _CMD_SWITCH_COMMANDS:
             if re.search(r"\b" + name + r"\b", c):
                 return True
-    return re.match(r"^(" + "|".join(_CMD_BUILTINS) + r")\b", c) is not None
+    return re.match(r"^(" + "|".join(_CMD_BUILTINS) + r")(?:\s|$)", c) is not None
 
 
 @tool
@@ -9398,7 +9667,6 @@ minimal_mode = False（Java 类别 WEB_SEARCH）。
 """
 
 
-import gzip
 import urllib.error
 import urllib.request
 import zlib
@@ -9475,29 +9743,58 @@ class HttpGetTool(ToolPlugin):
             return self.error("HTTP请求失败: " + str(e))
 
 
+def _inflate_partial(raw: bytes, wbits: int) -> bytes:
+    """把压缩流**分块**解出来；流被读取上限截断时，能解多少算多少。
+
+    【为什么不能 `gzip.decompress` + `except: pass`】它遇到半截流直接抛，pass 之后
+    压缩字节原样进解码器 → 返回一堆乱码还报成功。分块解压在截断时能保住已解出的前半段，
+    真正的坏流返回空串，由调用方如实报"解压失败"。
+    """
+    dec = zlib.decompressobj(wbits)
+    out = b""
+    pos = 0
+    try:
+        while pos < len(raw):
+            out += dec.decompress(raw[pos:pos + 65536])
+            pos += 65536
+        out += dec.flush()
+    except (zlib.error, ValueError, EOFError):
+        return out              # 流不完整/坏了：已解出的部分就是能给的全部
+    return out
+
+
 def read_body(response) -> str:
-    """按 Content-Encoding 解压、按 Content-Type 的 charset 解码，并限制读取上限。"""
+    """按 Content-Encoding 解压、按 Content-Type 的 charset 解码，并限制读取上限。
+
+    【顺序不能反：先解压、后截断】压缩流必须完整才解得开，原来是"读 5MB → 截断 →
+    再解压"，半截 gzip 必然解压失败并被 `except: pass` 吞掉，最后把 gzip 字节当 UTF-8
+    解码返回乱码。读取上限记的是**原始字节**（防大响应打爆内存），解压结果再按同一上限
+    截断（防压缩炸弹），解压失败则如实说明，不装作成功。
+    """
     raw = response.read(MAX_BODY_BYTES + 1)
+    read_overflow = len(raw) > MAX_BODY_BYTES
     encoding = (response.headers.get("Content-Encoding") or "").lower()
+    note = ""
     if "gzip" in encoding:
-        try:
-            raw = gzip.decompress(raw)
-        except Exception:
-            pass
+        data = _inflate_partial(raw, zlib.MAX_WBITS | 16)
+        if not data and raw:
+            note = "\n（响应体解压失败：不是合法的 gzip，或超过了读取上限）"
     elif "deflate" in encoding:
-        try:
-            raw = zlib.decompress(raw)
-        except Exception:
-            try:
-                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-            except Exception:
-                pass
-    truncated = len(raw) > MAX_BODY_BYTES
+        data = _inflate_partial(raw, zlib.MAX_WBITS)
+        if not data and raw:
+            data = _inflate_partial(raw, -zlib.MAX_WBITS)     # 少数站点发不带头的裸 deflate
+        if not data and raw:
+            note = "\n（响应体解压失败：不是合法的 deflate，或超过了读取上限）"
+    else:
+        data = raw
+    truncated = read_overflow or len(data) > MAX_BODY_BYTES
     if truncated:
-        raw = raw[:MAX_BODY_BYTES]
-    text = decode_text__tools_web_http_get(raw, response.headers.get("Content-Type"))
+        data = data[:MAX_BODY_BYTES]
+    text = decode_text__tools_web_http_get(data, response.headers.get("Content-Type"))
     if truncated:
         text += f"\n...(内容超过 {MAX_BODY_BYTES // (1024 * 1024)}MB 已截断)"
+    if note:
+        text += note
     return text
 
 
@@ -9621,17 +9918,9 @@ class UrlFetchTool(ToolPlugin):
 
 
 def _body(response) -> str:
-    raw = response.read(MAX_BODY_BYTES + 1)
-    if len(raw) > MAX_BODY_BYTES:
-        raw = raw[:MAX_BODY_BYTES]
-    encoding = (response.headers.get("Content-Encoding") or "").lower()
-    if "gzip" in encoding:
-        import gzip
-        try:
-            raw = gzip.decompress(raw)
-        except Exception:
-            pass
-    return decode_text__tools_web_http_get(raw, response.headers.get("Content-Type"))
+    # 统一走 read_body：原来这里是"先截 5MB 再解压"（半截 gzip 必失败 → 乱码），
+    # 而且只认 gzip 不认 deflate（我们声明的是 "gzip, deflate"）。见 read_body 的注释。
+    return read_body(response)
 
 
 def _cut(body: str, max_length: int) -> str:
@@ -9901,12 +10190,10 @@ class HttpPostTool(ToolPlugin):
 
 
 def _body__tools_web_http_post(response) -> str:
-    raw = response.read(MAX_BODY_BYTES + 1)
-    truncated = len(raw) > MAX_BODY_BYTES
-    if truncated:
-        raw = raw[:MAX_BODY_BYTES]
-    text = decode_text__tools_web_http_get(raw, response.headers.get("Content-Type"))
-    return text + ("\n...(响应体过大已截断)" if truncated else "")
+    # 【必须解压】请求头里主动声明了 `Accept-Encoding: gzip, deflate`，服务端照做返回
+    # 压缩体，而 urllib **不会**自动解压 —— 原来这里直接把 gzip 字节当 UTF-8 解码，
+    # 返回乱码还报成功。复用 http_get 的 read_body（解压 + charset + 上限一套全有）。
+    return read_body(response)
 
 
 # ========================================================================
@@ -10029,10 +10316,15 @@ def _translate_chunk(chunk: str, source: str, to: str) -> str | None:
 
 
 def _guess_source(text: str, to: str) -> str:
-    """目标语言不是中文、原文里又有中文 → 当成 zh；否则按英中互相猜一下。"""
+    """目标语言不是中文、原文里又有中文 → 当成 zh；否则原文按英文处理。
+
+    【原来这里是个恒等三元】`return "en" if to.startswith("zh") else "en"` 两支一样，
+    条件纯属死代码（docstring 承诺的"英中互相猜"根本没实现）。现在只留事实：
+    没有中文字符的原文一律当英文原文 —— 目标是不是中文都不影响"原文是什么语言"。
+    """
     if any(0x4E00 <= ord(ch) <= 0x9FFF or 0x3400 <= ord(ch) <= 0x4DBF for ch in text):
         return "zh-CN"
-    return "en" if to.startswith("zh") else "en"
+    return "en"
 
 
 def _split(text: str, size: int) -> list[str]:
@@ -10291,14 +10583,16 @@ def _parse_duckduckgo(html: str, max_results: int) -> list[_Hit]:
         r'(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', html)]
     links = re.findall(
         r'(?s)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html)
-    for href, inner in links:
+    # 【摘要按下标配对，不按"已接受的结果数"】snippets 与 links 是按页面顺序各自抓的
+    # 两份列表；用 len(out) 当下标，一旦某条链接被下面的条件跳过，后面每条结果都会
+    # 配上**前一条**的摘要（张冠李戴）。按链接在页面里的位置 i 取才对得上。
+    for i, (href, inner) in enumerate(links):
         if len(out) >= max_results:
             break
         url = _decode_ddg_url(href)
         title = _text(inner)
         if title.strip() != "" and url.startswith("http"):
-            index = len(out)
-            out.append(_Hit(title, url, snippets[index] if index < len(snippets) else ""))
+            out.append(_Hit(title, url, snippets[i] if i < len(snippets) else ""))
     return out
 
 
@@ -10573,6 +10867,42 @@ def _is_forbidden(cmd: str) -> str:
     return ""
 
 
+def _kill_tree_and_reap(p) -> tuple[bytes, bytes]:
+    """超时后**连子孙进程一起杀**并收掉管道，返回已经收到的那部分输出。
+
+    【两件事缺一不可】
+    1. `taskkill /F /T /PID`：kill/terminate 只作用于直接子进程，Windows 上
+       powershell 拉起来的 node/npm/服务器都是孙进程，不 /T 全部存活 —— 报"已终止"
+       却还在占端口/占 CPU；
+    2. 杀完必须**再收一次管道**（communicate）：攥着 stdout 句柄的漏网进程会让管道
+       永远等不到 EOF，表现是"超时之后这条命令还是卡着不返回"，工作线程一直泄漏。
+    类 Unix 这里只杀直接子进程（没有预先建进程组，杀不了整棵树），能收多少收多少。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15, creationflags=NO_WINDOW)
+        except Exception:                              # noqa: BLE001 —— taskkill 失败就退回普通 kill
+            try:
+                p.kill()
+            except Exception:                          # noqa: BLE001 —— 已经死了
+                pass
+    else:
+        try:
+            p.kill()
+        except Exception:                              # noqa: BLE001 —— 已经死了
+            pass
+    try:
+        return p.communicate(timeout=10)
+    except Exception:                                  # noqa: BLE001 —— 漏网进程还攥着管道，别无限等
+        try:
+            p.kill()
+        except Exception:                              # noqa: BLE001
+            pass
+        return b"", b""
+
+
 def _build_batch1(NS: dict) -> list:
     """用调用方传进来的基类造出工具类清单（避免与 main.py 循环导入）。
 
@@ -10653,18 +10983,6 @@ def _build_batch1(NS: dict) -> list:
             except Exception:                              # noqa: BLE001
                 cwd = None
             t0 = __import__("time").time()
-            try:
-                p = subprocess.run(argv, capture_output=True, cwd=cwd,
-                                   timeout=timeout, shell=False)
-            except subprocess.TimeoutExpired:
-                return ToolResult.fail(
-                    f"命令超时（{timeout:.0f}s）已被终止：{cmd}\n"
-                    "（要跑长时间任务请用 run_background）")
-            except FileNotFoundError as e:
-                return ToolResult.fail("找不到解释器: " + str(e))
-            except OSError as e:
-                return ToolResult.fail("启动失败: " + type(e).__name__ + ": " + str(e))
-            dt = __import__("time").time() - t0
 
             def dec(b):
                 for enc in ("utf-8", "gbk", "mbcs" if os.name == "nt" else "utf-8"):
@@ -10674,8 +10992,35 @@ def _build_batch1(NS: dict) -> list:
                         continue
                 return b.decode("utf-8", "replace")
 
-            stdout = dec(p.stdout or b"")
-            stderr = dec(p.stderr or b"")
+            try:
+                # 【用 Popen 而不是 subprocess.run】超时后要拿自己的 pid 去连**进程树**
+                # 一起杀：subprocess.run 只 kill 直接子进程 powershell，它拉起来的
+                # node/npm/服务器在 Windows 上全部存活，返回的"已被终止"是假话
+                # （对照本文件 HeadlessBrowser._kill_tree 的 taskkill /F /T）。
+                p = subprocess.Popen(argv, cwd=cwd, shell=False,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except FileNotFoundError as e:
+                return ToolResult.fail("找不到解释器: " + str(e))
+            except OSError as e:
+                return ToolResult.fail("启动失败: " + type(e).__name__ + ": " + str(e))
+            try:
+                out_bytes, err_bytes = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                out_bytes, err_bytes = _kill_tree_and_reap(p)
+                dt = __import__("time").time() - t0
+                partial = []
+                if (out_bytes or b"").strip():
+                    partial.append("已收到的输出:\n" + dec(out_bytes).rstrip())
+                if (err_bytes or b"").strip():
+                    partial.append("已收到的 stderr:\n" + dec(err_bytes).rstrip())
+                return ToolResult.fail(
+                    f"命令超时（{timeout:.0f}s）已被终止（含它拉起的子进程）：{cmd}\n"
+                    + ("".join(seg + "\n" for seg in partial))
+                    + f"（耗时 {dt:.1f}s；要跑长时间任务请用 run_background）")
+            dt = __import__("time").time() - t0
+
+            stdout = dec(out_bytes or b"")
+            stderr = dec(err_bytes or b"")
             parts = []
             if p.returncode != 0:
                 parts.append(f"[退出码 {p.returncode}] 命令没有成功（耗时 {dt:.1f}s）")
@@ -10954,7 +11299,10 @@ def _build_batch1(NS: dict) -> list:
         extra = ""
         if p.is_file():
             try:
-                h = hashlib.sha256(p.read_bytes()[:2_000_000]).hexdigest()[:16]
+                # 【只读需要的那 2MB】原来 `p.read_bytes()[:2_000_000]` 是把**整个文件**
+                # 读进内存再切片 —— GB 级文件为了算个"前 2MB"哈希瞬时吃掉等量内存。
+                with open(p, "rb") as fh:
+                    h = hashlib.sha256(fh.read(2_000_000)).hexdigest()[:16]
                 extra = f"\nsha256(前2MB) {h}"
             except OSError:
                 pass
@@ -11040,11 +11388,19 @@ def _build_batch1(NS: dict) -> list:
                     want = int(want)
                 except (TypeError, ValueError):
                     want = None
+            # 【count 的 0/负数不能当"全部"】CPython 实测：'aaa'.replace('a','b',0) 不替换、
+            # 'aaa'.replace('a','b',-3) 替换全部。原代码 `want if want else -1` 把 0 换成 -1
+            # → 用户要"0 处"却改了整个文件；负数还会报"替换了 -3 处"。
+            if want == 0:
+                return ToolResult.ok(f"已修改 {p}\n替换了 0 处（count=0，按你的要求没有改动文件）")
+            if want is not None and want < 0:
+                return ToolResult.fail(f"count 必须是 >= 1 的整数（你给的是 {want}）—— 没有做任何修改")
             if want is None and n > 1:
                 return ToolResult.fail(
                     f"old 在文件里出现了 {n} 处，无法确定要改哪一处 —— 没有做任何修改。\n"
                     "请把 old 给长一点（带上前后几行或独特上下文），或用 count 指定处数。")
-            replaced = text.replace(old, new, want if want else -1)
+            # want=None（没传）只可能在 n==1 时走到这里：全量替换 == 替换这 1 处
+            replaced = text.replace(old, new, -1 if want is None else want)
             try:
                 p.write_bytes(replaced.encode("utf-8"))
             except OSError as e:
@@ -11445,11 +11801,16 @@ def _build_batch1(NS: dict) -> list:
             env = os.environ.get("LION_CONTEXT_LIMIT")
             if env:
                 info.append("LION_CONTEXT_LIMIT = " + env)
-            # 用后端已有的预算设施（拿不到就如实说，别编数字）
+            # 【这里原来是一句死代码】`import 沙箱` 的结果既没接收也没用上，注释却写着
+            # "用后端已有的预算设施" —— 预算从来就没读到过。现在真的去问后端要
+            # （和 context_prune 同一个入口），拿不到就保持下面这句如实说明。
             try:
-                import 沙箱  # noqa: F401
+                backend = NS.get("api")
+                snapshot = backend.budget().snapshot("") if hasattr(backend, "budget") else None
+                if snapshot:
+                    info.append(f"预算快照: {snapshot}")
             except Exception:                              # noqa: BLE001
-                pass
+                pass                                       # 拿不到就走下面的"如实说"分支
             if not info:
                 return ToolResult.ok(
                     "本工具拿不到窗口数值（后端未把预算暴露给工具层）。"
@@ -11543,13 +11904,36 @@ def _build_batch1(NS: dict) -> list:
 
     for _c in out:
 
-        _lv = _LEVEL_OVERRIDE.get(getattr(_c, "name", None))
+        # 【类上取 name 拿到的是 property 对象】工具类把 name 定义成 @property，
+        # `getattr(类, "name")` 返回 property 本身、不是字符串 —— 拿它当 key 查
+        # _LEVEL_OVERRIDE 永远查不到，这段权限覆盖从来没生效过（现网没炸只因为
+        # main.py build_registry 又在**实例**上做了一遍；走 register_extra 这条路
+        # 就没人兜底）。按 fget 求值取出真正的名字（见 _tool_class_name）。
+        _lv = _LEVEL_OVERRIDE.get(_tool_class_name(_c))
 
         if _lv is not None:
 
             _c.permission = property(lambda self, _v=_lv: _v)
 
     return out
+
+def _tool_class_name(cls) -> str | None:
+    """取工具**类**的 name 字符串（取不到返回 None，调用方按"不认识这个工具"处理）。
+
+    `getattr(cls, "name")` 对 @property 类返回的是 property 对象本身，不能当 key 用；
+    这些 getter 都只返回常量，所以直接拿 fget 求值即可。真读 self 的 getter（不存在于
+    本文件，但保险起见）会抛异常 —— 按取不到处理，退回"不做覆盖"，不会比修复前更差。
+    """
+    prop = cls.__dict__.get("name") if isinstance(cls, type) else None
+    if prop is None:
+        prop = getattr(cls, "name", None)
+    if isinstance(prop, property) and prop.fget is not None:
+        try:
+            value = prop.fget(None)
+        except Exception:                              # noqa: BLE001
+            return None
+        return value if isinstance(value, str) else None
+    return prop if isinstance(prop, str) else None
 
 def register_extra(reg, NS: dict) -> int:
     """把本模块的工具注册进 reg（同名会覆盖桩实现）。返回注册个数。"""
@@ -11559,8 +11943,11 @@ def register_extra(reg, NS: dict) -> int:
         try:
             reg.register(cls(ws) if ws is not None else cls(Path.cwd()))
             n += 1
-        except Exception:                                  # noqa: BLE001
-            continue
+        except Exception as e:                         # noqa: BLE001
+            # 【不能静默吞】单个工具构造/注册失败原来被 continue 掉：外层只看到 n 变小，
+            # 模型侧只表现为"未找到工具"，一行日志都没有，查都没法查。
+            print(f"[工具] 注册 {getattr(cls, '__name__', cls)} 失败: "
+                  f"{type(e).__name__}: {e}")
     return n
 
 
@@ -11611,6 +11998,9 @@ import base64 as _b64
 import datetime
 import difflib
 import hashlib as _hash
+# fnmatch：search_in_files 的 glob 过滤要用（漏 import 的话只要文件树里有一个
+# 不匹配 glob 的文件，`fnmatch.fnmatch(...)` 就被求值 → NameError → 整个工具炸）
+import fnmatch
 import json
 import os
 import re
@@ -11626,11 +12016,34 @@ from pathlib import Path
 MAX_OUTPUT_B2 = 60_000
 _UA = {"User-Agent": "lion-code-tool/1.0"}
 
+#: batch2  HTTP 通道的读取上限（与 web 版 MAX_BODY_BYTES 同一档：5MB）
+_HTTP_MAX_B2 = 5 * 1024 * 1024
+
 
 def _truncate_b2(text: str, limit: int = MAX_OUTPUT_B2) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n…（共 {len(text)} 字符，已截断到前 {limit}）"
+
+
+def _int_b2(value, default: int) -> int:
+    """安全取整（拿不到就用默认值），不让乱值把整次工具调用炸成"工具执行异常"。
+
+    【为什么必须兜】schema 写的是 number，但模型经常给字符串：timeout="60s"、
+    limit="10.5"、count="3" —— 裸 `int(...)` 抛 ValueError 会一路冒出 execute，
+    模型看到的是"工具执行异常"而不是"参数不对"。bool 是 int 的子类，显式排除。
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip()))      # "10.5" 这种还能救回来
+        except (TypeError, ValueError):
+            return default
 
 
 def _run(cmd: list[str], cwd: str, timeout: int = 60) -> tuple[int, str]:
@@ -11656,10 +12069,19 @@ def _http(url: str, data: bytes | None = None, timeout: int = 30,
     req = urllib.request.Request(url, data=data, headers={**_UA, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read()
+            # 【读取必须有上限】原来 `r.read()` 是整个响应无上限进内存（同文件 web 版
+            # http_get 专门加了 5MB 的闸），给一个 GB 级地址就是内存打爆。
+            # 本通道没声明 Accept-Encoding，服务端一般回明文，按明文截断即可。
+            raw = r.read(_HTTP_MAX_B2 + 1)
+            truncated = len(raw) > _HTTP_MAX_B2
+            if truncated:
+                raw = raw[:_HTTP_MAX_B2]
             ctype = r.headers.get("Content-Type", "")
             if "text" in ctype or "json" in ctype or "xml" in ctype:
-                return True, _truncate_b2(raw.decode("utf-8", "replace"))
+                text = raw.decode("utf-8", "replace")
+                if truncated:
+                    text += f"\n…（响应体超过 {_HTTP_MAX_B2 // (1024 * 1024)}MB 已截断）"
+                return True, _truncate_b2(text)
             return True, f"[{ctype or 'binary'}] {len(raw)} 字节（非文本，未展开）"
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code} {e.reason}"
@@ -11681,10 +12103,16 @@ def _build_batch2(NS: dict) -> list:
 
     # 分类名做防御式取用：不同版本枚举取值可能不同，取不到就退回 SHELL
     CAT_SHELL = getattr(ToolCategory, "SHELL", None)
-    CAT_FILE = getattr(ToolCategory, "FILE", CAT_SHELL)
+    # ToolCategory 只有 FILE_OPERATION/FILE_MODIFY/FILE_SEARCH，**没有** "FILE" ——
+    # 拿不到就恒退回 SHELL，hash/diff_text 的类别会错标成 SHELL（/api/plugins 按类别
+    # 分组与极简模式判定都跟着错）。按真实存在的成员名取。
+    CAT_FILE = getattr(ToolCategory, "FILE_OPERATION", CAT_SHELL)
     CAT_NET = getattr(ToolCategory, "NETWORK", getattr(ToolCategory, "WEB", CAT_SHELL))
     CAT_OTHER = getattr(ToolCategory, "OTHER", CAT_SHELL)
-    LV_READ = getattr(PermissionLevel, "READ", None)
+    # PermissionLevel 只有 READ_ONLY/WRITE/WORKSPACE_WRITE/EXECUTE/DANGEROUS，**没有**
+    # "READ" —— getattr 到 None 时这 20 个纯计算工具的 permission 是 None，权限门禁
+    # 判 `required == READ_ONLY` 恒为 False，只读工作区里全被拦（取不到就该退回 READ_ONLY）。
+    LV_READ = getattr(PermissionLevel, "READ", PermissionLevel.READ_ONLY)
     LV_WRITE = getattr(PermissionLevel, "WRITE", None)
     LV_EXEC = getattr(PermissionLevel, "EXECUTE", None)
 
@@ -11730,7 +12158,7 @@ def _build_batch2(NS: dict) -> list:
                 argv = build_args(args)
                 if isinstance(argv, str):                  # 参数校验失败
                     return ToolResult.fail(argv)
-                rc, text = _run(["git"] + argv, cwd, int(args.get("timeout") or 60))
+                rc, text = _run(["git"] + argv, cwd, _int_b2(args.get("timeout"), 60))
                 body = text or "(无输出)"
                 if rc != 0:
                     return ToolResult.fail(f"git {' '.join(argv)} 退出码 {rc}：\n{body}")
@@ -11756,7 +12184,9 @@ def _build_batch2(NS: dict) -> list:
     git_tool("git_log", "tool.git.log",
              "看提交历史（默认最近 20 条，一行一条）。想看某文件的改动用 git_diff 配 file。",
              {**P_PATH, "limit": {"type": "number"}},
-             lambda a: ["log", f"-{int(a.get('limit') or 20)}", "--oneline", "--decorate"])
+             # limit 乱值/0/负数都不能让整次调用炸掉或拼出 `git log -0`：兜成 >=1
+             lambda a: ["log", "-" + str(max(1, _int_b2(a.get("limit"), 20) or 20)),
+                        "--oneline", "--decorate"])
 
     def _commit_args(a):
         msg = str(a.get("message") or "").strip()
@@ -11804,7 +12234,7 @@ def _build_batch2(NS: dict) -> list:
                     return ToolResult.fail(f"git add -A 失败（退出码 {rc}）：\n{text}")
             # 第二步：提交
             rc, text = _run(["git", "commit", "-m", msg], cwd,
-                            int(args.get("timeout") or 60))
+                            _int_b2(args.get("timeout"), 60))
             if rc != 0:
                 low = (text or "").lower()
                 if "nothing to commit" in low or "no changes added" in low:
@@ -11857,7 +12287,7 @@ def _build_batch2(NS: dict) -> list:
                     p.mkdir(parents=True, exist_ok=True)
                 except OSError as e:
                     return ToolResult.fail(f"建目录失败：{p}（{type(e).__name__}: {e}）")
-            rc, text = _run(["git", "init"], str(p), int(args.get("timeout") or 60))
+            rc, text = _run(["git", "init"], str(p), _int_b2(args.get("timeout"), 60))
             if rc != 0:
                 return ToolResult.fail(f"git init 失败（退出码 {rc}）：\n{text or '(无输出)'}")
             return ToolResult.ok(text or f"已初始化：{p}")
@@ -11912,7 +12342,7 @@ def _build_batch2(NS: dict) -> list:
             url = str(args.get("url") or "").strip()
             if not url:
                 return ToolResult.fail("缺少 url 参数")
-            ok, text = _http(url, timeout=int(args.get("timeout") or 30))
+            ok, text = _http(url, timeout=_int_b2(args.get("timeout"), 30))
             return ToolResult.ok(text) if ok else ToolResult.fail(text)
 
     @tool
@@ -11948,7 +12378,7 @@ def _build_batch2(NS: dict) -> list:
             else:
                 data, hdrs = b"", {}
             ok, text = _http(url, data=data, headers=hdrs,
-                             timeout=int(args.get("timeout") or 30))
+                             timeout=_int_b2(args.get("timeout"), 30))
             return ToolResult.ok(text) if ok else ToolResult.fail(text)
 
     @tool
@@ -11987,7 +12417,7 @@ def _build_batch2(NS: dict) -> list:
                 return ToolResult.fail("只支持 http/https")
             try:
                 req = urllib.request.Request(url, headers=_UA)
-                with urllib.request.urlopen(req, timeout=int(args.get("timeout") or 60)) as r, \
+                with urllib.request.urlopen(req, timeout=_int_b2(args.get("timeout"), 60)) as r, \
                         open(dest, "wb") as fh:
                     n = 0
                     while True:
@@ -12125,8 +12555,10 @@ def _build_batch2(NS: dict) -> list:
                                                      "version": {"type": "number"}},
                     "required": []}
         def execute(self, args):
-            n = max(1, min(100, int(args.get("count") or 1)))
-            v = int(args.get("version") or 4)
+            # count/version 乱值（"abc"）原来直接抛 ValueError → "工具执行异常"，
+            # 这里兜成默认值（uuid 一次一个、version 4）
+            n = max(1, min(100, _int_b2(args.get("count"), 1)))
+            v = _int_b2(args.get("version"), 4)
             gen = _uuid.uuid1 if v == 1 else _uuid.uuid4
             return ToolResult.ok("\n".join(str(gen()) for _ in range(n)))
 
@@ -12290,20 +12722,33 @@ def _build_batch2(NS: dict) -> list:
                     "required": ["value"]}
         def execute(self, args):
             names = {"bin": 2, "oct": 8, "dec": 10, "hex": 16}
-            fb = args.get("from_base") or 10
-            tb = args.get("to_base") or 16
-            if isinstance(fb, str): fb = names.get(fb.lower(), None) or int(fb)
-            if isinstance(tb, str): tb = names.get(tb.lower(), None) or int(tb)
+            # 【from_base/to_base 的 int() 必须在 try 里】fb="0x16" 这种 names 表之外的
+            # 字符串在**取值那一步**就抛 ValueError，原来它在 try 之外 → 整次调用变成
+            # "工具执行异常"，而本该走下面"按 N 进制解析失败"的可读报错分支。
+            try:
+                fb = args.get("from_base") or 10
+                tb = args.get("to_base") or 16
+                if isinstance(fb, str):
+                    fb = names.get(fb.lower(), None) or int(fb)
+                if isinstance(tb, str):
+                    tb = names.get(tb.lower(), None) or int(tb)
+                fb, tb = int(fb), int(tb)
+            except (TypeError, ValueError):
+                return ToolResult.fail(
+                    "from_base/to_base 必须是 2-36 的数字，或 bin/oct/dec/hex（你给的: "
+                    f"from_base={args.get('from_base')!r}, to_base={args.get('to_base')!r}）")
+            if not (2 <= fb <= 36):
+                return ToolResult.fail(f"from_base 只能是 2~36（你给的是 {fb}）")
             raw = str(args.get("value") or "").strip().replace("_", "")
             try:
-                n = int(raw, int(fb))
+                n = int(raw, fb)
             except ValueError as e:
                 return ToolResult.fail(f"按 {fb} 进制解析失败：{e}")
-            if not (2 <= int(tb) <= 36):
+            if not (2 <= tb <= 36):
                 return ToolResult.fail("to_base 只能是 2~36")
             builtin = {2: format(n, "b"), 8: format(n, "o"), 10: str(n), 16: format(n, "x")}
-            shown = builtin.get(int(tb)) or _to_base(n, int(tb))
-            return ToolResult.ok(f"{raw}(base{fb}) = {shown}（base{int(tb)}）")
+            shown = builtin.get(tb) or _to_base(n, tb)
+            return ToolResult.ok(f"{raw}(base{fb}) = {shown}（base{tb}）")
 
     def _to_base(n: int, base: int) -> str:
         digits, sign, out2 = "0123456789abcdefghijklmnopqrstuvwxyz", "", ""
@@ -12506,8 +12951,14 @@ def _build_batch2(NS: dict) -> list:
                                                      "language": {"type": "string"}},
                     "required": []}
         def execute(self, args):
-            lang = str(args.get("language") or ("json" if args.get("path", "").endswith(".json")
-                                                else "json")).lower()
+            # 【恒等三元 + None.endswith 都修掉】原来两支都是 "json"（条件纯属死代码），
+            # 而且 args.get("path", "") 在键**存在但值是 null** 时返回 None
+            # （默认值只在键缺失时生效）→ None.endswith 抛 AttributeError。
+            path = args.get("path")
+            if not args.get("language") and isinstance(path, str) and path.lower().endswith(".json"):
+                lang = "json"
+            else:
+                lang = str(args.get("language") or "json").lower()
             if lang not in ("json", "jsonc"):
                 return ToolResult.fail(
                     f"format_code 目前只支持 json（你给的是 {lang}）——\n"
@@ -12646,21 +13097,70 @@ def _build_batch2(NS: dict) -> list:
                 logdir.mkdir(parents=True, exist_ok=True)
             except OSError:
                 logdir = Path(cwd)
+            # 【工具说明承诺了日志文件，就必须真的落盘】原来 stdout/stderr 接 DEVNULL：
+            # `.lbcheck/bg-<pid>.log` 从没被创建过，模型按说明去 read_file 必然"文件不存在"，
+            # 进程起挂了也没有任何日志可查。文件名要 pid → 只能先把进程起来再开日志，
+            # stdout/stderr 合并成一条管道（stderr=STDOUT），由一个守护线程边读边写。
             try:
                 if os.name == "nt":
+                    # 【别再带 DETACHED_PROCESS(0x8)】实测：powershell 带 0x8 时
+                    # stdout 永远不往管道里写（进程活着、日志一直空），带它是因为以前
+                    # 输出接 DEVNULL 根本没人看。现在日志要落盘，只留 CREATE_NO_WINDOW
+                    # （0x08000000，GUI 不弹黑框）—— 实测这样输出立刻流进管道。
                     p = subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd],
-                                         cwd=cwd, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL,
-                                         creationflags=0x00000008 | 0x08000000)
+                                         cwd=cwd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         creationflags=0x08000000)
                 else:
                     p = subprocess.Popen(["sh", "-c", cmd], cwd=cwd,
-                                         stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             except Exception as e:                          # noqa: BLE001
                 return ToolResult.fail(f"起不来：{type(e).__name__}: {e}")
+
+            log_path = logdir / f"bg-{p.pid}.log"
+            log_note = ""
+            fh = None
+            try:
+                fh = open(log_path, "wb")
+            except OSError as e:
+                # 日志建不了也**必须照样把管道读干**：没人读的话输出一多，
+                # 子进程会卡死在 write 上（"后台任务永远不结束"那个坑）。
+                log_note = f"\n（日志文件创建失败：{type(e).__name__}: {e}，输出会被丢弃）"
+
+            def _pump() -> None:
+                try:
+                    # 必须用 read1（有就用）：BufferedReader.read(n) 会**凑满 n 字节**才返回，
+                    # 输出不满 64KB 时管道没人读 → 子进程卡在 write 上。
+                    reader = getattr(p.stdout, "read1", p.stdout.read)
+                    while True:
+                        chunk = reader(65536)
+                        if not chunk:
+                            break
+                        if fh is not None:
+                            fh.write(chunk)
+                            # 【必须立刻 flush】文件对象默认带 8KB 缓冲，不 flush 的话
+                            # "边跑边 read_file 看日志"永远读到空文件（进程还没退出，
+                            # finally 里的 close 还没发生）——工具的承诺就落空了。
+                            fh.flush()
+                except Exception:                          # noqa: BLE001
+                    pass
+                finally:
+                    try:
+                        p.stdout.close()
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except Exception:                  # noqa: BLE001
+                            pass
+
+            threading.Thread(target=_pump, name="lionbox-bg-log", daemon=True).start()
+
             _BG[p.pid] = {"cmd": cmd, "cwd": cwd, "proc": p}
             return ToolResult.ok(
                 f"已在后台启动，PID {p.pid}\n命令：{cmd}\n工作目录：{cwd}\n"
+                f"输出日志：{log_path}{log_note}\n"
                 f"（要停它用 stop_background(pid={p.pid})）")
 
     @tool
@@ -12682,7 +13182,15 @@ def _build_batch2(NS: dict) -> list:
             return {"type": "object", "properties": {"pid": {"type": "number"}}, "required": []}
         def execute(self, args):
             pid = args.get("pid")
-            targets = [int(pid)] if pid else list(_BG.keys())
+            if pid not in (None, "", False):
+                try:
+                    targets = [int(pid)]
+                except (TypeError, ValueError):
+                    # pid 乱值（"abc"）原来直接抛 ValueError → "工具执行异常"，
+                    # 这里如实说清楚：一个进程也没停
+                    return ToolResult.fail(f"pid 必须是数字（你给的是 {pid!r}）—— 没有停任何进程")
+            else:
+                targets = list(_BG.keys())
             if not targets:
                 return ToolResult.ok("没有本会话起的后台进程")
             rows = []
@@ -12691,11 +13199,7 @@ def _build_batch2(NS: dict) -> list:
                 if not rec:
                     rows.append(f"PID {tp}：不是本会话起的，**不动它**")
                     continue
-                try:
-                    rec["proc"].terminate()
-                    rows.append(f"PID {tp}：已终止（{rec['cmd'][:60]}）")
-                except Exception as e:                      # noqa: BLE001
-                    rows.append(f"PID {tp}：终止失败 {type(e).__name__}: {e}")
+                rows.append(_stop_one(tp, rec))
                 _BG.pop(tp, None)
             return ToolResult.ok("\n".join(rows))
 
@@ -12792,14 +13296,18 @@ def _build_batch2(NS: dict) -> list:
                                    "options": {"type": "array", "items": {"type": "string"}}},
                     "required": ["question"]}
         def execute(self, args):
-            q = str(args.get("question") or "").strip()
-            if not q:
-                return ToolResult.fail("缺少 question 参数")
-            opts = args.get("options") or []
-            tail = ("\n候选：" + " / ".join(str(o) for o in opts[:6])) if opts else ""
-            return ToolResult.ok(
-                f"已把问题交给用户：{q}{tail}\n"
-                "（等待用户回答；在拿到答复前**不要**对同一件事反复猜测或重复提问）")
+            # 【不许谎报"已把问题交给用户"】这个实现原来只是把问题原样回一句
+            # "已把问题交给用户：…（等待用户回答）"，却**没有任何呈现/接线调用** ——
+            # 问题根本没到用户眼前，模型却在原地等一个永远不会来的回答（对话空转）。
+            # 改成走本模块真正接线过的那个 ask_user（走 QUESTION_SERVICE，本文件
+            # `set_question_service` 挂的那个）：没接线它会如实报错，接线了就真的阻塞
+            # 等用户回答 —— 无论哪种，返回文案都是**实际发生的事**。
+            real = globals().get("AskUserTool")
+            if not isinstance(real, type):
+                return ToolResult.fail(
+                    "ask_user 没有可用的提问实现 —— 问题**没有**呈现给用户，"
+                    "不要假定用户已收到；换个方式继续或让用户手动输入。")
+            return real.execute(self, args)
 
     @tool
     class ChangePermissionsTool(ToolPlugin):
@@ -12858,7 +13366,9 @@ def _build_batch2(NS: dict) -> list:
 
     for _c in out:
 
-        _lv = _LEVEL_OVERRIDE.get(getattr(_c, "name", None))
+        # 同 _build_batch1 里那段：类上的 name 是 @property，getattr 拿到的是 property
+        # 对象，拿它查表永远不命中（死代码）。按 fget 求值取真名，见 _tool_class_name。
+        _lv = _LEVEL_OVERRIDE.get(_tool_class_name(_c))
 
         if _lv is not None:
 
@@ -12868,6 +13378,30 @@ def _build_batch2(NS: dict) -> list:
 
 #: run_background 起的进程表（进程内有效；stop 只动这里面的）
 _BG: dict = {}
+
+
+def _stop_one(tp, rec: dict) -> str:
+    """停掉一个后台进程，返回如实的一行结果。
+
+    【为什么不能只 `proc.terminate()`】run_background 起的是 powershell，命令里的
+    node/npm/服务器全是它的**孙进程**：只杀直接子进程，孙进程在 Windows 上全部存活，
+    却回报"已终止"（模型据此认为任务停了，实际还在占端口/占 CPU）。对照本文件
+    HeadlessBrowser._kill_tree 的做法：`taskkill /F /T /PID`（/T = 连进程树一起杀）。
+    """
+    proc = rec["proc"]
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(tp)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15, creationflags=NO_WINDOW)
+        else:
+            proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return f"PID {tp}：发了终止信号但 5 秒内还没退出，**可能还活着**（{rec['cmd'][:60]}）"
+    except Exception as e:                                  # noqa: BLE001
+        return f"PID {tp}：终止失败 {type(e).__name__}: {e}"
+    return f"PID {tp}：已终止（连子进程；{rec['cmd'][:60]}）"
 
 
 # ============================================================================
