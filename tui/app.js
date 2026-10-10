@@ -284,8 +284,12 @@ function App({port, workspace}) {
         [S('  输入 /help 看命令 · Esc/Ctrl+C 中断当前任务 · /exit 退出', C.gray)]);
       await refreshStats();
       const local = (await jget(port, '/api/runtime/local')).data || {};
-      const ready = local.modelInstalled && local.runtimeInstalled;
-      if (!ready) {
+      // 【云端 API 版】本地模型已停用：不再提示"把 llama.cpp 放回去"那条路 ——
+      // 留一个点了没反应的入口比没有入口更糟。只说云端怎么配。
+      if (local.disabled) {
+        pushText('· 云端 API 版：本地模型已停用（不下载权重、不拉起 llama-server）。', '  ');
+        pushText('  配云端：/key <你的APIKey>（默认走小米 MiMo），或 /endpoint <URL>', '  ');
+      } else if (!(local.modelInstalled && local.runtimeInstalled)) {
         pushText('! 本地模型还没就绪，直接提问会失败。两条路：', '  ');
         pushText('1) 把 llama.cpp 运行时放回 python/runtime-vulkan/（模型权重已在仓库里）', '  ');
         pushText('2) 用云端：/key <你的APIKey>（默认走小米 MiMo），或 /endpoint <URL>', '  ');
@@ -646,7 +650,8 @@ function App({port, workspace}) {
         for (const [k, v] of [
           ['后端', base(port)], ['会话', sessionName], ['工作区', workspace],
           ['模型', `${model} · 来源 ${provider} · 档位 ${level}`],
-          ['本地模型', String(local.phase || '未知')], ['上下文', String(stats.limit)],
+          ['本地模型', local.disabled ? '已停用（云端 API 版）' : String(local.phase || '未知')],
+          ['上下文', String(stats.limit)],
         ]) say([S(' ' + pad(k, 10), C.gray), S(String(v), C.text)]);
         return true;
       }

@@ -1188,17 +1188,31 @@ class Handler(BaseHTTPRequestHandler):
     def _model_ids(self) -> list:
         """真实可选的模型列表。
 
-        【数据源】试过 `/api/models` —— 它是空的（`data: []`）。有内容的只有
-        `/api/runtime/local/models`：三份量化，带中文标签与下载状态。
-        云端配了 key 之后，`/api/models` 才会有东西，所以两个都读、合并去重。
+        【2026-10 云端 API 版】原来第 ① 步读 `/api/runtime/local/models` ——
+        那是三份本地 GGUF 量化。本产品不再带权重、不下载、不拉起 llama-server，
+        继续把它们列出来 = 界面上三个点了没反应的选项 ✗。改成**云端口径**：
+          ① 配置里的云端模型（`/api/runtime/mode` 的 `customApi.model`，
+             也就是 `mimo-v2.6-flash`；后端 `/api/runtime/local/models`
+             现在也返回同一份云端清单，两边一致）
+          ② `/api/models`（配了 key 才有内容）
+          ③ 兜底：云端存档模型 → 最后才 MODEL_ID
         """
         ids = []
 
-        # ① 本地量化（file 是它的标识）
-        r = _req("/api/runtime/local/models") or {}
-        data = r.get("data") if isinstance(r, dict) else None
-        if isinstance(data, list):
-            for x in data:
+        # ① 云端模型（配置里的那个）
+        r = _req("/api/runtime/mode") or {}
+        d = r.get("data") if isinstance(r, dict) else {}
+        d = d if isinstance(d, dict) else {}
+        custom = d.get("customApi") if isinstance(d.get("customApi"), dict) else {}
+        for cand in (custom.get("model"), d.get("model")):
+            if cand:
+                ids.append(str(cand))
+
+        # ①' 后端的云端口径清单（与 ① 同源，多一道保险）
+        r0 = _req("/api/runtime/local/models") or {}
+        data0 = r0.get("data") if isinstance(r0, dict) else None
+        if isinstance(data0, list):
+            for x in data0:
                 if isinstance(x, dict):
                     n = x.get("file") or x.get("id") or x.get("name")
                     if n:
@@ -1227,16 +1241,13 @@ class Handler(BaseHTTPRequestHandler):
 
         # ③ 兜底：当前激活的那个
         if not ids:
-            m = _req("/api/runtime/mode") or {}
-            d = m.get("data") if isinstance(m, dict) else {}
-            ids = [str((d or {}).get("model") or MODEL_ID)]
+            ids = [str(custom.get("model") or MODEL_ID)]
 
         seen, out = set(), []
         for x in ids:
-            # 【必须只收"裸文件名"】`/api/models` 会把模型的**完整路径**也带出来
-            # （实测多出一条 `C:\Users\Leo\Desktop\lion-code\lion-merged-IQ4_XS.gguf` ✓），
-            # 混进列表后界面上就多出第 4 个选项，用户选中它必然失败 ✗ ——
-            # 用户报过这个 ✓。判据：含路径分隔符的一律跳过 ✓（后端只认文件名 ✓）。
+            # 【必须只收"裸名字"】`/api/models` 会把模型的**完整路径**也带出来
+            # （实测多出一条 C:\...\lion-merged-IQ4_XS.gguf ✓），混进列表后界面上
+            # 就多出一个选项，用户选中它必然失败 ✗。判据：含路径分隔符的一律跳过。
             if "\\" in x or "/" in x:
                 continue
             if x not in seen:
@@ -1244,25 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(x)
         return out
 
-    def _restart_runtime(self, want: str) -> None:
-        """切完模型后重启本地运行时（异步线程里跑 ✓）。
-
-        【为什么必须做】只改配置不重启，llama-server 会继续用旧权重 ✓ ——
-        用户切了 Q4_K_M，跑的还是 IQ4_XS，现象是"切了没反应" ✗。
-        【失败要如实报】不许假装成功 ✗（本会话反复吃"静默"的亏 ✓）——
-        打到自己这份日志（→ `.lbcheck/adapter.log` ✓）里，用户查得到 ✓。
-        """
-        try:
-            r = _req("/api/runtime/local/restart", {}, timeout=180.0, method="POST")
-            ok = isinstance(r, dict) and r.get("success") is not False
-            if ok:
-                print(f"[模型] 已切到 {want}，本地运行时已重启 ✓", flush=True)
-            else:
-                print(f"[模型] 已切到 {want}，但运行时重启返回异常: {str(r)[:200]}",
-                      flush=True)
-        except Exception as e:                                 # noqa: BLE001
-            print(f"[模型] 已切到 {want}，但运行时重启失败: {type(e).__name__}: {e}",
-                  flush=True)
+    # 【2026-10 云端 API 版】原来这里有个 `_restart_runtime()`：切完量化重启 llama-server。
+    # 本产品不拉起 llama-server，切模型也不再走本地口径 —— 方法连同调用点一并删掉，不留死代码。
 
     def _provider(self) -> dict:
         """/models 面板读的是 providers[].models —— 这里给真实列表，
@@ -1613,19 +1607,17 @@ class Handler(BaseHTTPRequestHandler):
             if want:
                 changed = want != MODEL_ID
                 MODEL_ID = want
-                # 本地量化用 file 名切换；认不出来就当普通模型名交给 mode 接口
-                _req("/api/runtime/local/model", {"file": want}) or _req(
-                    "/api/runtime/mode", {"mode": "local", "model": want})
-                # 【切完必须重启运行时】实测：切换只改了**配置**（`modelFile` 变成
-                # 新量化 ✓），但**正在跑的 llama-server 还是旧模型** ✗ ——
-                # 用户以为切了、实际没换 ✓（用户报过这个 ✓）。
-                # 后端有这个端点 ✓（`@router.post("/api/runtime/local/restart")` ✓
-                # —— 读出来的，不是猜的 ✗）。
-                # 【异步】重启要几十秒 ✗：卡住这个 PATCH 会让界面看起来像死了 ✓。
-                # 【只在真的变了时重启】用户重复选同一个模型不该触发重启 ✓。
+                # 【2026-10 云端 API 版】切模型只走云端口径，三条本地动作全去掉：
+                #   · 不再调 /api/runtime/local/model（本地量化切换已停用，那个接口
+                #     现在明确回"本地模式已停用（本产品为云端 API 版）"）
+                #   · 不再重启 llama-server（本产品不拉起它；原来"切了没反应"的根因
+                #     是只改配置不重启，现在没有"正在跑的本地运行时"这回事了）
+                #   · 写 providerMode=custom + model，再把新模型重指给活跃适配器
+                #     （适配器 baseUrl 是装配时固化的，光改配置不会跟着变）
+                _req("/api/runtime/mode", {"mode": "custom", "model": want})
+                _req("/api/chat/adapter/config", {"model": want})
                 if changed:
-                    threading.Thread(target=self._restart_runtime, args=(want,),
-                                     daemon=True).start()
+                    print(f"[模型] 已切到 {want}（云端 API，无需重启本地运行时）", flush=True)
             return self._json({"success": True})
 
         m = re.match(r"^/session/([^/]+)$", p)

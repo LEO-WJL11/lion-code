@@ -1110,9 +1110,17 @@ from typing import Any
 INSTALL_MODEL_MARKER = "install-model.txt"
 
 DEFAULTS: dict[str, Any] = {
-    "providerMode": "local",
-    "provider": "lionbox-local",
-    "model": "lion-models1",
+    # 【2026-10 云端 API 版】默认走云端（custom）。原来默认 local —— 那要配套
+    # llama-server + GGUF，本产品已经不带它们了，留着默认值等于开局就是坏的。
+    "providerMode": "custom",
+    "provider": "lionbox-custom",
+    "model": "mimo-v2.6-flash",
+    # 云端存档：运行模式切到 custom、或老配置的端点还指着本地运行时时，从这里取值。
+    "customApi": {
+        "baseUrl": "https://api.xiaomimimo.com/v1",
+        "apiKey": "",
+        "model": "mimo-v2.6-flash",
+    },
     "toolCallMode": "auto",
     # 【模型审查默认关（本仓库决定）】原来每次"危险工具调用"都会**再跑一次模型对话**
     # 让另一个模型判 ALLOW/DENY（见 `_approval_review`）。本地跑的是 **9B IQ4_XS 4bit**:
@@ -1374,7 +1382,9 @@ class AppConfigStore:
 
     @property
     def is_local_mode(self) -> bool:
-        return self.get("providerMode", "local") == "local"
+        # 【2026-10 云端 API 版】默认值从 local 改成 custom —— 没有 providerMode 键的
+        # 老配置不该被当成"要拉起本地运行时"（那条路已经停用）。
+        return self.get("providerMode", "custom") == "local"
 
     def install_model_marker(self) -> str:
         """安装程序写的"用户选了哪个模型"标记（没有则空串）。"""
@@ -1795,6 +1805,36 @@ from typing import Any, Callable
 RUNTIME_EXE_REL = Path("runtime-vulkan") / "llama-server.exe"
 DEFAULT_LOG = Path(os.environ.get("TEMP", "/tmp")) / "lionbox-model.log"
 
+# ======================================================================
+# 【2026-10：本产品是**云端 API 版**，本地运行时整条链路停用】
+#
+# 用户指令：不要拉起 llama-server、不要下载 GGUF、安装包不带 runtime-vulkan。
+# 做法是"**最小安全改动**"：接口一个都不删（适配层 / TUI 还在调它们 ✗ 删了会崩），
+# 改成在入口处**明确拒绝并说明原因**，绝不静默 ✗。
+#
+# 停用点（三处，缺一不可）：
+#   ① `LocalModelRuntime.start()`        —— 所有"拉起 llama-server"的路都从这里过
+#                                           （手动点启动、第一条消息惰性拉起、预热）
+#   ② `LocalModelRuntime.start_download()` —— 所有"下载权重"的路
+#   ③ `RuntimeApi.startup_prepare_model()` —— 开机自补齐那条线程
+# 再加上 providerMode 默认/迁移成 custom，聊天根本不会去问本地端点。
+# ======================================================================
+LOCAL_RUNTIME_DISABLED = True
+LOCAL_DISABLED_REASON = "本地模式已停用（本产品为云端 API 版）"
+#: 给接口/日志用的完整一句话 —— 所有停用回包都用它，文案不散落。
+LOCAL_DISABLED_MESSAGE = (
+    LOCAL_DISABLED_REASON
+    + "：不下载权重、不拉起 llama-server。请改用云端 API（设置 → 运行模式 = custom）。"
+)
+
+
+def local_disabled_status() -> dict[str, Any]:
+    """/api/runtime/local* 在停用态下的统一回包（phase 让前端也能显示对）。"""
+    return {"phase": "disabled", "running": False, "starting": False,
+            "modelInstalled": False, "modelName": "", "modelInUse": "",
+            "disabled": True, "disabledReason": LOCAL_DISABLED_REASON,
+            "lastError": LOCAL_DISABLED_MESSAGE}
+
 #: 健康探测结果缓存时长（秒）。界面轮询与预热会同时问状态，没必要每次真去探。
 HEALTH_CACHE_SECONDS = 1.5
 
@@ -1853,7 +1893,7 @@ class LocalModel:
 
 class LocalModelRuntime:
     def __init__(self, app_root: Path, cfg: AppConfigStore,
-                 start_timeout: int = 240, auto_download: bool = True) -> None:
+                 start_timeout: int = 240, auto_download: bool = False) -> None:
         self.app_root = Path(app_root)
         self.cfg = cfg
         self.start_timeout = start_timeout
@@ -2138,6 +2178,15 @@ class LocalModelRuntime:
 
     def start(self) -> dict[str, Any]:
         with self._lock:
+            # 【云端 API 版 · 总闸】所有"拉起 llama-server"的路都从这里过：
+            # 手动点启动、第一条消息的惰性拉起（`ensure_running`）、开机预热。
+            # 在这里拦一次，三处都不会再有 llama-server 进程 ✗。
+            # 不静默：状态里带 disabled/disabledReason，日志也打一句。
+            if LOCAL_RUNTIME_DISABLED:
+                self.starting = False
+                self.last_error = LOCAL_DISABLED_MESSAGE
+                print(f"[运行时] {LOCAL_DISABLED_MESSAGE}", flush=True)
+                return self.status()
             if self.healthy():
                 self.phase = "ready"
                 return self.status()
@@ -2240,6 +2289,11 @@ class LocalModelRuntime:
         静默什么都不做 —— 表现为"开机不会去下权重"。
         """
         name = str(model_file or "").strip()
+        # 【云端 API 版 · 总闸 ②】下载权重这条线也一样：接口保留、明确拒绝。
+        if LOCAL_RUNTIME_DISABLED:
+            print(f"[运行时] {LOCAL_DISABLED_MESSAGE}（拒绝下载 {name or '权重'}）", flush=True)
+            return {"started": False, "downloaded": False, "disabled": True,
+                    "error": LOCAL_DISABLED_MESSAGE}
         if not name:
             return {"started": False, "downloaded": False, "error": "模型文件名为空"}
         if self.is_model_downloaded(name):
@@ -2495,6 +2549,9 @@ class LocalModelRuntime:
             "downloadingFile": self.downloading_file,
             "modelDir": str(self.app_root),
             "nglInUse": self._started_with_ngl if self._started_with_ngl is not None else "",
+            # 【云端 API 版】界面读这两个键来显示"本地模型已停用"（tui/app.js 就是这么判的）
+            "disabled": bool(LOCAL_RUNTIME_DISABLED),
+            "disabledReason": LOCAL_DISABLED_REASON if LOCAL_RUNTIME_DISABLED else "",
         }
 
     # ------------------------------------------------------------------ 模型清单
@@ -2649,12 +2706,16 @@ class PrewarmService:
         return self._cfg_bool("warmupForce", self.force_default)
 
     def _is_builtin_endpoint(self) -> bool:
-        if str(self.cfg.get("providerMode", "local")) == "local":
+        if str(self.cfg.get("providerMode", "custom")) == "local":
             return True
         provider = str(self.cfg.get("provider", ""))
         return provider in ("lionbox-local", "lionbox-box")
 
     def why_skip(self) -> str | None:
+        # 【云端 API 版】预热的对象是"本地运行时 + 本地权重"，两者都停用了 ——
+        # 直接说明原因，不去 `ensure_running()`（那里也会拦，但没必要走一趟）。
+        if LOCAL_RUNTIME_DISABLED:
+            return LOCAL_DISABLED_MESSAGE
         if not self.enabled:
             return "预热功能已关闭"
         if self._is_builtin_endpoint() or self.force:
@@ -2755,7 +2816,9 @@ from typing import Any
 class RuntimeApi:
     def __init__(self, app_root: Path, cfg: AppConfigStore, *, prewarm_on_start: bool = False,
                  prewarm_enabled: bool = True, start_timeout: int = 240,
-                 auto_download: bool = True) -> None:
+                 # 【2026-10 云端 API 版】默认关掉自动下载：本产品不下载权重。
+                 # 套件还能用 --lionbox.runtime.auto-download=true 显式打开（见下）。
+                 auto_download: bool = False) -> None:
         self.app_root = Path(app_root)
         self.cfg = cfg
         # 【这个开关原来没人读】套件用 `--lionbox.runtime.auto-download=false/true` 切两段场景，
@@ -2782,14 +2845,16 @@ class RuntimeApi:
 
     # ------------------------------------------------------------ 开机补齐权重
     def startup_prepare_model(self) -> None:
-        """开机就把**配置的那份**权重在后台补下来 —— 不等用户发第一条消息。
+        """【2026-10 云端 API 版】开机自补齐权重这条线**整条停用**，只留一句说明。
 
-        【为什么必须在开机做】用户装的时候选了 IQ4_XS，如果实现只在"第一条消息"或
-        "点启动"时才去下，他发消息后的几分钟里模型一直在下载、界面像卡死；
-        而"开机后台悄悄下好"是 Java 的行为（`_check_model_choice.py` 第二阶段验的就是它）。
-        下载跑在守护线程里，完全不挡启动（这也是"第一次启动不能慢"的一部分：
-        我们只**发起**下载，不等它完成）。
+        【原来做什么】开机就在后台把配置那份 GGUF 下下来（Java 的行为）。
+        【为什么停】本产品现在是云端 API-only：不下载权重、不拉起 llama-server、
+        安装包也不带 runtime-vulkan。调用点（`_after_listen` 的线程）保留不动 ——
+        接口不删，但进来就明确拒绝并说明，绝不静默 ✗。
         """
+        if LOCAL_RUNTIME_DISABLED:
+            print(f"[运行时] {LOCAL_DISABLED_MESSAGE}", flush=True)
+            return
         try:
             if not self.runtime.auto_download:
                 return
@@ -2820,7 +2885,7 @@ class RuntimeApi:
         return {}
 
     def mode_payload(self) -> dict[str, Any]:
-        mode = str(self.cfg.get("providerMode", "local"))
+        mode = str(self.cfg.get("providerMode", "custom"))
         custom = self._custom_provider()
         api_key = str(custom.get("apiKey") or "")
         local = self._local_base_url()
@@ -2837,12 +2902,41 @@ class RuntimeApi:
             },
             "toolCallMode": self.cfg.tool_call_mode,
             "localBaseUrl": local,
-            "model": str(self.cfg.get("model") or "lion-models1"),
+            "model": str(self.cfg.get("model") or _DEFAULT_CLOUD_MODEL),
             "localModel": str(status["modelName"]),
             "lazyLoad": self.lazy_load,
             "localStatus": status,
             "hasApiKey": bool(api_key.strip()),
         }
+
+    def cloud_model_choices(self) -> list[dict[str, Any]]:
+        """【云端 API 版】`/api/runtime/local/models` 的云端口径清单。
+
+        原来那份 `model_choices()` 列的是三份 GGUF + 磁盘上用户自己塞的 ——
+        本产品不带权重也不下载，继续列它们就是三个点了没反应的选项 ✗。
+        字段形状照旧（file / label / current / configured / downloaded …），
+        消费方（适配层 `_model_ids`、TUI）不用改；额外带 `cloud=True` 与
+        `disabled/disabledReason`，让界面能明确写出"本地模型已停用"。
+        """
+        custom = self._custom_provider()
+        arch = dict(self.cfg.get("customApi") or {})
+        model = str(custom.get("model") or arch.get("model") or _DEFAULT_CLOUD_MODEL)
+        url = str(custom.get("baseUrl") or arch.get("baseUrl") or _DEFAULT_CLOUD_URL)
+        return [{
+            "file": model,
+            "id": model,
+            "label": f"{model}（云端 API）",
+            "note": f"云端 {url}；本产品为云端 API 版，本地模型已停用",
+            "sizeGb": 0,
+            "cloud": True,
+            "current": True,
+            "configured": True,
+            "downloaded": True,
+            "downloading": False,
+            "custom": False,
+            "disabled": True,
+            "disabledReason": LOCAL_DISABLED_REASON,
+        }]
 
     def local_config_payload(self) -> dict[str, Any]:
         llama = self.cfg.llama()
@@ -2943,21 +3037,33 @@ class RuntimeApi:
 
         @router.post("/api/runtime/local/start")
         def local_start(req: Request):
+            # 【云端 API 版】接口保留（适配层 / TUI 还在调它，删了会崩 ✗），
+            # 但**明确拒绝并说明原因**，绝不静默 ✗。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.ok(local_disabled_status(), LOCAL_DISABLED_MESSAGE)
             return ApiResponse.ok(api.runtime.start())
 
         @router.post("/api/runtime/local/stop")
         def local_stop(req: Request):
+            # stop 是幂等的"关掉"，停用态下没有进程可关 —— 如实说明即可。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.ok(local_disabled_status(), LOCAL_DISABLED_MESSAGE)
             return ApiResponse.ok(api.runtime.stop())
 
         @router.post("/api/runtime/local/restart")
         def local_restart(req: Request):
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.ok(local_disabled_status(), LOCAL_DISABLED_MESSAGE)
             return ApiResponse.ok(api.runtime.restart())
 
         @router.get("/api/runtime/local/models")
         def local_models(req: Request):
-            # 官方三份 + 用户自己塞的 GGUF，每行带 current/configured/downloaded/downloading
-            # —— 逐字段对齐 Java `RuntimeController` 的同一接口（原来只列磁盘上的文件，
-            # 于是"官方有但没下载"的那两份在界面上根本看不见，用户无处可选）。
+            # 【2026-10 云端 API 版】原来是"官方三份 GGUF + 用户自己塞的 GGUF"，
+            # 现在不带权重也不下载 —— 继续列那三份就是给用户三个点了没反应的选项 ✗。
+            # 改成**云端口径**：只列配置里的云端模型，并带 disabled/disabledReason
+            # 说明。字段形状（file/label/…）保持，消费方不用改。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.ok(api.cloud_model_choices())
             return ApiResponse.ok(api.runtime.model_choices())
 
         @router.post("/api/runtime/local/model")
@@ -2968,6 +3074,9 @@ class RuntimeApi:
             `modelFile`，套件发 `{'file': ...}` 时读出来是空串，报"没有这个模型: "——
             看着像模型清单坏了，其实是字段名没对上。
             """
+            # 【云端 API 版】本地量化切换已停用：接口保留、明确拒绝（不静默）。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.error(LOCAL_DISABLED_MESSAGE)
             body = req.json_obj()
             file = str(body.get("file") or "").strip()
             if not file:
@@ -3018,6 +3127,10 @@ class RuntimeApi:
             return ApiResponse.ok(st, f"已切换到 {file}（尚未下载：{r.get('error')}）")
         @router.post("/api/runtime/local/download")
         def download_local(req: Request):
+            # 【云端 API 版】不下载权重：原来这里回"下载源解析将在 P2 实现"，
+            # 现在直接说明产品口径（不静默、不留一个点了没反应的按钮）。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.error(LOCAL_DISABLED_MESSAGE, LOCAL_DISABLED_MESSAGE)
             # 下载源在 P2 接 ModelScope 解析；这里先明确回未实现，不假装成功
             return ApiResponse.error("下载源解析将在 P2 实现", "下载源解析将在 P2 实现")
 
@@ -18697,6 +18810,11 @@ from typing import Any
 MODE_LOCAL = "local"
 MODE_CUSTOM = "custom"
 
+#: 【2026-10 云端 API 版】出厂云端端点与模型。老配置把端点留在本地运行时
+#: （127.0.0.1:8788）上、或干脆没填端点时，用这两个值顶上 —— 绝不退回 local。
+_DEFAULT_CLOUD_URL = "https://api.xiaomimimo.com/v1"
+_DEFAULT_CLOUD_MODEL = "mimo-v2.6-flash"
+
 #: 工具调用方式：自动（推荐）/ 强制原生 function calling / 强制文本约定
 TOOLCALL_AUTO = "auto"
 TOOLCALL_NATIVE = "native"
@@ -18770,13 +18888,30 @@ class AppConfigExtras:
         changed = False
 
         # ---- 1) 确定运行模式 ----
+        # 【2026-10 云端 API 版】本产品只有 custom 一条路（不下载权重、不拉起
+        # llama-server）。老配置里写死的 `local` 要**连端点一起迁**，否则
+        # mode=custom 而 baseUrl 还是 127.0.0.1:8788，第一条消息就打到一个
+        # 永远不会启动的本地运行时上（现象是"目标计算机积极拒绝"）。
         mode = _str(self.store.get("providerMode", ""))
-        if mode not in (MODE_LOCAL, MODE_CUSTOM):
-            current = _str(self.store.get("baseUrl", ""))
-            if not current:
-                current = _str(self.get_map("openai").get("baseUrl"))
-            mode = MODE_CUSTOM if (current and not is_known_local_base_url(current)) else MODE_LOCAL
-            print(f"[配置] 未发现运行模式配置，按现有端点推断为: {mode}（端点={current}）", flush=True)
+        if mode != MODE_CUSTOM:
+            why = "本地模式已停用（本产品为云端 API 版）" if mode == MODE_LOCAL \
+                else "未发现合法的运行模式配置"
+            print(f"[配置] {why}：providerMode {mode or '(空)'} → custom", flush=True)
+            mode = MODE_CUSTOM
+            changed = True
+        # 端点还指着本地运行时（回环地址）→ 换成云端存档 customApi 里的那套
+        cur_url = _str(self.store.get("baseUrl", "")) or _str(self.get_map("openai").get("baseUrl"))
+        if not cur_url or is_known_local_base_url(cur_url):
+            arch = self.get_map("customApi")
+            archive_url = _first_non_blank(_str(arch.get("baseUrl")), _DEFAULT_CLOUD_URL)
+            archive_model = _first_non_blank(_str(arch.get("model")), _DEFAULT_CLOUD_MODEL)
+            archive_key = _str(arch.get("apiKey"))
+            print(f"[配置] 端点仍指向本地运行时（{cur_url or '空'}），改用云端存档 {archive_url}",
+                  flush=True)
+            changed = self._put_if_different("baseUrl", archive_url) or changed
+            changed = self._put_if_different("model", archive_model) or changed
+            if archive_key:
+                changed = self._put_if_different("apiKey", archive_key) or changed
             changed = True
         if mode != _str(self.store.get("providerMode", "")):
             self.store.set("providerMode", mode)
@@ -18792,10 +18927,16 @@ class AppConfigExtras:
             model = _first_non_blank(_str(self.store.get("model", "")), _str(block.get("model")))
             key = _first_non_blank(_str(self.store.get("apiKey", "")), _str(block.get("apiKey")))
             if not url:
-                print("[配置] 运行模式是自定义 API，但没有填端点，自动退回本地模型", flush=True)
-                mode = MODE_LOCAL
-                self.store.set("providerMode", MODE_LOCAL)
-            else:
+                # 【2026-10 云端 API 版】原来这里"没填端点就自动退回本地模型" ——
+                # 本地运行时已经停用，退回去等于开局就是坏的（聊天必失败）。
+                # 改成：用出厂云端端点顶上，并明确告诉用户还差 API Key ✗ 不静默。
+                arch = self.get_map("customApi")
+                url = _first_non_blank(_str(arch.get("baseUrl")), _DEFAULT_CLOUD_URL)
+                model = _first_non_blank(model, _str(arch.get("model")), _DEFAULT_CLOUD_MODEL)
+                print(f"[配置] 运行模式是自定义 API，但没有填端点 —— 改用出厂云端端点 {url}"
+                      f"（还需要在设置里填 API Key）", flush=True)
+                changed = True
+            if url:
                 changed = self._put_if_different("provider", CUSTOM_PROVIDER_ID) or changed
                 changed = self._put_if_different("baseUrl", url) or changed
                 changed = self._put_if_different("model", model) or changed
@@ -21444,6 +21585,9 @@ class RuntimeExtraApi:
                 # 空体 / 不是 JSON 对象时 Spring 在进方法体之前就回 400（默认错误体）。
                 # 这一条不在方法体里，所以只能在这里复刻（SPEC 第 2 节）。
                 return deps.spring_error(400, req.path)
+            # 【云端 API 版】不下载权重：接口保留（前端还在调 ✗），明确拒绝并说明。
+            if LOCAL_RUNTIME_DISABLED:
+                return ApiResponse.error(LOCAL_DISABLED_MESSAGE, LOCAL_DISABLED_MESSAGE)
             body = req.json_obj()
             file = java_str(body.get("file"))
             if not file or java_is_blank__api_runtime_extra(file):
@@ -23047,7 +23191,17 @@ def _hook_auto_download(ctx: Any) -> Any:
     Java 里这些下载方法本来就在 `LocalModelRuntime` 上；Python 侧它们在
     `api/runtime_extra.LocalModelsSupport` 里（同一个 runtime 实例的薄适配层），
     所以这里用接线点把它挂回去（`local/runtime.set_auto_downloader`）。
+
+    【2026-10 云端 API 版】**不再挂接**：接了也没用（`start_download` 入口已经拦住），
+    但"接线"这个动作本身意味着"开机补齐"这条路还在 —— 干脆不挂，并打一句说明。
+    装配点（`step("模型自动下载接线", ...)`）保留不动，接口不删 ✗。
     """
+    if LOCAL_RUNTIME_DISABLED:
+        from lionbox.local import runtime as local_runtime
+        local_runtime.set_auto_downloader(None)
+        print(f"[运行时] {LOCAL_DISABLED_MESSAGE}（已断开" 
+              f"自动下载接线）", flush=True)
+        return None
     from lionbox.api.runtime_extra import LocalModelsSupport
     from lionbox.local import runtime as local_runtime
     # 【与 RuntimeExtraApi.models 必须是同一份实例】下载互斥（_downloading_now/_lock）
@@ -25562,7 +25716,7 @@ class Wiring:
                 except Exception:  # noqa: BLE001
                     continue
         # 退路：直接按属性名取
-        mode = str(self.cfg.get("providerMode", "local"))
+        mode = str(self.cfg.get("providerMode", "custom"))
         for attr in (("local" if mode == "local" else "custom"), mode, "local"):
             got = getattr(self.adapters, attr, None)
             if got is not None:
