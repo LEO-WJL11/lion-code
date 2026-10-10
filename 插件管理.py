@@ -2289,8 +2289,8 @@ class PluginGateSpi(AgentSpi):
 class TerminalPlugin(Plugin):
     """终端插件：常驻终端的行为约束（超时、输出上限）。
 
-    它本身不提供工具（`execute_command` 那三个工具仍然是各自的 `ToolPlugin`），
-    它管的是**这组工具怎么跑**；关掉它会连带把这三个工具从清单里摘掉。
+    它本身不提供工具（`execute_command` 仍然是各自的 `ToolPlugin`），
+    它管的是**这个工具怎么跑**；关掉它会把这个工具从清单里摘掉。
 
     【与 tools/shell/terminal_limits.py 的关系】那边是工具层的读取实现（按 mtime 缓存
     读 `settings.json` 的 terminal 段），语义与本类完全一致；本类是插件层的真身
@@ -2300,7 +2300,8 @@ class TerminalPlugin(Plugin):
     PLUGIN_ID = "plugin.terminal"
 
     #: 这个插件"管着"的工具名：关掉插件 = 这几个工具一起从清单里消失
-    OWNED_TOOL_NAMES = frozenset({"execute_command", "run_background", "stop_background"})
+    #: 【2026-10】run_background / stop_background 已随工具削减删除，只剩 execute_command。
+    OWNED_TOOL_NAMES = frozenset({"execute_command"})
 
     def __init__(self, settings: PluginSettings | None = None) -> None:
         self.settings = settings or default_settings()
@@ -3985,14 +3986,15 @@ class ApprovalReviewPlugin(Plugin):
 
     PLUGIN_ID = "plugin.approval-review"
 
-    #: 默认要审查的工具：能改文件系统 / 能执行任意命令 / 能动远端仓库的那些。
-    #: 读文件、算 hash、格式化 JSON 这类纯计算不审 —— 全审等于每条都慢一倍，
-    #: 用户很快就会把这个插件关掉，那还不如一开始就只审危险的。
+    #: 默认要审查的工具：能改文件系统 / 能执行任意命令 / 能往外部送东西的那些。
+    #: 纯读的那 21 个里的其余工具不审 —— 全审等于每条都慢一倍，用户很快就会把这个
+    #: 插件关掉，那还不如一开始就只审危险的。
+    #: 【2026-10】指向已删工具的条目（run_background / stop_background / move_file /
+    #: change_permissions / git_reset / git_stash / git_remote / http_post）已清掉。
     DEFAULT_REVIEW_TOOLS = frozenset({
-        "execute_command", "run_background", "stop_background",
-        "delete_file", "move_file", "change_permissions",
-        "git_reset", "git_stash", "git_remote",
-        "download_file", "http_post",
+        "execute_command",
+        "delete_file",
+        "download_file",
     })
 
     def __init__(self, settings: PluginSettings | None = None) -> None:

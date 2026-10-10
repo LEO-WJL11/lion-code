@@ -11071,13 +11071,15 @@ def _alias(canonical: str, *names: str) -> None:
         ALIASES__agent_name_aliases[n] = canonical
 
 
-_alias("list_directory", "ls", "dir", "list", "listdir", "list_dir", "list_files",
-       "listfiles", "list_folder", "list_directory_contents", "show_directory",
-       # 压测里模型真的造过 ls_directory / list_dir_contents 这种"半对"的名字：
-       # 归一化表里没有就直接被判"未找到工具"，白烧一轮（本机一轮十几秒）
-       "ls_directory", "ls_dir", "lsdir", "lsdirs", "list_dir_contents", "list_dir_content",
-       "ls_l", "ls_dir_list", "list_directory_content", "dir_list", "dirlist",
-       "show_files", "list_all_files", "list_dir_files")
+# 【2026-10：只剩指向**存活工具**的别名】工具砍到 21 个之后，凡是 canonical 已经
+# 不存在的别名一律删掉 —— 留着的后果是"模型喊了别名 → 归一化到一个不存在的工具 →
+# 报未找到工具"，等于把模型往沟里带。跟着删的有：list_directory / word_count /
+# file_info / move_file / run_background / stop_background / fetch_url / http_get /
+# http_post / hash / base64 / json_format / yaml_process / generate_uuid / get_env /
+# dns_lookup / working_directory / translate / regex_test / string_utils / format_code /
+# git_* 9 个 / diff_text / markdown_render / change_permissions / escape_string /
+# number_convert / cron_parse。
+# context_window / context_prune 本来就没有别名（名字已经够直白）。
 _alias("read_file", "cat", "read", "readfile", "read_text", "readtext", "view",
        "view_file", "open_file", "get_file_content", "file_read", "show_file")
 _alias("head_tail_file", "head", "tail", "head_file", "tail_file", "read_head",
@@ -11088,7 +11090,6 @@ _alias("glob_files", "find", "glob", "ls_files", "glob_pattern", "match_files",
        "find_files", "list_files_by_pattern")
 _alias("line_count", "wc", "wc_l", "linecount", "count_lines", "lines_count",
        "file_line_count", "count_loc", "loc")
-_alias("word_count", "wc_words", "wordcount", "count_words", "file_word_count")
 _alias("write_file", "write", "writefile", "save_file", "write_text", "create_or_update_file",
        "put_file", "overwrite_file")
 _alias("create_file", "touch", "new_file", "create_empty_file", "make_file")
@@ -11097,57 +11098,17 @@ _alias("modify_file", "edit", "edit_file", "replace_in_file", "replace", "str_re
 _alias("append_file", "append", "append_to_file", "add_to_file", "append_text")
 _alias("delete_file", "rm", "del", "remove", "delete", "delete_path", "rm_file",
        "remove_file", "unlink")
-_alias("move_file", "mv", "move", "rename", "rename_file", "move_path")
 _alias("copy_file", "cp", "copy", "copy_path", "duplicate_file")
 _alias("create_directory", "mkdir", "create_dir", "new_directory", "make_directory")
-# 【别在这里加 "ls_l"】它已经在上面 list_directory 那一组里登记过了。
-# 别名表是 dict 赋值，后写的会**静默覆盖**先写的 —— Java 版这里原来也写了 "ls_l"，
-# 于是模型喊 ls_l 会被解析成 file_info（看单个文件的元信息），而不是列目录，
-# 和本文件开头"有歧义的一律不收"的约定正好相反。
-_alias("file_info", "stat", "file_stat", "fileinfo", "get_file_info")
 _alias("directory_tree", "tree", "dir_tree", "show_tree", "folder_tree")
 _alias("execute_command", "bash", "sh", "shell", "run", "exec", "cmd", "command",
        "run_command", "execute", "terminal", "shell_execute", "powershell", "run_shell",
        "execute_shell", "run_terminal", "cli")
-_alias("run_background", "bg", "background", "run_in_background", "start_background",
-       "background_run", "spawn_process")
-_alias("stop_background", "kill", "kill_process", "stop_process", "bg_stop")
-_alias("fetch_url", "curl", "wget", "fetch", "http_fetch", "get_url", "fetch_page",
-       "download_page")
-_alias("http_get", "httpget", "get_request", "http_request")
-_alias("http_post", "httppost", "post_request")
 _alias("web_search", "websearch", "search_web", "browser_search", "google", "search_internet")
 _alias("download_file", "wget_file", "download")
-_alias("hash", "sha256", "md5", "sha1", "hash_string", "hash_file", "checksum")
-_alias("base64", "b64", "base64_encode", "base64_decode", "encode_base64")
-_alias("json_format", "json", "format_json", "json_parse", "json_beautify", "pretty_json")
-_alias("yaml_process", "yaml", "format_yaml", "yaml_parse")
-_alias("generate_uuid", "uuid", "uuid_generate", "gen_uuid", "new_uuid")
-_alias("get_env", "env", "getenv", "environment", "env_var", "printenv")
-_alias("dns_lookup", "dns", "nslookup", "resolve_dns", "dns_resolve")
 _alias("timestamp", "time", "now", "current_time", "date", "get_time", "clock")
 _alias("system_info", "sysinfo", "systeminfo", "system", "sys_info", "machine_info")
-_alias("working_directory", "pwd", "cwd", "get_cwd", "get_working_directory")
-_alias("translate", "translation", "translate_text")
-_alias("regex_test", "regex", "regex_match", "test_regex")
-_alias("string_utils", "string", "strings", "string_ops")
-_alias("format_code", "format", "prettier", "formatter")
-_alias("git_status", "gitstatus", "status")
-_alias("git_log", "gitlog", "log")
-_alias("git_diff", "gitdiff", "diff_git")
-_alias("git_commit", "gitcommit", "commit")
-_alias("git_branch", "gitbranch", "branch", "checkout")
-_alias("git_init", "gitinit", "init_git")
-_alias("git_remote", "gitremote", "remote")
-_alias("git_stash", "gitstash", "stash")
-_alias("git_reset", "gitreset", "reset")
-_alias("diff_text", "diff", "compare_text", "text_diff")
-_alias("markdown_render", "markdown", "md_render", "render_markdown")
-_alias("change_permissions", "chmod", "permissions", "set_permissions")
-_alias("escape_string", "escape", "unescape", "escape_text")
-_alias("number_convert", "convert_number", "base_convert", "radix_convert")
 _alias("ask_user", "ask", "question", "ask_question", "prompt_user")
-_alias("cron_parse", "cron", "parse_cron")
 
 
 def squash__agent_name_aliases(s: str) -> str:
@@ -12782,86 +12743,53 @@ REPAIR_HINT_EMPTY = (
     "【系统提示】你上一次没有输出任何内容（正文为空，也没有工具调用）。"
     "请直接给出结论，或者调用合适的工具继续推进任务。")
 
+#: 工具清单提示（21 个，与 build_registry / 别名表三处必须**完全一致**）。
+#: 【为什么只剩 21 个】2026-10 按用户指令砍工具：57 → 21。留下的就是这张表的键；
+#: 表里多一个键 = 提示词在广告一个不存在的工具（本项目踩过 49 个坏点的根源），
+#: 所以**加/删工具时这张表、`_alias(...)` 表、build_registry 三处要一起改**。
 TOOL_PROMPT_HINTS: dict[str, str] = {
-    "read_file": "读文件内容（已知具体路径时用它）。不知道文件在哪先用 glob_files / search_in_files；只看开头结尾用 head_tail_file；列目录用 list_directory —— 本工具传目录会失败",
-    "head_tail_file": "看文件开头/结尾 N 行。用户说“前 5 行/最后几行/看下开头”就用它，**不要用 list_directory、也不要用 read_file 整读**（大日志用这个省上下文）；想看结尾加 tail=true",
+    "read_file": "读文件内容（已知具体路径时用它）。不知道文件在哪先用 glob_files / search_in_files；只看开头结尾用 head_tail_file；列目录/看结构用 directory_tree —— 本工具传目录会失败",
+    "head_tail_file": "看文件开头/结尾 N 行。用户说“前 5 行/最后几行/看下开头”就用它，**不要用 read_file 整读**（大日志用这个省上下文）；想看结尾加 tail=true",
     "line_count": "统计行数。用户问“有多少行代码/一共多少行”就用它；path 给目录会递归累计所有文件",
-    "word_count": "统计行数、字数、字节数。用户问“多少字/多大”用它",
-    "list_directory": "列目录下的文件和子目录（只一层）。用户问“有哪些文件/列一下目录”时用它；要看多层结构用 directory_tree、按后缀找用 glob_files、搜内容用 search_in_files",
-    "directory_tree": "画目录树。用户说“目录结构/画给我看/树状”用它",
+    "directory_tree": "画目录树（只看结构/有哪些文件用它，替代已停用的 list_directory）。用户说“目录结构/画给我看/树状/列一下目录”用它，path 给目录、maxDepth 控制层数",
     "glob_files": "按名字或后缀找文件。用户说“所有 .java 文件/找找 xyz 文件”用它，pattern 传 **/*.java 这种",
     "search_in_files": "在**文件内容**里搜文本或正则。用户说“哪里提到了 TODO/搜一下内容”用它",
     "create_file": "只创建**空**文件。要写内容请用 write_file",
     "write_file": "新建文件并写入内容（也用于整体覆盖）。用户说“建个文件，写上…”用它；只想建空文件用 create_file；改已有文件的一小部分用 modify_file（别整体重写）；追加用 append_file",
     "append_file": "往文件末尾追加内容。用户说“追加一行/加到末尾”用它",
     "modify_file": "改文件内容：替换/插入/删除行。用 operation 指定动作，替换给 oldText+content，按行改给 startLine/endLine+content",
-    "move_file": "移动或改名（source → target，两个都要给含文件名的完整路径）。只是复制、原文件留着用 copy_file；删除用 delete_file",
-    "copy_file": "复制文件或目录。source → target",
+    "copy_file": "复制文件或目录。source → target。要移动/改名就 copy_file + delete_file，或用 execute_command 跑 Move-Item",
     "delete_file": "删除文件或空目录。用户说“删掉/清理”用它",
     "create_directory": "创建目录（含父目录）",
-    "file_info": "看文件大小、修改时间等信息",
-    "execute_command": "在常驻终端里执行命令（git/构建/跑测试/装依赖）。用户说“跑一下/执行/编译/安装”用它；**读写改删搜文件不要用它**，用对应专用工具。环境是 Windows + PowerShell：没有 which（用 where）、没有 python3（用 python）、不要用 && / || 和 2>&1",
-    "run_background": "后台运行长时间命令（服务、监听、常驻进程）",
-    "stop_background": "停掉后台进程",
+    "download_file": "把 URL 上的文件下载到本地",
+    "execute_command": "执行命令并返回输出（跑 git、构建、测试、装依赖都用它）。环境是 Windows + PowerShell：没有 which（用 where.exe）、没有 python3（用 python）、不要用 && / || 和 2>&1。**读写改删搜文件不要用它**，用对应专用工具",
     "system_info": "系统信息（CPU、内存、操作系统）。用户问“什么配置/多少内存”用它",
     "timestamp": "当前时间。用户问“现在几点/今天几号”用它",
-    "hash": "计算哈希值（md5/sha1/sha256）",
-    "base64": "Base64 编码或解码",
-    "json_format": "JSON 格式化、校验、压缩",
-    "yaml_process": "YAML 格式化或校验",
-    "generate_uuid": "生成 UUID",
-    "get_env": "读环境变量",
-    "dns_lookup": "域名解析成 IP",
-    "fetch_url": "抓取网页正文（给定 URL 时用它）",
-    "http_get": "发 HTTP GET 请求（要接口原始响应时用它）",
-    "http_post": "发 HTTP POST 请求",
-    "web_search": "联网搜索（不知道网址、要查资料时用它）。已知 URL 取正文用 fetch_url；要接口原始响应用 http_get / http_post；下载文件用 download_file",
-    "download_file": "把 URL 上的文件下载到本地",
-    "translate": "翻译文本",
-    "working_directory": "查看或切换当前工作目录",
+    "web_search": "联网搜索（不知道网址、要查资料时用它）。已知 URL 要抓正文/原始响应就用 execute_command 跑 curl，下载文件用 download_file",
     # ---- 上下文经济：这两个工具是"省钱"用的，约束写在下面 CONTEXT_ECONOMY 那一节里 ----
     "context_window": "调整本会话的上下文窗口（默认 16K）。只有 16K 真装不下时才调大，做完立刻调回 16384",
     "context_prune": "删掉本会话前面那些已经没用的历史消息，只保留最近几条（真删）。方案定了、探查过程没用了就用它",
-    "git_status": "查看 Git 仓库状态",
-    "git_commit": "暂存并提交改动",
-    "git_log": "查看提交历史",
-    "git_diff": "查看改动差异",
-    "git_branch": "查看、创建、切换分支",
-    "git_init": "初始化 Git 仓库",
-    "git_remote": "查看或管理远程仓库",
-    "git_stash": "Git stash 保存/恢复/列出",
-    "git_reset": "撤销暂存或回退提交",
     "ask_user": "需要用户做选择或补充信息时提问",
-    "regex_test": "测试正则表达式匹配",
-    "string_utils": "字符串处理：大小写、trim、长度",
-    "escape_string": "字符串转义/反转义（html/json/java/url/regex/shell）",
-    "number_convert": "进制转换",
-    "format_code": "代码格式化（缩进、换行）",
-    "markdown_render": "Markdown 转 HTML",
-    "diff_text": "比较两段文本的差异",
-    "change_permissions": "修改文件权限（可执行/可写/可读）",
-    "cron_parse": "解析 Cron 表达式",
 }
 
 #: 从对照表的一行里认工具名（只认形如 xxx_yyy 的小写标识符）
 TOOL_TOKEN = re.compile(r"\b([a-z][a-z0-9_]{2,})\b")
 
 TOOL_CHOICE_TABLE = """## 别选错工具（下面这几组最容易混，逐条对照）
-**总原则：用户已经指明是哪个文件/目录时，直接用针对它的那个工具，不要先 list_directory 逛一圈。**
-- “文件的前 N 行 / 最后几行” → head_tail_file（不是 read_file，更不是 list_directory）
+**总原则：用户已经指明是哪个文件/目录时，直接用针对它的那个工具，不要先逛一圈。**
+- “文件的前 N 行 / 最后几行” → head_tail_file（不是 read_file）
 - “有多少行 / 统计行数 / 多少行代码”（文件或目录都算）→ line_count
-- “有哪些文件 / 列一下目录” → list_directory；“目录结构 / 画成树” → directory_tree
+- “有哪些文件 / 列一下目录 / 目录结构” → directory_tree
 - “找文件（按名字、后缀）” → glob_files；“找内容（哪里提到 X）” → search_in_files
 - “建个文件并写上内容” → write_file；“只建一个空文件” → create_file
 - “追加到末尾” → append_file；“替换/改内容/按行改” → modify_file
-- “把 A 改名成 B / 移到某处” → move_file；“复制一份” → copy_file；“删掉” → delete_file
-- “跑命令 / 编译 / 安装 / 执行一次” → execute_command
-- “要一直跑的服务 / 每 5 秒做一次 / 常驻进程” → run_background（不要写脚本再手动跑）
+- “复制一份” → copy_file；“删掉” → delete_file；“移动/改名” → copy_file + delete_file（或 execute_command 跑 Move-Item）
+- “建目录” → create_directory；“从网上下个文件” → download_file
+- “跑命令 / git / 编译 / 安装 / 执行一次” → execute_command（git 操作一律走它）
 - “现在几点 / 今天几号” → timestamp；“什么 CPU、多少内存” → system_info
-- “算哈希” → hash；“base64” → base64；“JSON 格式化” → json_format
-- “查资料 / 网上搜” → web_search；“抓某个网址” → fetch_url
-- “把某段话翻译成英文/中文” → translate（不要自己翻译，用工具）
-- “算一下/转换/解析”这类纯计算，先看有没有对应工具，有就用，别自己心算
+- “查资料 / 网上搜” → web_search
+- 需要用户拍板/补充信息 → ask_user
+- 省上下文 → context_prune（裁历史）、context_window（调窗口，用完立刻调回 16384）
 """
 
 CONTEXT_ECONOMY = """【上下文怎么用才省钱】默认窗口是 16K，这是刻意的：窗口越大，每一轮要重算的前缀越多。
@@ -12945,10 +12873,10 @@ MODE_MINIMAL = """## 当前模式：极简模式（MINIMAL）
 
 行为准则：
 1. 只使用文件工具（read_file / write_file / modify_file / create_file /
-   append_file / delete_file / move_file / copy_file / list_directory /
-   directory_tree / glob_files / search_in_files / line_count / word_count /
-   head_tail_file / file_info / change_permissions）和 Shell 工具
-   （execute_command / run_background / stop_background），不得调用其他任何工具。
+   append_file / delete_file / copy_file / create_directory /
+   directory_tree / glob_files / search_in_files / line_count /
+   head_tail_file / download_file）和 Shell 工具（execute_command），
+   不得调用其他任何工具。git 操作一律用 execute_command 跑 git 命令。
 2. 回复务必简短：不解释背景、不寒暄、不说废话，直接执行。
 3. 能用一条命令完成的事，不要拆成多条。
 4. 每轮只调用一个工具；结果返回后立即执行下一步。
@@ -13186,6 +13114,14 @@ class AgentLoop:
         p.append("## 工作区\n")
         p.append((workspace_path if workspace_path is not None else "(未设置)") + "\n")
         p.append("文件与命令都在此工作区内；path 可用相对路径（相对工作区）或绝对路径。\n")
+        # 【批注① 的落点】`working_directory` 工具已删除，改成开局就把工作区写进提示词
+        # —— 用的就是本函数本来就有的 `workspace_path` 参数（每轮都拿得到真实工作区）。
+        #
+        # 【批注② 的落点】`change_permissions` 工具也删了，改成开局就把**权限策略摘要**
+        # 写进提示词：哪些只读、哪些写操作会被拦/要确认。摘要按本轮**真实可用的工具**
+        # 从它们自己声明的 permission 动态生成（工具.py 的权限分类），不是写死的清单 ——
+        # 用户在设置里关掉插件后，摘要会跟着少一条，不会广告一个不在的工具。
+        p.append(self.permission_summary(self.filtered_tools(mode, session_id)))
         # 执行环境：实测模型爱写 Unix 命令（`which node npm python3 ollama` 这种）。
         #
         # 【这里曾经是死代码】原判断写成：
@@ -13317,6 +13253,38 @@ class AgentLoop:
         return self.build_tool_definitions(mode, session_id)
 
     # ---- 提示词辅助 ----
+    @staticmethod
+    def permission_summary(tools: Sequence[ToolPlugin]) -> str:
+        """把本轮可用工具按权限等级分组，写成一段"开局就知道"的权限策略摘要。
+
+        【为什么要有它】`change_permissions` 工具按用户指令删掉了，但"哪些操作只读、
+        哪些写操作会被拦/要确认"这件事必须让模型**开局就知道**（等被权限门禁拦下来
+        才知道，等于白烧一轮）。摘要从工具自己声明的 `permission` 动态分组，
+        不写死名字 —— 工具被关掉/新增时摘要自动跟着变，不会广告不存在的工具。
+        """
+        groups: dict[str, list[str]] = {}
+        for t in tools:
+            name = getattr(t, "name", None)
+            if not name:
+                continue
+            groups.setdefault(str(getattr(t, "permission", "READ_ONLY")), []).append(name)
+        if not groups:
+            return ""
+        order = [("READ_ONLY", "只读（随时可用，不会要你确认）"),
+                 ("WORKSPACE_WRITE", "写工作区（默认直接做；工作区被设成只读时会被拦）"),
+                 ("WRITE", "写外部/落盘（可能要求确认）"),
+                 ("EXECUTE", "执行（会要求确认）"),
+                 ("DANGEROUS", "危险（删除、覆盖类 —— 基本一定会要求确认，先看清楚再调）")]
+        lines = ["## 权限（开局先知道，别等被拦）\n"]
+        for key, label in order:
+            names = sorted(set(groups.get(key, [])))
+            if names:
+                lines.append("- " + label + "：" + "、".join(names) + "\n")
+        for key in sorted(set(groups) - {k for k, _ in order}):
+            lines.append("- " + key + "：" + "、".join(sorted(set(groups[key]))) + "\n")
+        lines.append("被拦/要确认时先想清楚能不能换一条只读的路；不要为了绕过确认换工具。\n")
+        return "".join(lines)
+
     @staticmethod
     def prompt_description(tool: ToolPlugin) -> str:
         """清单里这条工具该怎么描述。
@@ -23436,7 +23404,7 @@ class ReadFileTool(ToolPlugin):
             "- 不知道文件在哪，先用 glob_files 按名字找、或 search_in_files 按内容搜；"
             "**不要**拿本工具逐个文件试。\n"
             "- 只看开头/结尾几行用 head_tail_file，别把整个大文件读进来（会吃掉上下文）。\n"
-            "- 列目录用 list_directory；**本工具只读文件，传目录会失败**。\n"
+            "- 看目录结构用 directory_tree；**本工具只读文件，传目录会失败**。\n"
             "- path 必填；含空格或中文的路径原样传，不用自己加转义。"
         )
 
@@ -23463,7 +23431,7 @@ class ReadFileTool(ToolPlugin):
             return ToolResult.fail("文件不存在: " + str(p))
         if p.is_dir():
             # 描述里明写了"传目录会失败" —— 报错时给出**可操作的替代**，别只说不
-            return ToolResult.fail("这是目录不是文件: " + str(p) + "（列目录请用 list_directory）")
+            return ToolResult.fail("这是目录不是文件: " + str(p) + "（看目录结构请用 directory_tree）")
         try:
             data = p.read_bytes()
         except OSError as e:
@@ -23492,7 +23460,7 @@ class HeadTailTool(ToolPlugin):
             "查看文件开头/结尾的 N 行（大文件、大日志优先用它，比 read_file 省很多上下文）。\n"
             "用法：\n"
             "- 用户说“前 5 行”“最后几行”“看下开头”就用它。\n"
-            "- **不要**用 read_file 整读去看开头结尾；**也不要用 list_directory**（那个只列文件名）。\n"
+            "- **不要**用 read_file 整读去看开头结尾；也别用 directory_tree 猜（那个只有文件名）。\n"
             "- path 必填，lines 给行数（传数字，不要传字符串）；"
             "想看**结尾**就加 tail=true（默认看开头）。"
         )
@@ -23531,7 +23499,7 @@ class HeadTailTool(ToolPlugin):
         if not p.exists():
             return ToolResult.fail("文件不存在: " + str(p))
         if p.is_dir():
-            return ToolResult.fail("这是目录不是文件: " + str(p) + "（列目录请用 list_directory）")
+            return ToolResult.fail("这是目录不是文件: " + str(p) + "（看目录结构请用 directory_tree）")
         try:
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as e:
@@ -23642,41 +23610,8 @@ class ExecuteCommandTool(ToolPlugin):
         return ToolResult.ok("$ " + str(args.get("command", "")))
 
 
-class MoveFileTool(ToolPlugin):
-    minimal_mode = True
-
-    @property
-    def id(self): return "tool.file.move"
-
-    @property
-    def name(self): return "move_file"
-
-    @property
-    def description(self):
-        return (
-            "移动或重命名文件/目录：source → target（改名就是同目录换个名字）。\n"
-            "用法：\n"
-            "- 两个参数都必填，都要给**含文件名的完整路径**（不是只给目录）。\n"
-            "- 只是复制、原文件要留着，用 copy_file；删除用 delete_file。"
-        )
-
-    @property
-    def category(self): return ToolCategory.FILE_OPERATION
-
-    @property
-    def permission(self): return PermissionLevel.WRITE
-
-    def parameters_schema(self):
-        return {"type": "object",
-                "properties": {"source": {"type": "string"}, "target": {"type": "string"}},
-                "required": ["source", "target"]}
-
-    def execute(self, args):
-        if "source" not in args or "target" not in args:
-            return ToolResult.fail("缺少参数: "
-                                   + json.dumps(sorted(args.keys()), ensure_ascii=False))
-        return ToolResult.ok("已移动 " + str(args["source"]) + " → " + str(args["target"]))
-
+# 【move_file 工具已按用户指令删除（57 → 21）】移动/改名改用 copy_file + delete_file，
+# 或直接 execute_command 跑 PowerShell 的 Move-Item。类定义一并删掉，不留死代码。
 
 class ContextWindowTool(ToolPlugin):
     """真实存在（tool.context.window），用来验证提示词里的「上下文经济」那一段。
@@ -23785,8 +23720,8 @@ class WebSearchTool(ToolPlugin):
         return (
             "联网搜索（不知道具体网址、需要查资料时用它），返回搜索结果摘要。\n"
             "用法：\n"
-            "- 已知 URL 想取正文用 fetch_url；要接口原始响应用 http_get / http_post；"
-            "要下载文件用 download_file。\n"
+            "- 已知 URL 要拿内容：下载文件用 download_file；要原始 HTTP 响应就用 "
+            "execute_command 跑 curl。\n"
             "- query 必填（一个字符串，就写成你想搜的那句话）。\n"
             "- 搜到的内容可能过时或不准，关键结论要说明来源，不要当成既定事实。"
         )
@@ -23829,110 +23764,52 @@ class WebSearchTool(ToolPlugin):
                 errors.append(f"{engine}: {err}")
         return ToolResult.fail(
             "搜索失败 —— 两个源都没成：\n  " + "\n  ".join(errors) +
-            "\n（可用 fetch_url 直接抓已知网址；网络不通时请如实告知用户）")
+            "\n（已知具体网址可用 download_file 拉下来看；网络不通时请如实告知用户）")
 
 
-class ListDirectoryTool(ReadFileTool):
-    """列目录（只一层）。
-
-    【原来这里是"替身占名"】execute 只回一句 `"目录内容：" + path` ✗ —— 移植时是刻意
-    留的窄桩，但对用户就是"模型调了工具、工具什么都没做、模型只好再调一次"。
-    实测证据：拿一个非空目录调用它，输出里**没有任何文件名** ✓。
-    现在改成真列目录（只读操作，安全）。
-    """
-
-    @property
-    def id(self): return "tool.file.list"
-
-    @property
-    def name(self): return "list_directory"
-
-    @property
-    def description(self):
-        return (
-            "列出目录下的文件和子目录（**只一层**，不递归）。\n"
-            "用法：\n"
-            "- 用户问“有哪些文件”“列一下目录”用它。\n"
-            "- 想看多层结构用 directory_tree；按后缀找文件用 glob_files；"
-            "搜文件**内容**用 search_in_files；看文件内容用 read_file / head_tail_file。\n"
-            "- path 必填；含空格或中文的路径原样传（不要自己加转义）。"
-        )
-
-    def execute(self, args):
-        if "path" not in args:
-            return ToolResult.fail("缺少 path 参数")
-        try:
-            p = self.resolve_path(str(args["path"]))
-        except Exception as e:                             # noqa: BLE001
-            return ToolResult.fail("路径无法解析: " + type(e).__name__ + ": " + str(e))
-        if not p.exists():
-            return ToolResult.fail("目录不存在: " + str(p))
-        if not p.is_dir():
-            return ToolResult.fail("这是文件不是目录: " + str(p)
-                                   + "（看内容请用 read_file / head_tail_file）")
-        try:
-            entries = list(p.iterdir())
-        except OSError as e:
-            return ToolResult.fail("读不了: " + type(e).__name__ + ": " + str(e))
-        # 目录排前面，其余按名字不区分大小写排序 —— 顺手但可预期
-        entries.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
-        limit = 200
-        shown = entries[:limit]
-        body = "\n".join(("[目录] " if e.is_dir() else "       ") + e.name for e in shown)
-        head = str(p) + "（" + str(len(entries)) + " 项）:"
-        if not shown:
-            head += "\n（空目录）"
-            return ToolResult.ok(head)
-        if len(entries) > limit:
-            body += "\n…（共 " + str(len(entries)) + " 项，只列了前 " + str(limit) + " 项）"
-        return ToolResult.ok(head + "\n" + body)
+# 【list_directory 工具已按用户指令删除（57 → 21）】列目录改用 directory_tree（看结构）
+# 或 glob_files（按名字/后缀找）。类定义一并删掉，不留死代码。
 
 
 def build_registry(workspace: Path) -> PluginRegistry:
     reg = PluginRegistry()
-    for cls in (ReadFileTool, HeadTailTool, WriteFileTool, ExecuteCommandTool, MoveFileTool,
-                ContextWindowTool, WebSearchTool, ListDirectoryTool):
+    # 【21 个】与 用户指令里的清单一一对应：move_file / list_directory 的桩类已删除，
+    # 所以这里也不再注册它们（否则注册表会多出 2 个死工具）。
+    for cls in (ReadFileTool, HeadTailTool, WriteFileTool, ExecuteCommandTool,
+                ContextWindowTool, WebSearchTool):
         reg.register(cls(workspace))
-    # 【工具补全】提示词/别名表里**广告了 57 个工具名**，而这里原来只注册 8 个
-    # （其中 execute_command / move_file / context_window / web_search 还是窄桩）。
-    # 其余 49 个模型喊了只会得到"未找到工具" —— 用户反复遇到的"工具不能用"就是它。
+    # 【历史说明】这里原来"广告 57 个、只注册 8 个"，其余 49 个模型喊了只会得到
+    # "未找到工具"。**2026-10 起按用户指令把工具砍到 21 个**，提示词/别名表/注册表
+    # 三处已经同步（见 TOOL_PROMPT_HINTS 与 name_aliases 的 _alias 表），
+    # 所以现在三处都是 21，不再有"广告了但没有"的缺口。
     #
-    # 【真实现放在 工具.py 里】原来分两个独立模块（工具集.py / 工具集2.py，
-    # 每批能独立验证与回退 ✓），后来按用户要求**合并进 工具.py**（一个文件 ✓）。
-    # 基类仍然从这里传进去（`工具.build_tools(globals())` ✓）—— **不从 main 反向
-    # import** ✗ 那会循环导入。注册在原有 8 个**之后** → 同名会覆盖桩实现
-    # （引擎自己会打"插件已存在，将覆盖"日志）。
+    # 【真实现放在 工具.py 里】基类从这里传进去（`工具.build_tools(globals())` ✓）——
+    # **不从 main 反向 import** ✗ 那会循环导入。注册在基础桩**之后** → 同名会覆盖桩实现。
     #
-    # 【注意】ask_user / change_permissions / context_prune 是**循环级**的：
-    # 它们的语义要 AgentLoop/客户端配合（真正的提问 UI、权限变更入口都在上层），
-    # 所以只做**只读报告 + 如实说明**，不假装能改权限或删历史 ✓
+    # 【注意】ask_user / context_prune 是**循环级**的：它们的语义要 AgentLoop/客户端
+    # 配合（真正的提问 UI、删历史入口都在上层），所以只做**只读报告 + 如实说明**。
     try:
         for _cls in 工具.build_tools(globals()):
             reg.register(_cls(workspace))
     except Exception:                                      # noqa: BLE001
         # 工具补全失败不该让整个后端起不来 —— 但也不能静默（本项目的教训）。
         import traceback as _tb
-        print("[工具] 扩展工具注册失败，只有基础 8 个工具可用: "
+        print("[工具] 扩展工具注册失败，只有基础 6 个工具可用: "
               + _tb.format_exc()[-400:], flush=True)
 
     # ── 权限等级覆盖（一处收口，便于复查）──────────────────────────────────
-    # 【为什么需要】核查发现 20 个工具**没声明** permission（属性是 None，而不是基类
-    # 默认值 ✗），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` —— None 不
-    # 成立，于是在**只读工作区**里连 base64 / hash / json_format 这类纯计算都被拦 ✗；
-    # 另外 git_status / git_diff / git_log / git_branch 是只读命令却错标成 EXECUTE ✗；
-    # change_permissions 会改权限、必须是 DANGEROUS ✗。
-    # 这里按名字统一纠正（不改各工具类本身，避免散落二十多处、以后没法复查）。
+    # 【为什么需要】有些工具**没声明** permission（属性是 None，而不是基类默认值 ✗），
+    # 而权限门禁判的是 `required == PermissionLevel.READ_ONLY` —— None 不成立，
+    # 于是在**只读工作区**里连纯读操作都被拦 ✗。这里按名字统一纠正
+    # （不改各工具类本身，避免散落多处、以后没法复查）。
+    # 【只留存活工具的条目】2026-10 工具砍到 21 个后，指向已删工具的条目一并清掉，
+    # 否则这张表里全是查不到的名字，看表的人会以为那些工具还在。
     _LEVEL_OVERRIDE: dict[str, str] = {}
-    for _n in ("base64", "hash", "generate_uuid", "escape_string", "string_utils",
-               "regex_test", "number_convert", "diff_text", "json_format", "yaml_process",
-               "cron_parse", "format_code", "markdown_render", "translate",
-               "dns_lookup", "get_env", "http_get", "ask_user", "working_directory",
-               "context_window", "system_info", "timestamp",
-               "git_status", "git_diff", "git_log", "git_branch"):
+    for _n in ("ask_user", "context_window", "system_info", "timestamp"):
         _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
-    for _n in ("git_add", "git_commit", "git_stash", "git_init", "git_remote", "context_prune"):
+    for _n in ("context_prune",):
         _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
-    for _n in ("delete_file", "move_file", "change_permissions", "git_reset"):
+    for _n in ("delete_file",):
         _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
     for _t in reg.all():
         _lv = _LEVEL_OVERRIDE.get(getattr(_t, "name", None))
@@ -23941,25 +23818,29 @@ def build_registry(workspace: Path) -> PluginRegistry:
     return reg
 
 
-#: 工具名归一化的 known 列表。**以 Java `ToolNameAliases.main` 里那份为基础**
-#: （read_file / list_directory / execute_command / head_tail_file / line_count /
-#:  git_status / git_commit），再加上样本里出现的真实工具名。
-#: 两条负向用例必须留着，它们盯的是「别名表里有、但当前模式没开放 → 不硬转」这条分支：
-#: translate 在别名表里但不在 known 里、delete_directory_placeholder 压根不在表里。
-KNOWN_TOOLS = ["read_file", "list_directory", "execute_command", "head_tail_file",
-               "line_count", "git_status", "git_commit",
-               "write_file", "timestamp", "git_log"]
+#: 工具名归一化用的 known 列表（**测试夹具**，不是线上注册表）。
+#: 【2026-10 改写】原来这份抄的是 Java `ToolNameAliases.main` 的样例（含 list_directory /
+#: git_status / git_commit）—— 那些工具按用户指令砍掉了，样例跟着换成**存活的 21 个里的
+#: 一部分**。
+#: 【为什么故意不列全 21 个】两条负向用例必须留着，它们盯的是
+#: 「别名表里有、但当前模式没开放 → 不硬转」这条分支：
+#:   · `google` 在别名表里指向 web_search，而 web_search **刻意不在**下面这份 known 里；
+#:   · `delete_directory_placeholder` 压根不在别名表里。
+#: 所以删 web_search 之前先想想这两条用例还成不成立。
+KNOWN_TOOLS = ["read_file", "head_tail_file", "write_file", "execute_command",
+               "line_count", "glob_files", "search_in_files", "directory_tree",
+               "timestamp", "modify_file", "copy_file",
+               "create_file", "delete_file", "create_directory", "system_info"]
 
 #: 样本里出现的工具名 → 用来跑参数名归一化 / 类型转换的 schema 替身
 SCHEMA_TOOLS: dict[str, type[ToolPlugin]] = {
     "read_file": ReadFileTool,
-    "list_directory": ReadFileTool,
     "head_tail_file": HeadTailTool,
     "write_file": WriteFileTool,
     "execute_command": ExecuteCommandTool,
     "timestamp": ContextWindowTool,
-    "git_status": ExecuteCommandTool,
-    "git_log": ExecuteCommandTool,
+    "directory_tree": ReadFileTool,
+    "glob_files": ReadFileTool,
 }
 
 
@@ -24017,8 +23898,11 @@ def tool_messages(messages: list[ChatMessage__agent_loop]) -> list[ChatMessage__
 # ==========================================================================
 
 SAMPLES: list[tuple[str, str, str]] = [
-    ("1", "工具名写错（ls），参数名写错（file_path）",
-     "我看看目录里有什么。\n<tool_call>\n<function=ls>\n<parameter=file_path>src</parameter>\n"
+    # 【样本 1 换了工具名】2026-10 工具砍到 21 个，ls→list_directory 已删；
+    # **换了名字没换意图**：仍是"口语名归一到真工具"（cat 还在别名表里），
+    # 参数名 file_path 仍是错的，仍要靠参数别名修。
+    ("1", "工具名写错（cat），参数名写错（file_path）",
+     "我看看这个文件。\n<tool_call>\n<function=cat>\n<parameter=file_path>src</parameter>\n"
      "</function>\n</tool_call>"),
 
     ("2", "JSON 缺右括号 + 一次两个块（尾部被服务端截断的形状）",
@@ -24035,8 +23919,8 @@ SAMPLES: list[tuple[str, str, str]] = [
      "{\"file_path\": \"b.txt\", \"text\": \"hi\"}\n```\n</function>\n</tool_call>"),
 
     ("5", "一次多个调用（模板原生，无 tool_call 外壳讲解）",
-     "<tool_call>\n<function=git_status>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n"
-     "<tool_call>\n<function=git_log>\n<parameter=count>3</parameter>\n</function>\n</tool_call>"),
+     "<tool_call>\n<function=line_count>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n"
+     "<tool_call>\n<function=glob_files>\n<parameter=pattern>**/*.py</parameter>\n</function>\n</tool_call>"),
 
     ("6", "空转重复：同一调用连写两次（Guard 只统计不拦）",
      "<tool_call>\n<function=timestamp>\n</function>\n</tool_call>\n"
@@ -24049,12 +23933,12 @@ SAMPLES: list[tuple[str, str, str]] = [
      "<tool_call>\n<function=head_tail_file>\n{\"path\": \"x.txt\", \"lines\": \"5\"}\n"
      "</function>\n</tool_call>"),
 
-    ("9", "工具名多打一个字母（git_statuss）+ 值里带换行的多行命令",
-     "<tool_call>\n<function=git_statuss>\n<parameter=path>\nrepo\n</parameter>\n"
+    ("9", "工具名多打一个字母（read_fils）+ 值里带换行的多行命令",
+     "<tool_call>\n<function=read_fils>\n<parameter=path>\nrepo\n</parameter>\n"
      "</function>\n</tool_call>"),
 
-    ("10", "半对的名字（list_dir_contents）+ 递归参数",
-     "<tool_call>\n<function=list_dir_contents>\n<parameter=path>.</parameter>\n"
+    ("10", "半对的名字（count_lines）+ 递归参数",
+     "<tool_call>\n<function=count_lines>\n<parameter=path>.</parameter>\n"
      "<parameter=recursive>true</parameter>\n</function>\n</tool_call>"),
 
     ("11", "普通正文，不该被误判成工具调用",
@@ -24123,8 +24007,8 @@ def run_parser_samples() -> None:
                 json.dumps(fixed, ensure_ascii=False, default=str)))
 
         if num == "1":
-            check("样本 1 ls → list_directory",
-                  name_aliases.resolve("ls", KNOWN_TOOLS) == "list_directory")
+            check("样本 1 cat → read_file（口语名归一到存活工具）",
+                  name_aliases.resolve("cat", KNOWN_TOOLS) == "read_file")
         if num == "3":
             check("样本 3 JSON 对象被读成参数",
                   calls[0].arguments == {"path": "out/a.txt", "content": "hello"})
@@ -24140,11 +24024,11 @@ def run_parser_samples() -> None:
             check("样本 8 参数先当字符串读出来（类型转换交给 coerce_arguments）",
                   isinstance(calls[0].arguments.get("lines"), str))
         if num == "9":
-            check("样本 9 git_statuss → git_status（编辑距离 1）",
-                  name_aliases.resolve("git_statuss", KNOWN_TOOLS) == "git_status")
+            check("样本 9 read_fils → read_file（编辑距离 1）",
+                  name_aliases.resolve("read_fils", KNOWN_TOOLS) == "read_file")
         if num == "10":
-            check("样本 10 list_dir_contents → list_directory",
-                  name_aliases.resolve("list_dir_contents", KNOWN_TOOLS) == "list_directory")
+            check("样本 10 count_lines → line_count（半对自造名在别名表里）",
+                  name_aliases.resolve("count_lines", KNOWN_TOOLS) == "line_count")
         if num == "12":
             check("样本 12 自造工具名解析不出候选（上层会报未找到 + 建议）",
                   name_aliases.resolve("delete_directory_placeholder", KNOWN_TOOLS) is None)
@@ -24152,7 +24036,7 @@ def run_parser_samples() -> None:
     loop = AgentLoop(client=FakeChatClient([]), registry=build_registry(Path(".")))
     tcs = loop.parse_tool_calls_from_text(SAMPLES[0][2])
     check("AgentLoop.parse_tool_calls_from_text 走模板原生通道",
-          len(tcs) == 1 and tcs[0].name == "ls" and tcs[0].arguments == {"file_path": "src"})
+          len(tcs) == 1 and tcs[0].name == "cat" and tcs[0].arguments == {"file_path": "src"})
 
     xml = ("<tool_call><name>read_file</name><arguments>{\"path\": \"a.txt\"}</arguments>"
            "</tool_call>")
@@ -24167,8 +24051,8 @@ def run_parser_samples() -> None:
          '<tool_call><function=directory_tree>{"path": "src", "maxDepth": 2}</tool_call>',
          "directory_tree"),
         ("被 </tool_call> 截断（parameter 形式）",
-         "<tool_call><function=list_directory><parameter=path>src</parameter></tool_call>",
-         "list_directory"),
+         "<tool_call><function=directory_tree><parameter=path>src</parameter></tool_call>",
+         "directory_tree"),
         ("输出到这就断了（完全没闭合）",
          '<tool_call><function=directory_tree>{"path": "."}',
          "directory_tree"),
@@ -24250,7 +24134,7 @@ def run_parser_samples() -> None:
           len(tcs) == 1 and tcs[0].arguments.get("path") == "d.txt")
 
     check("remove_tool_call_blocks 剥离后只剩正文",
-          loop.remove_tool_call_blocks(SAMPLES[0][2]).strip() == "我看看目录里有什么。")
+          loop.remove_tool_call_blocks(SAMPLES[0][2]).strip() == "我看看这个文件。")
 
     # 【流式可见性过滤】真模型实测泄漏过**完整块**：
     #   <tool_call><function=write_file><parameter=path>…</parameter></function></tool_call>文件已创建…
@@ -24289,33 +24173,52 @@ def run_alias_tables() -> None:
     section("B. 工具名 / 参数名归一化判定表")
 
     cases: list[tuple[str, str | None]] = [
-        # 前 19 条照抄 Java ToolNameAliases.main 的自检用例
-        ("ls", "list_directory"), ("list_files", "list_directory"),
-        ("List_Directory", "list_directory"), ("ls_directory", "list_directory"),
-        ("read_file_content", "read_file"), ("do_list_directory", "list_directory"),
-        ("Status", "git_status"), ("cat", "read_file"), ("read", "read_file"),
-        ("head", "head_tail_file"), ("bash", "execute_command"),
-        ("run_command", "execute_command"), ("wc", "line_count"),
-        ("git_statuss", "git_status"), ("git-commit", "git_commit"),
-        ("readfile", "read_file"), ("delete_directory_placeholder", None),
-        ("translate", None), ("", None),
-        # 别名表里有、但当前模式没开放这个工具 → 不硬转
-        ("web_search", None),
+        # 【2026-10】原来这批照抄 Java ToolNameAliases.main，里面一半指向**已删工具**
+        # （list_directory / git_status / git_commit / translate）。按用户指令换成
+        # 指向**存活工具**的别名对；三条负向用例的意图一条没丢：
+        #   别名表里有但 known 不含（web_search 不在 KNOWN_TOOLS）→ 不硬转
+        #   压根不在别名表里（delete_directory_placeholder）→ 不猜
+        #   空串 → 不猜
+        ("cat", "read_file"), ("read", "read_file"), ("readfile", "read_file"),
+        ("read_file_content", "read_file"), ("view", "read_file"),
+        ("head", "head_tail_file"), ("tail", "head_tail_file"),
+        ("bash", "execute_command"), ("run_command", "execute_command"),
+        ("powershell", "execute_command"),
+        ("wc", "line_count"), ("count_lines", "line_count"),
+        ("tree", "directory_tree"), ("glob", "glob_files"),
+        ("grep", "search_in_files"), ("touch", "create_file"),
+        ("rm", "delete_file"), ("cp", "copy_file"), ("mkdir", "create_directory"),
+        ("NOW", "timestamp"), ("sysinfo", "system_info"),
+        ("delete_directory_placeholder", None),
+        ("", None),
+        # 别名表里有、但当前模式没开放这个工具 → 不硬转（web_search 不在 KNOWN_TOOLS）
+        ("google", None), ("web_search", None),
     ]
     for raw, expect in cases:
         got = name_aliases.resolve(raw, KNOWN_TOOLS)
         check("工具名 {!r} -> {!r}".format(raw, expect), got == expect, "实际 " + repr(got))
 
-    check("ls_l 仍然是 list_directory（别名表不许再被 file_info 覆盖）",
-          name_aliases.resolve("ls_l", KNOWN_TOOLS + ["file_info"]) == "list_directory")
+    # 【原来这里是 ls_l → list_directory】那条盯的是"别名表后写不得静默覆盖先写"。
+    # list_directory/file_info 都删了，改成**同一个意图的两种验法**：
+    #   ① 存活别名仍指向它该指的那个工具（没被别组抢走）；
+    #   ② 阶段1 的硬验收：别名表里不许有任何指向已删工具的项。
+    check("head 仍然指到 head_tail_file（别名表不许被别组覆盖）",
+          name_aliases.resolve("head", KNOWN_TOOLS) == "head_tail_file")
+    _alive = {t.name for t in build_registry(Path(".")).all()}
+    _bad = sorted({v for v in ALIASES__agent_name_aliases.values() if v not in _alive})
+    check("别名表里没有任何指向已删工具的项", not _bad, "坏项 " + str(_bad))
     check("包含多个真实工具名 -> 不猜",
-          name_aliases.resolve("read_file_and_git_commit", ["read_file", "git_commit"]) is None)
+          name_aliases.resolve("read_file_and_head_tail_file",
+                               ["read_file", "head_tail_file"]) is None)
     # 【为什么不能写 name_aliases.size()】内联后各模块同名符号会被改名以避免冲突
     # （`size` → `size__agent_name_aliases`）。而 `name_aliases` / `arg_aliases` /
     # `parsing` 这些名字在本文件里都指向**本模块自己**（sys.modules 自引用），
     # 于是 `name_aliases.size()` 实际调到的是**参数别名表**的 `size`，返回 36，
-    # 断言 267 必然失败（实测）。表本身是齐的：len(ALIASES__agent_name_aliases)=267。
-    check("别名表大小 = 267（逐条搬全）", size__agent_name_aliases() == 267)
+    # 断言 267 必然失败（实测）。表本身是齐的：len(ALIASES__agent_name_aliases)=126。
+    # 267 是"砍工具前"的条数；砍掉 36 个工具后，指向它们的别名一并删掉 → 126。
+    # 这条断言的**意图**是"表没有漏搬"，所以值跟着表走，另加上面那条硬校验。
+    check("别名表大小 = 126（指向存活工具的别名，逐条搬全）",
+          size__agent_name_aliases() == 126)
     check("参数别名表 = 36 组 / 188 个别名",
           arg_aliases.size() == 36 and sum(len(v) for v in arg_aliases.ALIASES.values()) == 188)
 
@@ -24416,7 +24319,7 @@ def run_main_loop(work: Path) -> None:
     print("\n  --- 文本通道（模型把 <tool_call><function=...> 写在正文里）---")
     history2 = LocalConversationHistory()
     client2 = FakeChatClient([
-        {"content": "<tool_call>\n<function=list_dir>\n<parameter=file_path>.</parameter>\n"
+        {"content": "<tool_call>\n<function=tree>\n<parameter=path>.</parameter>\n"
                     "</function>\n</tool_call>",
          "tool_calls": [], "finish_reason": "stop"},
         {"content": "目录里有一个文件。", "tool_calls": [], "finish_reason": "stop"},
@@ -24430,8 +24333,12 @@ def run_main_loop(work: Path) -> None:
     # 【原来断言的是窄桩的固定串 "目录内容：."】工具改成真列目录后，输出是真实清单 ✓。
     # 这条用例的**意图**是"它真的执行了"，那就检查真实清单的特征（有项数、且不再是
     # 那句占位），而不是把桩的输出钉死 ✗。
-    check("文本通道：list_dir 被归一化成 list_directory 并真的执行了",
-          len(tm2) == 1 and "项）" in tm2[0].content and "目录内容：" not in tm2[0].content,
+    # 【原来是 list_directory 的"（N 项）"特征】那个工具删了，换成 directory_tree 的
+    # 真实清单特征：它逐行列出工作区里的条目，notes.txt 就在里面。
+    # 意图没变：**不是占位串、而是真的读到了目录**。
+    check("文本通道：tree 被归一化成 directory_tree 并真的执行了",
+          len(tm2) == 1 and "notes.txt" in tm2[0].content
+          and "目录内容：" not in tm2[0].content,
           "实际 " + str([m.content for m in tm2]))
     check("文本通道：正文里的 tool_call 被剥掉，不当成回答",
           ans2 == "目录里有一个文件。")
@@ -24498,11 +24405,14 @@ def run_main_loop(work: Path) -> None:
     coerced = _SCHEMA_LOOP.coerce_arguments(HeadTailTool(work), {"path": "x.txt", "lines": "5"})
     print("  " + json.dumps(coerced, ensure_ascii=False))
     check("lines '5' -> 5（int）", coerced["lines"] == 5 and isinstance(coerced["lines"], int))
-    coerced2 = _SCHEMA_LOOP.coerce_arguments(MoveFileTool(work),
-                                             {"src": "a.txt", "dest_path": "b.txt"})
+    # 【原来这里用的是 MoveFileTool(src/dest_path → source/target)】move_file 按用户
+    # 指令删了，换成**同一条代码路径**（arg_aliases.match_key + coerce）的存活工具：
+    # write_file 的声明键是 path/content，模型爱写 file_path/text —— 归一化意图一样。
+    coerced2 = _SCHEMA_LOOP.coerce_arguments(WriteFileTool(work),
+                                             {"file_path": "a.txt", "text": "hi"})
     print("  " + json.dumps(coerced2, ensure_ascii=False))
-    check("参数名归一化 src→source、dest_path→target",
-          coerced2.get("source") == "a.txt" and coerced2.get("target") == "b.txt")
+    check("参数名归一化 file_path→path、text→content",
+          coerced2.get("path") == "a.txt" and coerced2.get("content") == "hi")
 
     # ---- 流式链路 ----
     print("\n  --- 流式链路（chat_stream 分片）---")
@@ -24567,24 +24477,24 @@ def run_guard() -> None:
     g = ToolCallGuard()
     all_ok = True
     for i in range(1, 11):
-        d = g.before_call("s1", "git_status", '{"path":"repo"}')
+        d = g.before_call("s1", "execute_command", '{"path":"repo"}')
         if d.verdict != Verdict.OK or d.hint is not None:
             all_ok = False
             print("  第 {} 次被拦了: {} / {}".format(i, d.verdict, d.hint))
     check("同一调用连问 10 次都放行（不再跳过、不再终止任务）", all_ok)
     check("重复次数照常统计（第 10 次 = 10）",
-          g.repeat_count("s1", "git_status", '{"path":"repo"}') == 10)
+          g.repeat_count("s1", "execute_command", '{"path":"repo"}') == 10)
 
     for _ in range(10):
-        g.after_call("s1", "number_convert", False)
-    dec = g.before_call("s1", "number_convert", '{"v":7}')
+        g.after_call("s1", "modify_file", False)
+    dec = g.before_call("s1", "modify_file", '{"v":7}')
     check("连续失败 10 次后仍然放行",
           dec.verdict == Verdict.OK and dec.hint is None)
-    check("连续失败次数照常统计（10）", g.failure_count("s1", "number_convert") == 10)
-    g.after_call("s1", "number_convert", True)
-    check("成功一次就把连续失败清零", g.failure_count("s1", "number_convert") == 0)
+    check("连续失败次数照常统计（10）", g.failure_count("s1", "modify_file") == 10)
+    g.after_call("s1", "modify_file", True)
+    check("成功一次就把连续失败清零", g.failure_count("s1", "modify_file") == 0)
     g.reset("s1")
-    check("reset 清掉本会话计数", g.failure_count("s1", "number_convert") == 0)
+    check("reset 清掉本会话计数", g.failure_count("s1", "modify_file") == 0)
     check("历史常量保留（3 / 5 / 6 / 3）",
           (ToolCallGuard.REPEAT_SKIP_AT, ToolCallGuard.REPEAT_ABORT_AT,
            ToolCallGuard.FAIL_SKIP_AT, ToolCallGuard.FAIL_WARN_AT) == (3, 5, 6, 3))

@@ -20,11 +20,13 @@ r"""Lion Code 系统提示词（中文）—— 译自 Claude Code 的真实系�
     system-prompt-exploratory-questions-analyze-before-…md     → 开放问题先给建议与取舍，别直接开工
 
 【改造（这是重点，不是直译）】
-  1. 工具名全部换成我们自己的（正名见 main.py 的 `_alias(...)` 表，55 个）：
+  1. 工具名全部换成我们自己的（正名见 main.py 的 `_alias(...)` 表；**2026-10 起只剩
+     21 个工具**，指向已删工具的别名已一并删掉）：
        Bash→execute_command   Read→read_file(+head_tail_file)   Write→write_file/create_file
        Edit→modify_file       Glob→glob_files                   Grep→search_in_files
-       LS→list_directory      WebFetch→fetch_url                WebSearch→web_search
-       KillShell→stop_background                                Task/Agent→agent_spawn
+       LS→directory_tree      WebFetch→download_file            WebSearch→web_search
+       KillShell→**删掉**（run_background / stop_background 已停用）
+       Task/Agent→agent_spawn
        TodoWrite→**删掉**（我们没有 todo 工具，改成"把活拆成小步"的行为要求）
   2. 调用语法换成我们的文本通道：
        <tool_call><function=工具名><parameter=参数名>值</parameter></function></tool_call>
@@ -144,9 +146,10 @@ SYSTEM_PROMPT_ZH = """\
 </tool_call>
 - 工具名与参数名**必须用工具清单里的**，不要发明。
 - 一轮里互不依赖的调用可以连着写多个 `<tool_call>` 块一次给完。
-- 工具选择以清单里的描述为准：目录用 `list_directory`/`directory_tree`、读文件用
+- 工具选择以清单里的描述为准：列目录/看结构用 `directory_tree`、读文件用
   `read_file`（只看开头结尾用 `head_tail_file`）、找文件用 `glob_files`、
-  搜内容用 `search_in_files`、改内容用 `modify_file`、跑命令用 `execute_command`。
+  搜内容用 `search_in_files`、改内容用 `modify_file`、跑命令（含 git）用
+  `execute_command`。**没有独立的 git 工具，git 操作一律走 execute_command**。
   **不确定某命令/程序是否存在时，先探测再决定**，不要凭印象假设它装了。
 """
 

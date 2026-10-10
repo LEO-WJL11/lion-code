@@ -128,6 +128,9 @@ from typing import Any, Iterable
 LEGACY_IDS = ("backend", "client", "document", "frontend")
 
 #: 工具名 → 老插件 id 的映射：让 `required_tool_ids()` 还能返回老格式的 id。
+#: 【2026-10】工具砍到 21 个后，指向已删工具的条目（list_directory / run_background /
+#: git_status / git_commit）删掉；list_directory 的活儿现在由 directory_tree 干，
+#: 所以给它补了一条 —— 技能要求"能列目录"时不至于拿不到插件 id。
 TOOL_PLUGIN_IDS: dict[str, str] = {
     "read_file": "tool.file.read",
     "write_file": "tool.file.write",
@@ -136,11 +139,8 @@ TOOL_PLUGIN_IDS: dict[str, str] = {
     "modify_file": "tool.file.modify",
     "search_in_files": "tool.file.search",
     "glob_files": "tool.file.search",
-    "list_directory": "tool.file.search",
+    "directory_tree": "tool.file.search",
     "execute_command": "tool.shell.execute",
-    "run_background": "tool.shell.execute",
-    "git_status": "tool.git.status",
-    "git_commit": "tool.git.commit",
 }
 
 

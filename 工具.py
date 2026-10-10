@@ -258,33 +258,20 @@ from pathlib import Path
 
 TOOL_MODULES: list[tuple[str, str, str]] = [
 
-    ("code", "base64", "Base64Tool"),
 
-    ("code", "cron", "CronTool"),
 
-    ("code", "diff", "DiffTool"),
 
-    ("code", "escape", "EscapeTool"),
 
-    ("code", "format", "CodeFormatTool"),
 
-    ("code", "hash", "HashTool"),
 
-    ("code", "json", "JsonTool"),
 
-    ("code", "markdown", "MarkdownTool"),
 
-    ("code", "number", "NumberTool"),
 
-    ("code", "regex", "RegexTool"),
 
-    ("code", "string", "StringTool"),
 
     ("code", "timestamp", "TimestampTool"),
 
-    ("code", "uuid", "UuidTool"),
 
-    ("code", "yaml", "YamlTool"),
 
     ("context", "context_prune", "ContextPruneTool"),
 
@@ -292,7 +279,6 @@ TOOL_MODULES: list[tuple[str, str, str]] = [
 
     ("file", "file_append", "FileAppendTool"),
 
-    ("file", "file_chmod", "FileChmodTool"),
 
     ("file", "file_copy", "FileCopyTool"),
 
@@ -302,17 +288,14 @@ TOOL_MODULES: list[tuple[str, str, str]] = [
 
     ("file", "file_head_tail", "FileHeadTailTool"),
 
-    ("file", "file_info", "FileInfoTool"),
 
     ("file", "file_line_count", "FileLineCountTool"),
 
-    ("file", "file_list", "FileListTool"),
 
     ("file", "file_mkdir", "FileMkdirTool"),
 
     ("file", "file_modify", "FileModifyTool"),
 
-    ("file", "file_move", "FileMoveTool"),
 
     ("file", "file_read", "FileReadTool"),
 
@@ -322,41 +305,27 @@ TOOL_MODULES: list[tuple[str, str, str]] = [
 
     ("file", "file_tree", "FileTreeTool"),
 
-    ("file", "file_wc", "FileWcTool"),
 
     ("file", "file_write", "FileWriteTool"),
 
-    ("git", "git_branch", "GitBranchTool"),
 
-    ("git", "git_commit", "GitCommitTool"),
 
-    ("git", "git_diff", "GitDiffTool"),
 
-    ("git", "git_init", "GitInitTool"),
 
-    ("git", "git_log", "GitLogTool"),
 
-    ("git", "git_remote", "GitRemoteTool"),
 
-    ("git", "git_reset", "GitResetTool"),
 
-    ("git", "git_stash", "GitStashTool"),
 
-    ("git", "git_status", "GitStatusTool"),
 
-    ("shell", "shell_background", "ShellBackgroundTool"),
 
     ("shell", "shell_execute", "ShellExecuteTool"),
 
-    ("shell", "shell_stop", "ShellStopTool"),
 
     ("system", "ask_user", "AskUserTool"),
 
-    ("system", "env_var", "EnvVarTool"),
 
     ("system", "system_info", "SystemInfoTool"),
 
-    ("system", "working_dir", "WorkingDirTool"),
 
 ]
 
@@ -1080,16 +1049,6 @@ class FileAppendTool(ToolPlugin):
 # ========================================================================
 # 原模块 lionbox/tools/file/file_chmod.py
 # ========================================================================
-"""`change_permissions` —— 修改文件权限。
-
-【契约来源】`core/plugin/tool/file/FileChmodTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-
-【行为】Java 走 POSIX 权限集，在不支持的系统上抛 `UnsupportedOperationException`，
-退回 `File.setReadable/setWritable/setExecutable`（三个参数默认值都是 **false**：
-不传就表示"关掉"）。Python 在 Windows 上没有 os.chmod 的权限位语义，
-所以用同一套判据分流：`os.name == "posix"` 走 chmod，否则走只读位。
-"""
 
 
 import os
@@ -1100,77 +1059,6 @@ from typing import Any
 from lionbox.plugins.base import ToolPlugin, ToolResult, tool
 
 
-@tool
-class FileChmodTool(ToolPlugin):
-    """文件权限修改工具。"""
-
-    minimal_mode = True          # Java: ToolCategory.FILE_MODIFY 在 MINIMAL 下开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.file.chmod"
-
-    @property
-    def name(self) -> str:
-        return "change_permissions"
-
-    @property
-    def description(self) -> str:
-        return "修改文件权限"
-
-    @property
-    def category(self) -> str:
-        return "FILE_MODIFY"
-
-    @property
-    def permission(self) -> str:
-        return "WORKSPACE_WRITE"
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-                "readable": {"type": "boolean", "description": "可读"},
-                "writable": {"type": "boolean", "description": "可写"},
-                "executable": {"type": "boolean", "description": "可执行"},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            file_path = Path(path)
-
-            readable = self.get_bool_arg(args, "readable", False)
-            writable = self.get_bool_arg(args, "writable", False)
-            executable = self.get_bool_arg(args, "executable", False)
-
-            if os.name == "posix":
-                # Java 只加 OWNER_* 三位的权限（从空集合开始，所以另外六位清 0）
-                mode = 0
-                if readable:
-                    mode |= stat.S_IRUSR
-                if writable:
-                    mode |= stat.S_IWUSR
-                if executable:
-                    mode |= stat.S_IXUSR
-                os.chmod(file_path, mode)
-            else:
-                # Windows：Java 退到 File.setReadable/setWritable/setExecutable。
-                # 只有"可写"这一位是真实生效的（只读属性），其余两位 Windows 上无对应语义。
-                # 【OSError 不能吞】路径不存在/被占用时 os.chmod 会抛 FileNotFoundError/
-                # PermissionError，原来 `except OSError: pass` 之后照样回"权限已修改"，
-                # 模型据此以为改好了继续往下走（失败仍报成功）。这里如实报错。
-                try:
-                    os.chmod(file_path, stat.S_IREAD | (stat.S_IWRITE if writable else 0))
-                except OSError as e:
-                    return self.error(f"修改权限失败: {type(e).__name__}: {e}")
-
-            return self.success(f"权限已修改: {path}")
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"修改权限失败: {e}")
 
 
 # ========================================================================
@@ -1686,16 +1574,6 @@ class FileHeadTailTool(ToolPlugin):
 # ========================================================================
 # 原模块 lionbox/tools/file/file_info.py
 # ========================================================================
-"""`file_info` —— 查看文件详细信息（大小、修改时间等）。
-
-【契约来源】`core/plugin/tool/file/FileInfoTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-
-【修改时间的格式】Java 是 `String.format("%s", FileTime)`，即 `FileTime.toString()` ——
-ISO-8601 的 `yyyy-MM-ddTHH:mm:ss[.fffffffff]Z`，小数位数是 0/3/6/9 位（按精度截断）。
-这里按同一格式手写（NTFS 是 100ns 精度 → JDK 取到纳秒 → 9 位小数），别用 Python 默认的
-`datetime.__str__`（那是 `2024-01-15 10:30:45.123456`，中间是空格、没有 Z，对不上）。
-"""
 
 
 import os
@@ -1706,61 +1584,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class FileInfoTool(ToolPlugin):
-    """文件信息查看工具。"""
-
-    minimal_mode = True          # Java: ToolCategory.FILE_OPERATION 在 MINIMAL 下开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.file.info"
-
-    @property
-    def name(self) -> str:
-        return "file_info"
-
-    @property
-    def description(self) -> str:
-        return "查看文件详细信息（大小、修改时间等）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.FILE_OPERATION
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            file_path = Path(path)
-            if not file_path.exists():
-                return self.error(f"路径不存在: {path}")
-
-            stat = file_path.stat()
-            size = stat.st_size
-            is_dir = file_path.is_dir()
-
-            return self.success(
-                f"路径: {path}\n"
-                f"类型: {'目录' if is_dir else '文件'}\n"
-                f"大小: {size} 字节\n"
-                f"最后修改: {_file_time(stat.st_mtime_ns)}\n"
-                f"可读: {'true' if os.access(file_path, os.R_OK) else 'false'}\n"
-                f"可写: {'true' if os.access(file_path, os.W_OK) else 'false'}")
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"获取文件信息失败: {e}")
 
 
 def _file_time(mtime_ns: int) -> str:
@@ -1879,7 +1702,7 @@ class FileLineCountTool(ToolPlugin):
             if looks_binary(head):
                 return self.success(
                     f"（{path} 看着是二进制（含 NUL 或大量控制字符），不统计行数；"
-                    "要大小/类型用 file_info）")
+                    "要大小/类型请用 execute_command 跑 Get-Item）")
 
             # 容错读：记事本存的 ANSI/GBK 中文文件按 UTF-8 严格解码会抛
             # MalformedInputException，word_count 早就容错读了，这里对齐。
@@ -1892,15 +1715,6 @@ class FileLineCountTool(ToolPlugin):
 # ========================================================================
 # 原模块 lionbox/tools/file/file_list.py
 # ========================================================================
-"""`list_directory` —— 列出目录下的文件和子目录。
-
-【契约来源】`core/plugin/tool/file/FileListTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-
-【顺序】Java 的 `Files.list(dir)` 返回的是**目录流本身的顺序**（NTFS 上大致按名字，
-但没有排序保证），`Files.walk` 同理 —— 所以这里不排序，照系统给的顺序输出，
-免得和 Java 版逐行对比时顺序对不上。
-"""
 
 
 import os
@@ -1910,75 +1724,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class FileListTool(ToolPlugin):
-    """目录列表工具。"""
-
-    minimal_mode = True          # Java: ToolCategory.FILE_OPERATION 在 MINIMAL 下开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.file.list"
-
-    @property
-    def name(self) -> str:
-        return "list_directory"
-
-    @property
-    def description(self) -> str:
-        return "列出目录下的文件和子目录"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.FILE_OPERATION
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "目录路径"},
-                "recursive": {"type": "boolean", "description": "是否递归列出", "default": False},
-                "maxDepth": {"type": "integer", "description": "最大递归深度", "default": 3},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            recursive = self.get_bool_arg(args, "recursive", False)
-            max_depth = self.get_int_arg(args, "maxDepth", 3)
-
-            dir_path = Path(path)
-            if not dir_path.exists():
-                return self.error(f"路径不存在: {path}")
-            if not dir_path.is_dir():
-                return self.error(f"不是目录: {path}")
-
-            lines = [f"目录: {path}"]
-            if recursive:
-                # Java: Files.walk(dirPath, maxDepth) —— 含根自己，根显示成 "."
-                for entry, rel in walk_entries(dir_path, max(0, max_depth)):
-                    lines.append(("[DIR] " if entry.is_dir() else "[FILE] ") + rel)
-            else:
-                # Java: Files.list(dirPath) —— 只列直接子项
-                try:
-                    children = [Path(e.path) for e in os.scandir(dir_path)]
-                except OSError as e:
-                    return self.error(f"列出目录失败: {e}")
-                for child in children:
-                    lines.append(("[DIR] " if child.is_dir() else "[FILE] ") + child.name)
-
-            return self.success("\n".join(lines) + "\n")
-
-        except OSError as e:
-            return self.error(f"列出目录失败: {e}")
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"参数错误: {e}")
 
 
 # ========================================================================
@@ -2325,11 +2070,6 @@ def _read_lines_with_encoding(path: Path, encoding: str) -> list[str]:
 # ========================================================================
 # 原模块 lionbox/tools/file/file_move.py
 # ========================================================================
-"""`move_file` —— 移动或重命名文件/目录。
-
-【契约来源】`core/plugin/tool/file/FileMoveTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-"""
 
 
 import errno
@@ -2340,99 +2080,6 @@ from typing import Any
 from lionbox.plugins.base import ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class FileMoveTool(ToolPlugin):
-    """文件移动/重命名工具。"""
-
-    minimal_mode = True          # Java: ToolCategory.FILE_OPERATION 在 MINIMAL 下开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.file.move"
-
-    @property
-    def name(self) -> str:
-        return "move_file"
-
-    @property
-    def description(self) -> str:
-        return "移动或重命名文件/目录"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.FILE_OPERATION
-
-    @property
-    def permission(self) -> str:
-        return "WORKSPACE_WRITE"
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "source": {"type": "string", "description": "源路径"},
-                "target": {"type": "string", "description": "目标路径"},
-            },
-            "required": ["source", "target"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            # 参数别名：模型常写 src/from，只认 source 会白报一次"缺少必需参数"
-            merged = dict(args)
-            if "source" not in merged:
-                for alias in ("src", "from", "path", "oldPath"):
-                    if merged.get(alias) is not None:
-                        merged["source"] = merged[alias]
-                        break
-            if "target" not in merged:
-                for alias in ("dest", "destination", "to", "newPath"):
-                    if merged.get(alias) is not None:
-                        merged["target"] = merged[alias]
-                        break
-
-            source = self.resolve_path(self.get_required_string_arg(merged, "source"))
-            target = self.resolve_path(self.get_required_string_arg(merged, "target"))
-
-            source_path = Path(source)
-            target_path = Path(target)
-
-            if not source_path.exists():
-                return self.error(f"源路径不存在: {source}")
-
-            if target_path.parent != Path(""):
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # 【目标已存在且是目录时必须先说清楚】os.replace 对"目标是目录"必然失败，
-            # 退到 shutil.move 的语义是"搬进目录里"（真实落点是 target/<源文件名>），
-            # 而返回文案照旧写 "source -> target" —— 调用方按文案去找文件会找不到。
-            # Java 的 REPLACE_EXISTING 此时抛 DirectoryNotEmptyException 直接报错，这里对齐：
-            # 先拒绝，把真实落点告诉调用方，别先斩后奏。
-            if target_path.is_dir():
-                return self.error(
-                    f"目标已存在且是目录: {target}"
-                    f"（要移动到目录里就写完整落点 {target.rstrip('/\\') + os.sep + source_path.name}；"
-                    "或者把 target 写成一个文件名）")
-
-            # Java: Files.move(source, target, REPLACE_EXISTING) —— 同盘是原子改名，
-            # 目标已存在就替换（目录被替换时要求它为空，非空会报 DirectoryNotEmptyException）。
-            # Python 的 os.replace 语义一致；**只有跨盘（EXDEV）**才退到 shutil.move ——
-            # 其它失败（权限、目标是目录、被占用）原来也无脑兜底，会把"没搬成"报成"已移动"。
-            try:
-                source_path.replace(target_path)
-            except OSError as e:
-                cross_device = (getattr(e, "errno", None) == errno.EXDEV
-                                or getattr(e, "winerror", None) == 17)   # ERROR_NOT_SAME_DEVICE
-                if not cross_device:
-                    raise
-                shutil.move(str(source_path), str(target_path))
-
-            return self.success(f"已移动: {source} -> {target}")
-
-        except OSError as e:
-            return self.error(f"移动失败: {e}")
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"参数错误: {e}")
 
 
 # ========================================================================
@@ -2860,69 +2507,6 @@ def count_words(content: str | None) -> int:
     return 0 if not text else len(_WHITESPACE_SPLIT.split(text))
 
 
-@tool
-class FileWcTool(ToolPlugin):
-    """文件统计工具（行数、字数、字节数）。"""
-
-    minimal_mode = True          # Java: ToolCategory.FILE_OPERATION 在 MINIMAL 下开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.file.wc"
-
-    @property
-    def name(self) -> str:
-        return "word_count"
-
-    @property
-    def description(self) -> str:
-        return "统计文件行数、字数、字节数"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.FILE_OPERATION
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            target = Path(path)
-
-            # 实测：模型把目录当文件传进来，原来只回"统计失败: <路径>"（异常 message 是空的），
-            # 等于什么都没说。它想要的就是"这个目录里有多少东西"，那就真的去数。
-            if target.is_dir():
-                return self.success(_directory_stats(target))
-
-            if not target.exists():
-                return self.error(f"文件不存在: {path}")
-
-            raw = target.read_bytes()
-            size = len(raw)
-            if looks_binary(raw):
-                # 【这是原来的死代码位置】现在按字节真判：二进制就说清楚，不编数字。
-                return self.success(
-                    f"字节数: {size}\n（这个文件看着是二进制（含 NUL 或大量控制字符），"
-                    "行数/字数没法准确统计；可以 file_info 看类型，或 read_file 看前面一段）")
-
-            # 【和 line_count 对齐】同一个文件两个工具的答案必须一样
-            lines = len(read_text_lines(target))
-            words = count_words(decode_text(raw))
-            return self.success(f"行数: {lines}\n字数: {words}\n字节数: {size}")
-
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"统计失败: {e}")
 
 
 def _directory_stats(directory: Path) -> str:
@@ -3072,22 +2656,17 @@ class FileWriteTool(ToolPlugin):
 
 __all__ = [
     "FileAppendTool",
-    "FileChmodTool",
     "FileCopyTool",
     "FileDeleteTool",
     "FileGlobTool",
     "FileHeadTailTool",
-    "FileInfoTool",
     "FileLineCountTool",
-    "FileListTool",
     "FileMkdirTool",
     "FileModifyTool",
-    "FileMoveTool",
     "FileReadTool",
     "FileSearchTool",
     "FileTouchTool",
     "FileTreeTool",
-    "FileWcTool",
     "FileWriteTool",
 ]
 
@@ -3436,22 +3015,6 @@ __all__ = [
 # ========================================================================
 # 原模块 lionbox/tools/code/base64.py
 # ========================================================================
-"""Base64 编解码工具（对应 Java `core/plugin/tool/code/Base64Tool.java`）。
-
-【逐字一致的契约】id/name/description/parameters_schema 与 Java 一字不差；
-minimal_mode = False —— Java 里类别是 OTHER，极简模式不开放。
-
-【实测过的行为，照抄】
-1. 编解码写死 UTF-8。Java 侧原来用平台默认编码，启动参数带 `-Dfile.encoding=GBK`
-   时"中文"编出来的 base64 跟标准工具/别的机器完全不一样，用户拿去解码是乱码。
-2. 失败一律返回 `ToolResult.fail("Base64处理失败: …")`，不抛异常出去（Java 的 catch 包住整段，
-   连"缺少必需参数"也走这个前缀）。
-3. 解码得到的字节按 UTF-8 **容错**解码：Java 的 `new String(bytes, UTF_8)` 遇到非法序列
-   替换成 U+FFFD 而不报错，Python 的 bytes.decode 默认会抛，所以这里用 errors="replace"。
-
-【扩展（不改变上面任何行为）】除 Java 的 input/action 外，额外认 `file`：给了 file 就读文件
-字节（对齐"编码工具要支持文本或文件两种输入"）。不传 file 时与 Java 完全一致。
-"""
 
 
 import base64 as _base64
@@ -3460,69 +3023,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class Base64Tool(ToolPlugin):
-    """Base64编码/解码"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.base64"
-
-    @property
-    def name(self) -> str:
-        return "base64"
-
-    @property
-    def description(self) -> str:
-        return "Base64编码/解码"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "输入内容"},
-                "action": {"type": "string", "description": "encode/decode"},
-            },
-            "required": ["input", "action"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            action = self.get_required_string_arg(args, "action")
-            file_arg = str(args.get("file") or args.get("path") or "").strip()
-            if file_arg:
-                return self._execute_file(action, file_arg)
-
-            text = self.get_required_string_arg(args, "input")
-            if action == "encode":
-                return self.success(_base64.b64encode(text.encode("utf-8")).decode("ascii"))
-            if action == "decode":
-                return self.success(_decode_to_text(text))
-            return self.error("未知操作: " + action)
-        except Exception as e:      # 与 Java 一样，整段一个 catch：错误前缀统一
-            return self.error("Base64处理失败: " + str(e))
-
-    def _execute_file(self, action: str, file_arg: str) -> ToolResult:
-        """扩展路径：以文件为输入（Java 没有这个分支，加了不影响原行为）。"""
-        path = self.resolve_path(file_arg)
-        if not path.is_file():
-            return self.error("Base64处理失败: 文件不存在: " + str(path))
-        data = path.read_bytes()
-        if action == "encode":
-            return self.success(_base64.b64encode(data).decode("ascii"))
-        if action == "decode":
-            return self.success(_decode_to_text(data.decode("ascii", errors="replace")))
-        return self.error("未知操作: " + action)
 
 
 def _decode_to_text(text: str) -> str:
@@ -3541,15 +3041,6 @@ def _decode_to_text(text: str) -> str:
 # ========================================================================
 # 原模块 lionbox/tools/code/cron.py
 # ========================================================================
-"""Cron 表达式解析工具（对应 Java `core/plugin/tool/code/CronTool.java`）。
-
-【逐字一致的契约】id/name/description/parameters_schema 与 Java 一字不差；
-minimal_mode = False（Java 类别 OTHER）。
-
-【行为对齐】Java 是 `expr.split("\\s+")` 后按"5 段还是 6 段"决定秒/分/时/日/月/周的位置，
-不做语义校验（不判断 */5、MON-FRI 这类写法是否合法）。这里照抄同一套动作与输出文案，
-连 `split` 的边界语义都对齐：Java 会丢掉末尾空串，这里也丢。
-"""
 
 
 import re
@@ -3558,77 +3049,11 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class CronTool(ToolPlugin):
-    """解析Cron表达式"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.cron"
-
-    @property
-    def name(self) -> str:
-        return "cron_parse"
-
-    @property
-    def description(self) -> str:
-        return "解析Cron表达式"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "Cron表达式"},
-            },
-            "required": ["expression"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            expr = self.get_required_string_arg(args, "expression")
-        except ValueError as e:
-            return self.error(str(e))
-
-        parts = re.split(r"\s+", expr)
-        while parts and parts[-1] == "":      # Java 的 split 丢末尾空串
-            parts.pop()
-
-        if len(parts) < 5 or len(parts) > 6:
-            return self.error("无效的Cron表达式，需要5或6个字段")
-
-        six = len(parts) > 5
-        return self.success(
-            f"Cron表达式: {expr}\n"
-            f"秒: {parts[0] if six else '0'}\n"
-            f"分: {parts[1] if six else parts[0]}\n"
-            f"时: {parts[2] if six else parts[1]}\n"
-            f"日: {parts[3] if six else parts[2]}\n"
-            f"月: {parts[4] if six else parts[3]}\n"
-            f"周: {parts[5] if six else parts[4]}")
 
 
 # ========================================================================
 # 原模块 lionbox/tools/code/diff.py
 # ========================================================================
-"""文本差异比较工具（对应 Java `core/plugin/tool/code/DiffTool.java`）。
-
-【逐字一致的契约】id/name/description/parameters_schema 与 Java 一字不差；
-minimal_mode = False（Java 类别 OTHER）。
-
-【行为对齐】Java 是按行号**逐行对位**比较（不是 LCS diff）：
-`String.split("\\n")` 会丢掉末尾的空串，所以这里也照 Java 的语义切行，
-否则 "a\\n" 与 "a" 在 Java 里算"完全相同"、在 Python 里会被判成第 2 行不同。
-"""
 
 
 from typing import Any
@@ -3636,59 +3061,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class DiffTool(ToolPlugin):
-    """比较两段文本的差异"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.diff"
-
-    @property
-    def name(self) -> str:
-        return "diff_text"
-
-    @property
-    def description(self) -> str:
-        return "比较两段文本的差异"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "text1": {"type": "string", "description": "文本1"},
-                "text2": {"type": "string", "description": "文本2"},
-            },
-            "required": ["text1", "text2"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            text1 = self.get_required_string_arg(args, "text1")
-            text2 = self.get_required_string_arg(args, "text2")
-        except ValueError as e:
-            return self.error(str(e))
-
-        lines1 = _java_split_lines(text1)
-        lines2 = _java_split_lines(text2)
-
-        out: list[str] = []
-        for i in range(max(len(lines1), len(lines2))):
-            l1 = lines1[i] if i < len(lines1) else ""
-            l2 = lines2[i] if i < len(lines2) else ""
-            if l1 != l2:
-                out.append(f"行{i + 1}:\n  - {l1}\n  + {l2}\n")
-        return self.success("".join(out) if out else "文本完全相同")
 
 
 def _java_split_lines(text: str) -> list[str]:
@@ -3727,91 +3099,6 @@ from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, Tool
 TARGETS = ("html", "xml", "java", "json", "url", "regex", "shell")
 
 
-@tool
-class EscapeTool(ToolPlugin):
-    """字符串转义/反转义"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.escape"
-
-    @property
-    def name(self) -> str:
-        return "escape_string"
-
-    @property
-    def description(self) -> str:
-        return "字符串转义/反转义（html/json/java/url/regex/shell）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "要转义的文本（放这里！不是 target）"},
-                "action": {"type": "string", "description": "escape / unescape"},
-                "target": {"type": "string", "description":
-                           "转到哪种格式：html / xml / java / json / url / regex / shell，默认 html",
-                           "default": "html"},
-            },
-            "required": ["input", "action"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        merged = dict(args)
-        # input 的别名：模型常写 text / value / data / string / content
-        for alias in ("text", "value", "data", "string", "content", "source", "str"):
-            if "input" not in merged and merged.get(alias) is not None:
-                merged["input"] = merged[alias]
-
-        raw_action = "" if merged.get("action") is None else str(merged.get("action"))
-        action = raw_action.lower().strip()
-        if action.startswith("un"):
-            action = "unescape"
-        elif action != "escape":
-            action = "escape"
-
-        raw_target = "" if merged.get("target") is None else str(merged.get("target"))
-        # 注意：target 缺省（没传）时是 html；传了但内容是空串时仍走"未知目标"的提示分支，
-        # 这与 Java 的 `a.get("target") == null ? "html" : String.valueOf(...)` 完全一致
-        target = "html" if merged.get("target") is None else raw_target.lower().strip()
-        text = None if merged.get("input") is None else str(merged.get("input"))
-
-        # 模型把目标名写进了 input、把正文写进了 target：换回来
-        if target not in TARGETS and text is not None and text.lower().strip() in TARGETS:
-            text, target = target, text.lower().strip()
-
-        if text is None or text.strip() == "":
-            return self.error("缺少必需参数: input" + self._required_hint())
-
-        note = ""
-        if target not in TARGETS:
-            note = ("（target 只能是 " + " / ".join(TARGETS)
-                    + " 之一，要转义的文本放在 input 里；本次按 html 处理）\n")
-            target = "html"
-        return self.success(note + _convert(target, action, text))
-
-    def _required_hint(self) -> str:
-        """把必填参数连说明一起回给模型（对齐 Java 的 requiredParamsHint）。"""
-        schema = self.parameters_schema()
-        required = schema.get("required") or []
-        if not required:
-            return ""
-        props = schema.get("properties") or {}
-        items = []
-        for key in required:
-            desc = str((props.get(key) or {}).get("description", ""))
-            items.append(f"{key}（{desc}）")
-        return "。本工具必填参数：" + "、".join(items)
 
 
 def _convert(target: str, action: str, text: str) -> str:
@@ -3938,71 +3225,6 @@ from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, Tool
 INDENT = "    "
 
 
-@tool
-class CodeFormatTool(ToolPlugin):
-    """规整代码空白"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.format"
-
-    @property
-    def name(self) -> str:
-        return "format_code"
-
-    @property
-    def description(self) -> str:
-        return ("规整代码空白：制表符缩进统一成4空格、去掉行尾空白、连续空行压成一行、统一换行符；"
-                "不做语法级重排（不会改缩进层级、不会折行），不是任何语言的格式化器")
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "代码内容"},
-            },
-            "required": ["code"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            code = self.get_required_string_arg(args, "code")
-        except ValueError as e:
-            return self.error(str(e))
-
-        # 统一换行：CRLF 混在里面会让每一行末尾挂一个 \r，后面的行尾空白判断和输出都会带着它
-        text = code.replace("\r\n", "\n").replace("\r", "\n")
-
-        # 末尾那个空元素（文件以换行结尾时的产物）先摘掉，否则它会被当成"一个多余的空行"，
-        # 结果凭空多出一个空行 —— 与 Java 的 split("\n", -1) + 摘末尾 完全同一套动作
-        lines = text.split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-
-        out: list[str] = []
-        last_blank = False
-        for line in lines:
-            fixed = line.replace("\t", INDENT) if "\t" in line else line
-            trimmed = _strip_trailing(fixed)
-            if not trimmed:
-                if last_blank:
-                    continue        # 连续空行只留一行
-                last_blank = True
-            else:
-                last_blank = False
-            out.append(trimmed)
-        body = "".join(line + "\n" for line in out)
-        return self.success(body)
 
 
 def _strip_trailing(line: str) -> str:
@@ -4062,76 +3284,6 @@ _ALGORITHMS = {
 _CHUNK = 1 << 20
 
 
-@tool
-class HashTool(ToolPlugin):
-    """计算字符串的MD5/SHA1/SHA256哈希值"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.hash"
-
-    @property
-    def name(self) -> str:
-        return "hash"
-
-    @property
-    def description(self) -> str:
-        return "计算字符串的MD5/SHA1/SHA256哈希值"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "输入内容"},
-                "algorithm": {"type": "string", "description": "算法：MD5/SHA-1/SHA-256",
-                              "default": "SHA-256"},
-            },
-            "required": ["input"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            algorithm = self.get_string_arg(args, "algorithm", "SHA-256")
-            file_arg = str(args.get("file") or args.get("path") or "").strip()
-            encoding = self.get_string_arg(args, "encoding", "hex").strip().lower() or "hex"
-
-            digest = _new_digest(algorithm)
-            if digest is None:
-                # Java 的 NoSuchAlgorithmException 原文形状
-                return self.error("哈希计算失败: " + algorithm + " MessageDigest not available")
-
-            if file_arg:
-                path = self.resolve_path(file_arg)
-                if not path.is_file():
-                    return self.error("哈希计算失败: 文件不存在: " + str(path))
-                size = _feed_file(digest, path)
-                tail = f"\n文件: {path}（{size} 字节）"
-            else:
-                text = self.get_required_string_arg(args, "input")
-                digest.update(text.encode("utf-8"))
-                tail = ""
-
-            raw = digest.digest()
-            if encoding == "base64":
-                out = _base64.b64encode(raw).decode("ascii")
-            elif encoding == "hex":
-                out = raw.hex()
-            else:
-                return self.error("哈希计算失败: 不支持的输出编码: " + encoding
-                                  + "（支持 hex / base64）")
-            return self.success(algorithm + ": " + out + tail)
-        except Exception as e:
-            return self.error("哈希计算失败: " + str(e))
 
 
 def _new_digest(algorithm: str):
@@ -4167,19 +3319,6 @@ def _feed_file(digest, path: Path) -> int:
 # ========================================================================
 # 原模块 lionbox/tools/code/json.py
 # ========================================================================
-"""JSON 格式化/验证/压缩工具（对应 Java `core/plugin/tool/code/JsonTool.java`）。
-
-【逐字一致的契约】id/name/description/parameters_schema 与 Java 一字不差；
-minimal_mode = False（Java 类别 OTHER）。
-
-【为什么要自己写序列化】Java 用的是 Jackson 的 `writerWithDefaultPrettyPrinter()`：
-  1. 键值分隔是 `" : "`（冒号两边都有空格），缩进 2 空格；
-  2. 数组是**行内**的 `[ 1, 2 ]`（`DefaultPrettyPrinter` 的数组缩进器是 FixedSpaceIndenter），
-     只有对象才换行；空对象/空数组写作 `{ }` / `[ ]`；
-  3. 中文原样输出（不转成 \\uXXXX），键顺序保留输入顺序。
-Python 的 `json.dumps(indent=2)` 这三点全都不同，会让"同一个输入在两版里格式不一样"，
-所以这里按 Jackson 的实际输出实现（对照 Java 侧实测输出逐项核对过）。
-"""
 
 
 import json as _json
@@ -4189,58 +3328,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class JsonTool(ToolPlugin):
-    """格式化、验证、压缩JSON"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.json"
-
-    @property
-    def name(self) -> str:
-        return "json_format"
-
-    @property
-    def description(self) -> str:
-        return "格式化、验证、压缩JSON"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "JSON字符串"},
-                "action": {"type": "string", "description": "format/minify/validate",
-                           "default": "format"},
-            },
-            "required": ["input"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            text = self.get_required_string_arg(args, "input")
-            action = self.get_string_arg(args, "action", "format")
-
-            if action == "validate":
-                _parse(text)
-                return self.success("JSON格式有效")
-            if action == "format":
-                return self.success(_dump(_parse(text), pretty=True))
-            if action == "minify":
-                return self.success(_dump(_parse(text), pretty=False))
-            return self.error("未知操作: " + action)
-        except Exception as e:
-            return self.error("JSON处理失败: " + str(e))
 
 
 def _parse(text: str) -> Any:
@@ -4330,57 +3417,6 @@ _H2 = re.compile(r"^## (.*)$", re.MULTILINE)
 _H1 = re.compile(r"^# (.*)$", re.MULTILINE)
 
 
-@tool
-class MarkdownTool(ToolPlugin):
-    """Markdown转HTML预览"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.markdown"
-
-    @property
-    def name(self) -> str:
-        return "markdown_render"
-
-    @property
-    def description(self) -> str:
-        return "Markdown转HTML预览"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "markdown": {"type": "string", "description": "Markdown内容"},
-            },
-            "required": ["markdown"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            md = self.get_required_string_arg(args, "markdown")
-        except ValueError as e:
-            return self.error(str(e))
-
-        html = escape_html(md)
-        html = _H3.sub(r"<h3>\1</h3>", html)
-        html = _H2.sub(r"<h2>\1</h2>", html)
-        html = _H1.sub(r"<h1>\1</h1>", html)
-        # 行内记号：** 要比 * 先换（和 Java 同样的顺序）
-        html = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", html)
-        html = re.sub(r"\*(.*?)\*", r"<em>\1</em>", html)
-        html = re.sub(r"`([^`]+)`", r"<code>\1</code>", html)
-        html = html.replace("\n", "<br>")
-        return self.success(html)
 
 
 def escape_html(text: str) -> str:
@@ -4425,85 +3461,6 @@ LONG_MIN = -(2 ** 63)
 LONG_MAX = 2 ** 63 - 1
 
 
-@tool
-class NumberTool(ToolPlugin):
-    """进制转换"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.number"
-
-    @property
-    def name(self) -> str:
-        return "number_convert"
-
-    @property
-    def description(self) -> str:
-        return "进制转换（dec/hex/bin/oct 或 10/16/2/8）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "value": {"type": "string", "description": "要转换的数值，如 255"},
-                "fromBase": {"type": "string",
-                             "description": "源进制：10/16/2/8，也认 dec/hex/bin/oct",
-                             "default": "10"},
-                "toBase": {"type": "string",
-                           "description": "目标进制：10/16/2/8，也认 dec/hex/bin/oct",
-                           "default": "16"},
-            },
-            "required": ["value", "fromBase", "toBase"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            value = self.get_required_string_arg(args, "value").strip()
-        except ValueError as e:
-            # Java 里 IllegalArgumentException 落到泛化 catch → 前缀同样是"转换失败: "
-            return self.error("转换失败: " + str(e))
-        try:
-            from_base = parse_base(args.get("fromBase"), 10)
-            to_base = parse_base(args.get("toBase"), 16)
-            if from_base < 2 or from_base > 36 or to_base < 2 or to_base > 36:
-                return self.error(
-                    f"进制必须在 2-36 之间（收到 fromBase={args.get('fromBase')}, "
-                    f"toBase={args.get('toBase')}）；也可以直接写 dec/hex/bin/oct")
-
-            digits = value
-            negative = digits.startswith("-")
-            if negative or digits.startswith("+"):
-                digits = digits[1:]
-            if digits.startswith(("0x", "0X")):
-                digits = digits[2:]
-                from_base = 16
-            elif digits.startswith(("0b", "0B")):
-                digits = digits[2:]
-                from_base = 2
-            elif digits.startswith(("0o", "0O")):
-                digits = digits[2:]
-                from_base = 8
-
-            decimal = _parse_long(digits, from_base, negative)
-        except ValueError:
-            return self.error("转换失败: " + str(args.get("value")) + " 不是合法的 "
-                              + str(args.get("fromBase")) + " 进制数字")
-        except Exception as e:
-            return self.error("转换失败: " + str(e))
-
-        out = _to_base(decimal, to_base).upper()
-        return self.success(f"{value}（{base_name(from_base)}） = {out}（{base_name(to_base)}）"
-                            f"\n十进制: {decimal}")
 
 
 def parse_base(raw: Any, fallback: int) -> int:
@@ -4587,91 +3544,6 @@ MAX_MATCHES = 200
 TIME_BUDGET_SECONDS = 10.0
 
 
-@tool
-class RegexTool(ToolPlugin):
-    """测试正则表达式匹配"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.regex"
-
-    @property
-    def name(self) -> str:
-        return "regex_test"
-
-    @property
-    def description(self) -> str:
-        return "测试正则表达式匹配"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "正则表达式"},
-                "input": {"type": "string", "description": "测试文本"},
-                "flags": {"type": "string", "description": "标志：i=忽略大小写", "default": ""},
-            },
-            "required": ["pattern", "input"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            pattern = self.get_required_string_arg(args, "pattern")
-            text = self.get_required_string_arg(args, "input")
-            flags = self.get_string_arg(args, "flags", "")
-
-            risky = find_nested_quantifier(pattern)
-            if risky is not None:
-                return self.error(
-                    "正则表达式可能有灾难性回溯风险（嵌套量词 " + risky + "），已拒绝执行："
-                    "Python 侧没有引擎级超时。请改写，例如把 (.+)+ 换成 .+、"
-                    "把 (\\w+)* 换成 [\\w]*，或用更具体的字符集限定重复范围。")
-
-            flag = re.IGNORECASE if "i" in flags else 0
-            compiled = re.compile(pattern, flag)
-            matches: list[str] = []
-            truncated = False
-            timed_out = False
-            started = time.monotonic()
-            for m in compiled.finditer(text):
-                if len(matches) >= MAX_MATCHES:
-                    truncated = True        # 达到上限就停：剩下的不再收集，只报一句"还有更多"
-                    break
-                if time.monotonic() - started > TIME_BUDGET_SECONDS:
-                    timed_out = True
-                    break
-                matches.append(f"位置[{m.start()},{m.end()}]: '{m.group()}'")
-
-            if not matches:
-                if timed_out:
-                    return self.error(
-                        f"正则匹配超过 {TIME_BUDGET_SECONDS:.0f} 秒被中止（文本太长或表达式太慢）："
-                        "请把 pattern 写得更具体，或先在小段文本上验证。")
-                return self.success("无匹配结果")
-
-            if truncated:
-                head = f"匹配结果（只列出前 {len(matches)} 条，后面还有更多）:\n"
-            else:
-                head = f"匹配结果（共 {len(matches)} 条）:\n"
-            body = "".join(match + "\n" for match in matches)
-            if truncated:
-                body += ("（结果已截断：还有更多匹配没列出来。要看全部就把 pattern 写得更具体，"
-                         "或者先用更小的 input 验证正则）\n")
-            if timed_out:
-                body += (f"（匹配超时：已花 {TIME_BUDGET_SECONDS:.0f} 秒，后面的匹配没有继续收集）\n")
-            return self.success(head + body)
-        except Exception as e:
-            return self.error("正则表达式错误: " + str(e))
 
 
 def find_nested_quantifier(pattern: str) -> str | None:
@@ -4783,64 +3655,6 @@ _ALIASES = {
 }
 
 
-@tool
-class StringTool(ToolPlugin):
-    """字符串处理：大小写转换、trim、长度等"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.string"
-
-    @property
-    def name(self) -> str:
-        return "string_utils"
-
-    @property
-    def description(self) -> str:
-        return "字符串处理：大小写转换、trim、长度等"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "输入字符串"},
-                "action": {"type": "string", "description":
-                           "只支持这几个：upper / lower / trim / length / reverse"},
-            },
-            "required": ["input", "action"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            text = self.get_required_string_arg(args, "input")
-            action = self.get_required_string_arg(args, "action").lower().strip()
-        except ValueError as e:
-            return self.error(str(e))
-
-        action = _ALIASES.get(action, action)
-
-        if action == "upper":
-            return self.success(text.upper())
-        if action == "lower":
-            return self.success(text.lower())
-        if action == "trim":
-            return self.success(_java_trim(text))
-        if action == "length":
-            return self.success("长度: " + str(len(text)))
-        if action == "reverse":
-            return self.success(text[::-1])
-        return self.error(
-            "未知操作: " + action + "。本工具只支持：upper、lower、trim、length、reverse")
 
 
 def _java_trim(text: str) -> str:
@@ -5240,52 +4054,6 @@ from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, Tool
 MAX_COUNT = 1000
 
 
-@tool
-class UuidTool(ToolPlugin):
-    """生成UUID"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.uuid"
-
-    @property
-    def name(self) -> str:
-        return "generate_uuid"
-
-    @property
-    def description(self) -> str:
-        return "生成UUID"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "count": {"type": "integer", "description": f"生成数量（1-{MAX_COUNT}）",
-                          "default": 1},
-            },
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        count = self.get_int_arg(args, "count", 1)
-        if count < 1:
-            return self.error(f"count 必须是 >= 1 的整数（当前: {count}）")
-        clamped = count > MAX_COUNT
-        n = MAX_COUNT if clamped else count
-
-        out = "\n".join(str(_uuid.uuid4()) for _ in range(n))
-        if clamped:
-            out += f"\n（已截断：一次最多生成 {MAX_COUNT} 个，你要求的是 {count} 个）"
-        return self.success(out)
 
 
 # ========================================================================
@@ -5341,69 +4109,6 @@ class YamlSyntaxError(Exception):
         return "".join(out)
 
 
-@tool
-class YamlTool(ToolPlugin):
-    """YAML校验/格式化/压缩"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.code.yaml"
-
-    @property
-    def name(self) -> str:
-        return "yaml_process"
-
-    @property
-    def description(self) -> str:
-        return "YAML校验/格式化/压缩（真解析，语法错误会报出行列）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.CODE
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "YAML内容"},
-                "action": {"type": "string", "description":
-                           "validate=只校验语法 / format=规范化缩进 / minify=压成单行流式",
-                           "default": "format"},
-            },
-            "required": ["input"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            text = self.get_required_string_arg(args, "input")
-        except ValueError as e:
-            return self.error(str(e))
-
-        action = normalize_action(self.get_string_arg(args, "action", "format"))
-        if action is None:
-            return self.error("未知操作: " + self.get_string_arg(args, "action", "")
-                              + "。支持：validate（只校验语法）、format（格式化）、"
-                                "minify（压缩成单行）")
-
-        try:
-            docs = load_all(text)
-        except YamlSyntaxError as e:
-            return self.error("YAML语法错误: " + e.describe())
-        except Exception as e:
-            return self.error("YAML解析失败: " + str(e))
-
-        if not docs:
-            return self.success("YAML语法有效（空文档：整个输入没有任何内容）")
-        if action == "validate":
-            return self.success(f"YAML语法有效（{len(docs)} 个文档，顶层是 "
-                                f"{type_name(docs[0])}）")
-        return self.success(dump(docs, action == "minify"))
 
 
 def normalize_action(raw: str) -> str | None:
@@ -6346,20 +5051,7 @@ minimal_mode 对齐 Java 的 `AbstractToolPlugin.isAvailableInMode(MINIMAL)`：
 
 
 __all__ = [
-    "Base64Tool",
-    "CodeFormatTool",
-    "CronTool",
-    "DiffTool",
-    "EscapeTool",
-    "HashTool",
-    "JsonTool",
-    "MarkdownTool",
-    "NumberTool",
-    "RegexTool",
-    "StringTool",
     "TimestampTool",
-    "UuidTool",
-    "YamlTool",
 ]
 
 
@@ -6560,119 +5252,6 @@ _GIT_TIMEOUT = 30
 _BRANCH_PROBE_TIMEOUT = 15        # 对应 Java 的 drainAndWait(p, 15, UTF_8)
 
 
-@tool
-class GitBranchTool(ToolPlugin):
-    """查看、创建、切换 Git 分支。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.branch"
-
-    @property
-    def name(self) -> str:
-        return "git_branch"
-
-    @property
-    def description(self) -> str:
-        return "查看、创建、切换Git分支"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # Java 的 GitBranchTool 没有覆盖 getRequiredPermission() → 基类默认 WORKSPACE_WRITE
-        # （create/checkout/delete 都在动仓库）。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "仓库路径"},
-                "action": {"type": "string", "description": "list/create/checkout/delete"},
-                "branch": {"type": "string", "description": "分支名"},
-            },
-            "required": ["path", "action"],
-        }
-
-    def branch_exists(self, directory: str, branch: str) -> bool:
-        """本地有没有这个分支（`git branch --list <名字>` 输出非空就是有）。"""
-        try:
-            result = _git.run(["branch", "--list", branch], directory, _BRANCH_PROBE_TIMEOUT)
-        except Exception:                              # noqa: BLE001 —— 与 Java 一致：问不出来当没有
-            return False
-        if result is None:
-            return False                               # 超时（已强杀）：当成"没这个分支"
-        # 【退出码也要看】非仓库目录里这条命令 exit=128、stderr 是 "fatal: not a git
-        # repository"（stderr 已合并到 result[1]），只看"输出非空"会把 fatal 当成
-        # "分支已存在" → create 直接回"分支已存在，无需重复创建"，仓库根本没动。
-        return result[0] == 0 and bool(result[1].strip())
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            action = self.get_required_string_arg(args, "action").strip().lower()
-            branch = self.get_string_arg(args, "branch", "") or ""
-
-            dir_error = _git.check_directory(path)
-            if dir_error is not None:
-                return self.error(dir_error)
-            if not branch.strip():
-                branch = self.get_string_arg(args, "name", "") or ""
-
-            if action in ("create", "checkout"):
-                if not branch.strip():
-                    return self.error("缺少分支名：action=" + action
-                                      + " 要带 branch 参数（例如 branch=dev）")
-                if _git.is_empty_repository(path):
-                    result = _git.run(["checkout", "-b", branch], path, _GIT_TIMEOUT)
-                    if result is None:
-                        return self.error("git 命令超时（30 秒没返回）")
-                    exit_code, output = result
-                    if exit_code == 0:
-                        return self.success(
-                            "仓库还没有任何提交，已直接创建并切换到分支 " + branch
-                            + "（空仓库里 git branch 建不出分支，所以用 checkout -b；"
-                            + "git_commit 一次之后再 git_branch list 就能看到它）\n" + output)
-                    return self.error("创建分支失败（退出码 " + str(exit_code) + "）:\n" + output)
-
-            if action == "create" and self.branch_exists(path, branch):
-                return self.success("分支已存在，无需重复创建: " + branch)
-            if action == "delete" and not self.branch_exists(path, branch):
-                return self.success("分支本来就不存在（无需删除）: " + branch)
-
-            if action == "list":
-                command = ["branch", "-a"]
-            elif action == "create":
-                command = ["branch", branch]
-            elif action == "checkout":
-                command = ["checkout", branch]
-            elif action == "delete":
-                command = ["branch", "-d", branch]
-            else:
-                return self.error("未知操作: " + action + "（支持 list / create / checkout / delete）")
-
-            result = _git.run(command, path, _GIT_TIMEOUT)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            # 【必须看退出码】checkout 一个不存在的分支（pathspec 'typo' did not match）、
-            # branch -d 删未合并分支（not fully merged）、非仓库目录（fatal: not a git
-            # repository）全是 exit!=0 —— 原来这里一律 self.success，模型以为已切换/已删除，
-            # 后续步骤全建立在假状态上（同文件 git_log 早就写了这条，这里补齐）。
-            exit_code, output = result
-            if exit_code != 0:
-                if "not a git repository" in output:
-                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
-                return self.error("git " + " ".join(command)
-                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
-            return self.success(output if output else "操作完成")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git分支操作失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -6697,80 +5276,6 @@ from lionbox.tools.git import _git
 _GIT_TIMEOUT__tools_git_git_commit = 30
 
 
-@tool
-class GitCommitTool(ToolPlugin):
-    """暂存并提交更改。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.commit"
-
-    @property
-    def name(self) -> str:
-        return "git_commit"
-
-    @property
-    def description(self) -> str:
-        return "Git暂存并提交更改"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # 与 Java 一致：GitCommitTool 没有覆盖 getRequiredPermission()，取 AbstractToolPlugin
-        # 的默认值 WORKSPACE_WRITE。这里显式写出来 —— Python 基类的默认值是 READ_ONLY，
-        # 不写就会把"提交"标成只读。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Git仓库路径"},
-                "message": {"type": "string", "description": "提交信息"},
-                "addAll": {"type": "boolean", "description": "是否暂存所有更改", "default": True},
-            },
-            "required": ["path", "message"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            message = self.get_required_string_arg(args, "message")
-            # 【键不存在 = true，显式给了 false 才是 false】与 Java 的
-            # `!arguments.containsKey("addAll") || getBoolArg(…)` 同语义。
-            add_all = args.get("addAll") is None or self.get_bool_arg(args, "addAll", False)
-
-            if add_all:
-                added = _git.run(["add", "-A"], path, _GIT_TIMEOUT__tools_git_git_commit)
-                if added is None:
-                    return self.error(
-                        "git add 超时（30 秒没返回），已终止；请检查是否有文件被占用或索引被锁。")
-
-            result = _git.run(
-                ["-c", "user.name=Lion Code Agent",
-                 "-c", "user.email=agent@lionbox.local",
-                 "commit", "-m", message],
-                path, _GIT_TIMEOUT__tools_git_git_commit)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据")
-
-            exit_code, output = result
-            if exit_code == 0:
-                return self.success("提交成功:\n" + output)
-            # "没有改动"不是错误：报成错误会让模型以为参数写错了、反复重试（用户那次连试三次）。
-            if ("nothing to commit" in output or "no changes added" in output
-                    or "nothing added to commit" in output):
-                return self.success("（没有需要提交的改动：工作区是干净的，不用再试）")
-            if "not a git repository" in output:
-                return self.error("这不是 git 仓库（先 git_init）:\n" + output)
-            return self.error("提交失败:\n" + output)
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git提交失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -6791,82 +5296,6 @@ from lionbox.tools.git import _git
 _GIT_TIMEOUT__tools_git_git_diff = 30
 
 
-@tool
-class GitDiffTool(ToolPlugin):
-    """查看 Git 文件差异。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.diff"
-
-    @property
-    def name(self) -> str:
-        return "git_diff"
-
-    @property
-    def description(self) -> str:
-        return "查看Git文件差异"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Git仓库路径"},
-                "file": {"type": "string", "description": "指定文件（可选，会自动放到 -- 后面）"},
-                "rev": {"type": "string", "description": "版本/范围（可选），如 HEAD~1、main..dev"},
-                "cached": {"type": "boolean", "description": "查看暂存区差异", "default": False},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            file = self.get_string_arg(args, "file", "") or ""
-            cached = self.get_bool_arg(args, "cached", False)
-            rev = self.get_string_arg(args, "rev", "") or ""
-
-            command = ["diff"]
-            if cached:
-                command.append("--cached")
-            if rev.strip():
-                command.append(rev)        # 例如 HEAD~1 或 main..dev
-            if file.strip():
-                command.append("--")       # 见模块头注释：文件路径必须在 -- 后面
-                command.append(file)
-
-            result = _git.run(command, path, _GIT_TIMEOUT__tools_git_git_diff)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            # 【必须看退出码】rev 写错时 git diff 是 exit=128 + "fatal: ambiguous
-            # argument 'xyz'"，非仓库目录同样是 128 —— 原来把这段 fatal 文本当"差异内容"
-            # success 吐回去，模型会照着分析一段根本不是 diff 的报错文本。
-            exit_code, output = result
-            if exit_code != 0:
-                # 已知文案按**小写**比对：git 对 `diff` 在非仓库里回的是
-                # "warning: Not a git repository"（大写 N）+ 退出码 129，
-                # 只匹配小写会漏掉、退化成一句没有指向的"失败"。
-                low = output.lower()
-                if "ambiguous argument" in low:
-                    return self.error("rev 没解析出来（写错了？例如 HEAD~1 / main..dev）:\n"
-                                      + output)
-                if "not a git repository" in low:
-                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
-                return self.error("git diff 失败（退出码 " + str(exit_code) + "）:\n" + output)
-            return self.success(output if output else "（无差异）")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git差异获取失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -6889,64 +5318,6 @@ from lionbox.tools.git import _git
 _GIT_TIMEOUT__tools_git_git_init = 30
 
 
-@tool
-class GitInitTool(ToolPlugin):
-    """初始化 Git 仓库。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.init"
-
-    @property
-    def name(self) -> str:
-        return "git_init"
-
-    @property
-    def description(self) -> str:
-        return "初始化Git仓库"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # Java 的 GitInitTool 没有覆盖 getRequiredPermission() → 取基类默认 WORKSPACE_WRITE。
-        # 它在目标目录里写 .git/，显式写出来才不会在 Python 侧被默认成只读。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "目录路径"},
-                "bare": {"type": "boolean", "description": "是否创建裸仓库", "default": False},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            bare = self.get_bool_arg(args, "bare", False)
-            Path(path).mkdir(parents=True, exist_ok=True)   # 对应 Java 的 Files.createDirectories
-
-            command = ["init", "--bare"] if bare else ["init"]
-            result = _git.run(command, path, _GIT_TIMEOUT__tools_git_git_init)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            # 【退出码不能丢】目录只读/被占用/已有损坏的 .git 时 init 会 exit!=0，
-            # 原来照样拼上 "Git仓库已初始化:\n<fatal...>" —— 明确的谎报成功。
-            exit_code, output = result
-            if exit_code != 0:
-                return self.error("Git初始化失败（退出码 " + str(exit_code) + "）:\n"
-                                  + output + _git.hint(output))
-            return self.success("Git仓库已初始化:\n" + output)
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git初始化失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -6968,64 +5339,6 @@ from lionbox.tools.git import _git
 _GIT_TIMEOUT__tools_git_git_log = 30
 
 
-@tool
-class GitLogTool(ToolPlugin):
-    """查看 Git 提交历史。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.log"
-
-    @property
-    def name(self) -> str:
-        return "git_log"
-
-    @property
-    def description(self) -> str:
-        return "查看Git提交历史"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Git仓库路径"},
-                "count": {"type": "integer", "description": "显示条数", "default": 20},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            count = self.get_int_arg(args, "count", 20)
-
-            result = _git.run(["log", "--oneline", "-" + str(count)], path, _GIT_TIMEOUT__tools_git_git_log)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-
-            exit_code, output = result
-            output = output.strip()
-            if exit_code != 0:
-                if ("does not have any commits" in output or "unknown revision" in output
-                        or "bad default revision" in output):
-                    return self.success("（这个仓库还没有任何提交：先 create_file 建个文件，再 git_commit）")
-                if "not a git repository" in output:
-                    return self.error("这不是 git 仓库：" + str(path) + "（先 git_init，path 指向工作区目录）")
-                return self.error("git log 失败:\n" + output)
-            return self.success(output if output else "（无提交记录）")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git日志获取失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -7053,128 +5366,6 @@ _GIT_TIMEOUT__tools_git_git_remote = 30
 _REMOTE_PROBE_TIMEOUT = 10        # 对应 Java 的 drainAndWait(p, 10, UTF_8)
 
 
-@tool
-class GitRemoteTool(ToolPlugin):
-    """查看和管理 Git 远程仓库。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.remote"
-
-    @property
-    def name(self) -> str:
-        return "git_remote"
-
-    @property
-    def description(self) -> str:
-        return "查看和管理Git远程仓库"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # 不是只读：remote add / set-url / remove 都在写 .git/config（只读工作区里也能把
-        # origin 改指别处）—— 与 Java 的 getRequiredPermission() = WORKSPACE_WRITE 一致。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "仓库路径"},
-                "action": {"type": "string",
-                           "description": "list / show / add / remove / get-url / set-url"},
-                "name": {"type": "string", "description": "远程名（add/remove/show 用，如 origin）"},
-                "url": {"type": "string", "description": "仓库地址（add 用）"},
-            },
-            "required": ["path", "action"],
-        }
-
-    def infer_remote_name(self, repo_path: str, url: str) -> str:
-        """猜一个远程名：没配过远程就叫 origin，否则用地址里的仓库名（去掉 .git）。"""
-        try:
-            result = _git.run(["remote"], repo_path, _REMOTE_PROBE_TIMEOUT)
-            if result is not None and not result[1].strip():
-                return "origin"                # 一个远程都没有 → 惯例就是 origin
-        except Exception:                      # noqa: BLE001 —— 问不出来就按仓库名猜
-            pass
-        base = re.sub(r"[#?].*$", "", url)
-        base = re.sub(r"/+$", "", base)
-        index = max(base.rfind("/"), base.rfind(":"))
-        if 0 <= index < len(base) - 1:
-            base = base[index + 1:]
-        base = re.sub(r"\.git$", "", base).strip()
-        return base or "origin"
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            action = self.get_required_string_arg(args, "action")
-            name = (self.get_string_arg(args, "name", "") or "").strip()
-            url = (self.get_string_arg(args, "url", "") or "").strip()
-
-            if action in ("list", "ls"):
-                command = ["remote", "-v"]
-            elif action == "show":
-                # -n：只读本地配置，不联网。实测不加 -n 时 git 会去连远端、等凭据卡死。
-                command = ["remote", "show", "-n", name or "origin"]
-            elif action == "add":
-                if not url:
-                    return self.error("add 操作至少要给 url（仓库地址），例如 "
-                                      "{\"action\":\"add\",\"url\":\"https://github.com/you/repo.git\"}"
-                                      "；name 可以不给，会自动取 origin 或仓库名")
-                if not name:
-                    name = self.infer_remote_name(path, url)
-                command = ["remote", "add", name, url]
-            elif action in ("get-url", "geturl", "url"):
-                command = ["remote", "get-url", name or "origin"]
-            elif action in ("set-url", "seturl"):
-                if not url:
-                    return self.error("set-url 操作需要 url 参数")
-                command = ["remote", "set-url", name or "origin", url]
-            elif action in ("remove", "rm", "delete"):
-                if not name:
-                    return self.error("remove 操作需要 name（要删掉的远程名）")
-                command = ["remote", "remove", name]
-            else:
-                return self.error("未知操作: " + action
-                                  + "。支持 list / show / add / remove / get-url / set-url"
-                                  + "（add/set-url 需要 url，其余需要 name）")
-
-            result = _git.run(command, path, _GIT_TIMEOUT__tools_git_git_remote)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-
-            # 【退出码不能丢】remote add 重复加（error: remote origin already exists.）、
-            # remove 不存在的远程、非仓库目录（fatal）全是 exit!=0 而 stderr 已合并进
-            # output —— 原来"有输出就 success"，等于把 error 文本当成功结果还给模型。
-            exit_code, raw_output = result
-            output = raw_output.strip()
-            if exit_code != 0:
-                if "not a git repository" in output:
-                    return self.error("这不是 git 仓库（先 git_init）:\n" + output)
-                return self.error("git remote " + action
-                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
-            if output:
-                return self.success(output)
-            # 没输出 != 失败：git remote add / set-url / remove 成功时本来就不打印任何东西。
-            # 以前这里一律回"（无远程仓库）"，add 成功看着也像没加上。
-            if action == "add":
-                return self.success("已添加远程 " + name + " → " + url + "（git 成功时本来就没有输出）")
-            if action in ("set-url", "seturl"):
-                return self.success("已把远程 " + name + " 的地址改成 " + url)
-            if action in ("remove", "rm"):
-                return self.success("已删除远程 " + name)
-            if action in ("list", "ls"):
-                return self.success("（这个仓库没有配置任何远程）")
-            return self.success("（git 没有输出，命令已执行）")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git remote操作失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -7200,80 +5391,6 @@ _RESET_TIMEOUT = 60        # 对应 Java 的 drainAndWait(process, 60, UTF_8)
 _MODES = ("soft", "mixed", "hard", "keep", "merge")
 
 
-@tool
-class GitResetTool(ToolPlugin):
-    """撤销暂存 / 回退提交。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.reset"
-
-    @property
-    def name(self) -> str:
-        return "git_reset"
-
-    @property
-    def description(self) -> str:
-        return "撤销暂存/回退提交（--soft/--mixed/--hard，可选 ref）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # Java 的 GitResetTool 没有覆盖 getRequiredPermission() → 基类默认 WORKSPACE_WRITE。
-        # 危险度由审批策略决定（工具 id 是 tool.git.reset），不靠这里的等级。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Git仓库路径"},
-                "mode": {"type": "string",
-                         "description": "soft（只移动 HEAD，改动留在暂存区）/ mixed（默认，改动留在工作区）/ hard（丢弃改动）",
-                         "default": "mixed"},
-                "ref": {"type": "string", "description": "回退到哪个提交，默认 HEAD"},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            dir_error = _git.check_directory(path)
-            if dir_error is not None:
-                return self.error(dir_error)
-
-            mode = (self.get_string_arg(args, "mode", "mixed") or "mixed").lower().strip()
-            mode = mode.replace("-", "")               # 模型可能写成 --hard / -hard
-            if mode not in _MODES:
-                return self.error("未知模式: " + mode + "。只能是 soft / mixed / hard")
-
-            ref = self.get_string_arg(args, "ref", "HEAD") or ""
-            if not ref.strip():
-                ref = "HEAD"
-
-            command = ["reset", "--" + mode]
-            if ref != "HEAD":
-                command.append(ref)
-
-            result = _git.run(command, path, _RESET_TIMEOUT)
-            if result is None:
-                return self.error("git 命令超时（60 秒没返回）：多半在等网络或凭据")
-
-            code, output = result
-            head = ("git reset --" + mode + ("" if ref == "HEAD" else " " + ref)
-                    + "（退出码 " + str(code) + "）")
-            if code != 0:
-                return self.error(head + "\n" + output + _git.hint(output))
-            warn = "\n注意：--hard 已丢弃工作区改动。" if mode == "hard" else ""
-            return self.success(head + "\n" + (output if output.strip() else "（无输出）") + warn)
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("git reset 失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -7301,80 +5418,6 @@ _ALIASES__tools_git_git_stash = {
 }
 
 
-@tool
-class GitStashTool(ToolPlugin):
-    """Git stash 操作（保存/恢复/列出/删除）。"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:
-        return "tool.git.stash"
-
-    @property
-    def name(self) -> str:
-        return "git_stash"
-
-    @property
-    def description(self) -> str:
-        return "Git stash操作（保存/恢复/列出/删除）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        # Java 的 GitStashTool 没有覆盖 getRequiredPermission() → 基类默认 WORKSPACE_WRITE
-        # （stash push/pop 会改工作区文件）。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "仓库路径"},
-                "action": {"type": "string",
-                           "description": "push/pop/list/drop/apply（save 等于 push）"},
-                "message": {"type": "string", "description": "stash消息"},
-            },
-            "required": ["path", "action"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            action = self.get_required_string_arg(args, "action").lower().strip()
-            action = _ALIASES__tools_git_git_stash.get(action, action)          # 别名：save/stash/create 都是 push
-            message = self.get_string_arg(args, "message", "") or ""
-
-            if action == "push":
-                command = ["stash", "push", "-m", message] if message else ["stash", "push"]
-            elif action in ("pop", "list", "drop", "apply"):
-                command = ["stash", action]
-            else:
-                return self.error("未知操作: " + action)
-
-            result = _git.run(command, path, _GIT_TIMEOUT__tools_git_git_stash)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据。"
-                                  "远程操作用 -n 只看本地配置，或先确认网络/凭据。")
-            # 【退出码不能丢】stash pop 撞冲突（CONFLICT / local changes would be
-            # overwritten）、空栈上 drop/apply/pop（No stash entries found）全是 exit!=0，
-            # 原来一律 self.success —— 模型以为改动已恢复/暂存已删，工作区其实没动。
-            exit_code, output = result
-            if exit_code != 0:
-                if "No stash entries found" in output or "No stash entries" in output:
-                    return self.error("没有可执行的 stash（栈是空的）:\n" + output)
-                if "CONFLICT" in output or "would be overwritten" in output:
-                    return self.error("stash " + action + " 有冲突（退出码 "
-                                      + str(exit_code) + "，改动没有完整恢复，先看下面的输出）:\n"
-                                      + output)
-                return self.error("git stash " + action
-                                  + " 失败（退出码 " + str(exit_code) + "）:\n" + output)
-            return self.success(output if output else "操作完成")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git stash操作失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -7392,63 +5435,6 @@ from lionbox.tools.git import _git
 _GIT_TIMEOUT__tools_git_git_status = 30
 
 
-@tool
-class GitStatusTool(ToolPlugin):
-    """查看 Git 仓库状态：`git status --short`。"""
-
-    minimal_mode = False        # GIT 类工具在极简模式下一律不开放（Java: isAvailableInMode(MINIMAL)）
-
-    @property
-    def id(self) -> str:
-        return "tool.git.status"
-
-    @property
-    def name(self) -> str:
-        return "git_status"
-
-    @property
-    def description(self) -> str:
-        return "查看Git仓库状态"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.GIT
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Git仓库路径"},
-            },
-            "required": ["path"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        return self.runGitCommand(args, "status", "--short")
-
-    def runGitCommand(self, args: dict[str, Any], *command: str) -> ToolResult:
-        """对应 Java 的 `runGitCommand(arguments, gitExecutable(), …)`。"""
-        try:
-            path = self.resolve_path(self.get_required_string_arg(args, "path"))
-            result = _git.run(list(command), path, _GIT_TIMEOUT__tools_git_git_status)
-            if result is None:
-                return self.error("git 命令超时（30 秒没返回）：多半在等网络或凭据")
-            # 【退出码不能丢】非仓库目录里 git status --short 是 exit=128 +
-            # "fatal: not a git repository"，原来这句 fatal 被当"状态文本" success 吐回去，
-            # 模型会把它读成"仓库没改动"（同文件 git_log 对同一文案做了分流，这里对齐）。
-            exit_code, output = result
-            if exit_code != 0:
-                if "not a git repository" in output:
-                    return self.error("这不是 git 仓库（先 git_init，path 指向工作区目录）:\n"
-                                      + output)
-                return self.error("git status 失败（退出码 " + str(exit_code) + "）:\n" + output)
-            return self.success(output if output else "（无变更）")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("Git命令执行失败: " + str(exc) + _git.hint(str(exc)))
 
 
 # ========================================================================
@@ -7463,15 +5449,6 @@ class GitStatusTool(ToolPlugin):
 
 
 __all__ = [
-    "GitBranchTool",
-    "GitCommitTool",
-    "GitDiffTool",
-    "GitInitTool",
-    "GitLogTool",
-    "GitRemoteTool",
-    "GitResetTool",
-    "GitStashTool",
-    "GitStatusTool",
 ]
 
 
@@ -8294,101 +6271,6 @@ def shutdown() -> None:
             pass
 
 
-@tool
-class ShellBackgroundTool(ToolPlugin):
-    """在后台执行长时间运行的命令。"""
-
-    minimal_mode = True         # SHELL 类工具极简模式也开放
-
-    def __init__(self, workspace=None) -> None:
-        super().__init__(workspace)
-    @property
-    def key(self) -> str:
-        """后台进程登记表的键：**当前会话的工作区**（不是构造期那个）。
-
-        后台进程按工作区分组登记；用构造期的 `self.workspace`（`load_all()` 没传工作区时
-        退化成进程 CWD）会让"在这个会话里起的进程"和"在那个会话里查/停的进程"对不上，
-        也会把仓库根目录当成用户的工作区。见 `ToolPlugin.current_workspace()`。
-        """
-        return str(self.current_workspace())
-
-    @property
-    def id(self) -> str:
-        return "tool.shell.background"
-
-    @property
-    def name(self) -> str:
-        return "run_background"
-
-    @property
-    def description(self) -> str:
-        return "在后台执行长时间运行的命令"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.SHELL
-
-    @property
-    def permission(self) -> str:
-        # 与 Java 一致：ShellBackgroundTool 没有覆盖 getRequiredPermission()，
-        # 取 AbstractToolPlugin 的默认值 WORKSPACE_WRITE。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "命令"},
-                "workdir": {"type": "string", "description": "工作目录"},
-            },
-            "required": ["command"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            command = self.get_required_string_arg(args, "command")
-            workdir = self.get_string_arg(args, "workdir", "") or ""
-
-            directory: str | None = None
-            if workdir.strip():
-                resolved = self.resolve_path(workdir)
-                directory = str(resolved)
-                if not resolved.is_dir():
-                    return self.error("工作目录不存在: " + directory
-                                      + "（先 create_directory 建出来，或去掉 workdir 用工作区根目录）")
-            else:
-                directory = self.key
-
-            if is_windows__tools_shell_persistent_shell():
-                argv = ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
-                        "-Command", command]
-            else:
-                argv = ["sh", "-c", command]
-
-            # 【不能用 text=True + encoding="utf-8"】PS 5.1 子进程按系统 ANSI/OEM 代码页
-            # （中文机器 = CP936/GBK）往管道写字节，utf-8 + errors="replace" 会把中文输出
-            # 全解成 U+FFFD 乱码（"留最后 50 行方便排查"拿到的是废文本）。
-            # 这里按字节收，drain 里走 UTF-8 → GBK → 替换 的退路（同 read_text/git 输出）。
-            process = subprocess.Popen(
-                argv,
-                cwd=directory,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=NO_WINDOW,
-            )
-
-            tail: list[str] = []
-            drain(process.stdout, tail)
-            drain(process.stderr, tail)
-
-            pid = uuid.uuid4().hex[:8]
-            table(self.key)[pid] = process
-            tails(self.key)[pid] = tail
-
-            return self.success("后台进程已启动，PID: " + pid
-                                + "\n工作目录: " + (directory if directory else "(继承)")
-                                + "\n使用 stop_background 工具停止")
-        except Exception as exc:                       # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("启动后台进程失败: " + str(exc))
 
 
 # ========================================================================
@@ -8538,12 +6420,11 @@ _UNIX_TO_PS: tuple[tuple[str, str], ...] = (
     (r"\btail\s+-n\s+(\d+)\s+", r"Get-Content -Tail \1 "),                 # tail -n 5 file
 )
 
-#: 用了 cmd 的 `/x` 风格开关时，哪些命令名说明这是 cmd 语法
-_CMD_SWITCH_COMMANDS = ("rmdir", "rd", "del", "erase", "copy", "move", "xcopy",
-                        "robocopy", "attrib", "icacls", "net")
-
-#: cmd 独占的命令名（PowerShell 里没有同名 cmdlet 或语义完全不同）
-_CMD_BUILTINS = ("dir", "type", "findstr", "tasklist", "taskkill", "where", "ver", "set")
+#: 【2026-10 删掉了 looks_like_cmd】本机 shell 只有 PowerShell 一条路，原来那套
+#: "像不像 cmd 语法"的启发式（/x 开关 + cmd 内置命令名）连同它的两张名单一起删了：
+#: 启发式判错会把合法命令送进 `cmd /c` 必然失败，而恒走 PowerShell 更简单也更对
+#: （`dir`/`cd`/`ls`/`pwd` PowerShell 本来就有别名）。超时、输出截断、进程树 kill
+#: **都还在** —— 那些是安全网，不是启发式。
 
 
 def unix_to_powershell(command: str) -> str:
@@ -8559,28 +6440,6 @@ def unix_to_powershell(command: str) -> str:
     for pattern, replacement in _UNIX_TO_PS:
         c = re.sub(pattern, replacement, c)
     return c
-
-
-def looks_like_cmd(command: str) -> bool:
-    """这条命令像不像 cmd 语法。
-
-    判据：用了 cmd 的内置命令 + `/x` 风格开关（`rmdir /s /q`、`del /f`、`xcopy /e`…），
-    或者 cmd 独占的命令名（`dir`、`type`、`findstr`、`tasklist`、`taskkill`）。
-
-    【命令名后面只能是空白或结尾】本机 execute_command 走的是 **PowerShell**，
-    用 `\b` 判词边界会把 `Set-Content`、`Where-Object`、`Set-Item` 这些 cmdlet 的前缀
-    （`set`/`where` 后面紧跟 `-`，`\b` 照样成立）当成 cmd 语法送进 `cmd /c`，
-    合法命令必然失败（exit 9009）。裸 `set x=1` / `where.exe git` 才是 cmd。
-    """
-    if not command or not command.strip():
-        return False
-    c = command.strip().lower()
-    slash_switch = re.search(r"\s/[a-z](\s|$)", c) is not None
-    if slash_switch:
-        for name in _CMD_SWITCH_COMMANDS:
-            if re.search(r"\b" + name + r"\b", c):
-                return True
-    return re.match(r"^(" + "|".join(_CMD_BUILTINS) + r")(?:\s|$)", c) is not None
 
 
 @tool
@@ -8606,8 +6465,7 @@ class ShellExecuteTool(ToolPlugin):
 
     @property
     def description(self) -> str:
-        return ("在常驻终端里执行命令（同一工作区共用一个持续运行的 PowerShell 会话，"
-                "cd、变量、函数会保留到下一次调用）")
+        return "执行命令并返回输出。"
 
     @property
     def category(self) -> str:
@@ -8676,16 +6534,12 @@ class ShellExecuteTool(ToolPlugin):
 
             prepared = command
             if is_windows__tools_shell_persistent_shell():
-                # 【实测】模型两种写法都会用：
-                #   ls -la            → PowerShell 别名，用 cmd 会报"不是内部或外部命令"
-                #   rmdir /s /q xxx   → cmd 开关，用 PowerShell 会报"找不到与参数名称/q匹配的参数"
-                # 所以按写法分流：带 cmd 风格开关的交给 `cmd /c`（在常驻终端里跑，不另起 shell），
-                # 其余按 PowerShell 走，并把 Unix 写法翻译过来。
-                if looks_like_cmd(prepared):
-                    prepared = "cmd /c '" + prepared.replace("'", "''") + "'"
-                else:
-                    # PowerShell 5.1 不认 `&&`：模型很爱写 `ls && pwd`，换成 `;`
-                    prepared = unix_to_powershell(prepared).replace("&&", ";")
+                # 【2026-10：恒走 PowerShell】原来这里先用 looks_like_cmd 猜"这条像不像
+                # cmd 语法"，像就包一层 `cmd /c`。启发式判错会把合法命令送进 cmd 必然
+                # 失败，所以按用户指令整段删掉 —— 本机 shell 就是 PowerShell，
+                # `dir`/`cd`/`ls`/`pwd` 它本来就有别名；Unix 写法仍按模式翻译过来。
+                # PowerShell 5.1 不认 `&&`：模型很爱写 `ls && pwd`，换成 `;`
+                prepared = unix_to_powershell(prepared).replace("&&", ";")
 
             result = self.shell.run(str(self.current_workspace()), prepared, directory,
                                     timeout, max_output_bytes)
@@ -8755,12 +6609,6 @@ def _shared_shell() -> PersistentShell:
 # ========================================================================
 # 原模块 lionbox/tools/shell/shell_stop.py
 # ========================================================================
-"""停止后台进程工具 —— Java: `core/plugin/tool/shell/ShellStopTool.java`。
-
-【实测】模型常想"把后台的东西停掉"，但手上没有 pid（上一轮 run_background 的返回值
-它没记住），于是编一个 id 传进来 → 必然 ❌。所以允许不给 pid：这个工作区只有一个在跑
-就直接停它（这才是它真正想要的），多个就把名单回给它挑。
-"""
 
 
 from typing import Any
@@ -8768,98 +6616,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class ShellStopTool(ToolPlugin):
-    """停止后台运行的进程。"""
-
-    minimal_mode = True         # SHELL 类工具极简模式也开放
-
-    def __init__(self, workspace=None) -> None:
-        super().__init__(workspace)
-    @property
-    def key(self) -> str:
-        """后台进程登记表的键：**当前会话的工作区**（不是构造期那个）。
-
-        后台进程按工作区分组登记；用构造期的 `self.workspace`（`load_all()` 没传工作区时
-        退化成进程 CWD）会让"在这个会话里起的进程"和"在那个会话里查/停的进程"对不上，
-        也会把仓库根目录当成用户的工作区。见 `ToolPlugin.current_workspace()`。
-        """
-        return str(self.current_workspace())
-
-    @property
-    def id(self) -> str:
-        return "tool.shell.stop"
-
-    @property
-    def name(self) -> str:
-        return "stop_background"
-
-    @property
-    def description(self) -> str:
-        return "停止后台运行的进程"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.SHELL
-
-    @property
-    def permission(self) -> str:
-        # 与 Java 一致：ShellStopTool 没有覆盖 getRequiredPermission()，取基类默认值。
-        return PermissionLevel.WORKSPACE_WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "pid": {"type": "string",
-                        "description": "进程ID（省略则停掉最近启动的那个后台进程）"},
-            },
-            "required": [],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            # 【实测】两条后台命令正常跑完之后，不带 pid 的 stop_background 会回
-            # "有多个后台进程在跑，指定要停哪个" —— 名单里全是已经退出的进程，于是它谁也停不了。
-            # 先按"还活着吗"把死进程从表里清掉，再判断"现在有几个在跑"。
-            finished = reap_finished(self.key)
-            pid = self.get_string_arg(args, "pid", "") or ""
-
-            # 【实测】模型常常没有 pid（上一轮 run_background 的返回值它没记住）：
-            # 只有一个在跑就直接停它；多个就把名单回给它挑。
-            if not pid.strip() or pid.strip().lower() == "null":
-                ids = list(table(self.key))
-                if not ids:
-                    return self.error("当前没有在跑的后台进程（run_background 启动后会返回 pid）")
-                if len(ids) > 1:
-                    return self.error("有多个后台进程在跑，指定要停哪个：pid=" + " / ".join(ids))
-                pid = ids[0]
-
-            if pid in finished or was_stopped(self.key, pid):
-                # 它自己已经跑完了（或者上一条 stop_background 刚把它停掉）——
-                # 用户/模型要的就是"它别在跑"，直接当成功回，别报"未找到进程"
-                # （那会让人以为还得再想办法）。
-                return self.success("这个后台进程已经自己结束了，不用再停: " + pid)
-
-            process = forget(self.key, pid)
-            if process is None:
-                # 实测模型会拿一个自己编的 pid 来停（a7472d31）。
-                # 把当前真在跑的后台进程 id 列出来，它下一轮就能用对。
-                alive = list(table(self.key))
-                if not alive:
-                    return self.error("未找到进程: " + pid
-                                      + "（当前没有在跑的后台进程；先用 run_background 启动，"
-                                        "它会返回 pid）")
-                return self.error("未找到进程: " + pid
-                                  + "（当前在跑的后台进程: " + ", ".join(alive) + "）")
-
-            try:
-                process.kill()
-            except Exception:                      # noqa: BLE001 —— 刚好自己退出了也算停住了
-                pass
-            return self.success("进程已停止: " + pid)
-        except Exception as exc:                   # noqa: BLE001 —— 与 Java catch(Exception) 对齐
-            return self.error("停止进程失败: " + str(exc))
 
 
 # ========================================================================
@@ -8879,9 +6635,7 @@ class ShellStopTool(ToolPlugin):
 __all__ = [
     "PersistentShell",
     "RunResult",
-    "ShellBackgroundTool",
     "ShellExecuteTool",
-    "ShellStopTool",
     "TerminalLimits",
 ]
 
@@ -9107,11 +6861,6 @@ def _read_timeout(args: dict[str, Any]) -> int:
 # ========================================================================
 # 原模块 lionbox/tools/system/env_var.py
 # ========================================================================
-"""`get_env` —— 查看环境变量。
-
-【契约来源】`core/plugin/tool/system/EnvVarTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-"""
 
 
 import os
@@ -9120,52 +6869,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolPlugin, ToolResult, tool
 
 
-@tool
-class EnvVarTool(ToolPlugin):
-    """环境变量查看工具。"""
-
-    minimal_mode = False         # Java: ToolCategory.OTHER 在 MINIMAL 下不开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.system.env"
-
-    @property
-    def name(self) -> str:
-        return "get_env"
-
-    @property
-    def description(self) -> str:
-        return "查看环境变量"
-
-    @property
-    def category(self) -> str:
-        return "OTHER"
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        # Java 的 Map.of(type, properties) 里**没有 required**，别补上
-        return {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "变量名（可选，不填返回全部）"},
-            },
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            name = self.get_string_arg(args, "name", "") or None
-            if name is not None:
-                value = os.environ.get(name)
-                # Java 的 System.getenv 在 Windows 上大小写不敏感，Python 的 os.environ 也是
-                return self.success(f"{name}={value if value is not None else '（未设置）'}")
-            out = "".join(f"{k}={v}\n" for k, v in os.environ.items())
-            return self.success(out)
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"读取环境变量失败: {e}")
 
 
 # ========================================================================
@@ -9339,15 +7042,6 @@ def _resident_bytes() -> int:
 # ========================================================================
 # 原模块 lionbox/tools/system/working_dir.py
 # ========================================================================
-"""`working_directory` —— 获取或设置当前工作目录。
-
-【契约来源】`core/plugin/tool/system/WorkingDirTool.java` 逐行对照。
-id / name / description / parameters_schema 与 Java 版**逐字一致**。
-
-【只读】Java 的实现只返回 `System.getProperty("user.dir")`，**没有**设置功能
-（描述里那句"或设置"是历史遗留）。这里照抄实现，不多做：
-schema 里没有参数，`execute` 一律返回当前目录。
-"""
 
 
 import os
@@ -9356,41 +7050,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolPlugin, ToolResult, tool
 
 
-@tool
-class WorkingDirTool(ToolPlugin):
-    """工作目录工具。"""
-
-    minimal_mode = False         # Java: ToolCategory.OTHER 在 MINIMAL 下不开放
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.system.cwd"
-
-    @property
-    def name(self) -> str:
-        return "working_directory"
-
-    @property
-    def description(self) -> str:
-        return "获取或设置当前工作目录"
-
-    @property
-    def category(self) -> str:
-        return "OTHER"
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        # Java 的 Map.of("type", "object", "properties", Map.of()) —— 没有 required
-        return {"type": "object", "properties": {}}
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            return self.success(f"当前工作目录: {os.getcwd()}")
-        except Exception as e:      # noqa: BLE001 - 与 Java 的 catch(Exception) 对齐
-            return self.error(f"获取工作目录失败: {e}")
 
 
 # ========================================================================
@@ -9414,24 +7073,13 @@ class WorkingDirTool(ToolPlugin):
 
 __all__ = [
     "AskUserTool",
-    "EnvVarTool",
     "SystemInfoTool",
-    "WorkingDirTool",
 ]
 
 
 # ========================================================================
 # 原模块 lionbox/tools/web/dns_lookup.py
 # ========================================================================
-"""DNS 查询工具（对应 Java `core/plugin/tool/web/DnsLookupTool.java`）。
-
-【逐字一致的契约】id/name/description/parameters_schema 与 Java 一字不差；
-minimal_mode = False（Java 类别 WEB_SEARCH，极简模式不开放）。
-
-【行为对齐】Java 用 `InetAddress.getAllByName` 拿到**全部**地址（IPv4 + IPv6）逐个输出，
-这里用 `socket.getaddrinfo` 做同样的事，并按出现顺序去重（同一个地址被解析出多条记录时
-Java 也只列一次实际返回的地址列表）。
-"""
 
 
 import socket
@@ -9440,55 +7088,6 @@ from typing import Any
 from lionbox.plugins.base import PermissionLevel, ToolCategory, ToolPlugin, ToolResult, tool
 
 
-@tool
-class DnsLookupTool(ToolPlugin):
-    """DNS域名解析查询"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.web.dns"
-
-    @property
-    def name(self) -> str:
-        return "dns_lookup"
-
-    @property
-    def description(self) -> str:
-        return "DNS域名解析查询"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.WEB
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "hostname": {"type": "string", "description": "主机名"},
-            },
-            "required": ["hostname"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            hostname = self.get_required_string_arg(args, "hostname")
-            infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-            seen: list[str] = []
-            for info in infos:
-                address = _java_ip_text(info[4][0])
-                if address not in seen:
-                    seen.append(address)
-            out = ["域名: " + hostname]
-            out.extend("IP: " + address for address in seen)
-            return self.success("\n".join(out) + "\n")
-        except Exception as e:
-            return self.error("DNS查询失败: " + str(e))
 
 
 def _java_ip_text(address: str) -> str:
@@ -9684,63 +7283,6 @@ MAX_BODY_BYTES = 5 * 1024 * 1024
 DEFAULT_TIMEOUT = 30
 
 
-@tool
-class HttpGetTool(ToolPlugin):
-    """发送HTTP GET请求"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.http.get"
-
-    @property
-    def name(self) -> str:
-        return "http_get"
-
-    @property
-    def description(self) -> str:
-        return "发送HTTP GET请求"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.WEB
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "请求URL"},
-                "timeout": {"type": "integer", "description": "超时秒数", "default": 30},
-            },
-            "required": ["url"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            url = self.get_required_string_arg(args, "url")
-            timeout = self.get_int_arg(args, "timeout", DEFAULT_TIMEOUT)
-        except ValueError as e:
-            return self.error("HTTP请求失败: " + str(e))
-        request = urllib.request.Request(url, headers={
-            "User-Agent": UA,
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate",
-        })
-        try:
-            with urllib.request.urlopen(request, timeout=max(1, timeout)) as response:
-                body = read_body(response)
-                return self.success(f"HTTP {response.status}\n{body}")
-        except urllib.error.HTTPError as e:
-            # 非 2xx：状态码 + 响应体片段一起给模型（Java 侧就是这个行为）
-            body = read_body(e)
-            return self.success(f"HTTP {e.code}\n{body}")
-        except Exception as e:
-            return self.error("HTTP请求失败: " + str(e))
 
 
 def _inflate_partial(raw: bytes, wbits: int) -> bytes:
@@ -9844,77 +7386,6 @@ TIMEOUT__tools_web_fetch_url = 30
 DEFAULT_MAX_LENGTH = 10000
 
 
-@tool
-class UrlFetchTool(ToolPlugin):
-    """抓取URL内容"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.web.fetch"
-
-    @property
-    def name(self) -> str:
-        return "fetch_url"
-
-    @property
-    def description(self) -> str:
-        return "抓取URL内容"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.WEB
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL"},
-                "maxLength": {"type": "integer", "description": "最大内容长度",
-                              "default": 10000},
-            },
-            "required": ["url"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            url = self.get_required_string_arg(args, "url")
-            max_length = self.get_int_arg(args, "maxLength", DEFAULT_MAX_LENGTH)
-        except ValueError as e:
-            return self.error("抓取失败: " + str(e))
-        if max_length < 0:
-            max_length = 0
-
-        request = urllib.request.Request(url, headers={
-            "User-Agent": UA__tools_web_fetch_url,
-            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-        })
-
-        last: Exception | None = None
-        for attempt in (1, 2):        # 失败重试一次（网络抖动很常见）
-            try:
-                with urllib.request.urlopen(request, timeout=TIMEOUT__tools_web_fetch_url) as response:
-                    body = _body(response)
-                    head = f"HTTP {response.status}（第 {attempt} 次尝试）\n"
-                    return self.success(head + _cut(body, max_length))
-            except urllib.error.HTTPError as e:
-                # 非 2xx：不重试，把状态码 + 响应体一起给模型（Java 侧就是这个行为）
-                head = (f"HTTP {e.code}（第 {attempt} 次尝试）\n"
-                        "（非 2xx：站点可能要求登录/被墙/需要换 UA）\n")
-                return self.success(head + _cut(_body(e), max_length))
-            except Exception as e:
-                last = e
-        return self.error("抓取失败（重试过 1 次）: "
-                          + ("未知原因" if last is None else str(last))
-                          + "\n可以改用 http_get（同样的 GET，超时设置不同）或 web_search "
-                            "搜这个地址。")
 
 
 def _body(response) -> str:
@@ -10124,69 +7595,6 @@ UA__tools_web_http_post = "okhttp/4.12.0"
 DEFAULT_TIMEOUT__tools_web_http_post = 15
 
 
-@tool
-class HttpPostTool(ToolPlugin):
-    """发送HTTP POST请求"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.http.post"
-
-    @property
-    def name(self) -> str:
-        return "http_post"
-
-    @property
-    def description(self) -> str:
-        return "发送HTTP POST请求"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.WEB
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.WRITE
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "请求URL"},
-                "body": {"type": "string", "description": "请求体"},
-                "contentType": {"type": "string", "description": "内容类型",
-                                "default": "application/json"},
-            },
-            "required": ["url", "body"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            url = self.get_required_string_arg(args, "url")
-            body = self.get_required_string_arg(args, "body")
-            content_type = self.get_string_arg(args, "contentType", "application/json")
-        except ValueError as e:
-            return self.error("HTTP请求失败: " + str(e))
-
-        # OkHttp 的 RequestBody.create(String, MediaType) 在没有 charset 时会补一句
-        # "; charset=utf-8"（正文按 UTF-8 编码）—— 实测 Java 发出的头就是
-        # "application/json; charset=utf-8"，这里对齐，免得两边站点看到的请求不一样。
-        if content_type and "charset=" not in content_type.lower():
-            content_type = content_type + "; charset=utf-8"
-
-        request = urllib.request.Request(
-            url, data=body.encode("utf-8"), method="POST",
-            headers={"Content-Type": content_type, "User-Agent": UA__tools_web_http_post,
-                     "Accept-Encoding": "gzip, deflate"})
-        try:
-            with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT__tools_web_http_post) as response:
-                return self.success(f"HTTP {response.status}\n{_body__tools_web_http_post(response)}")
-        except urllib.error.HTTPError as e:
-            return self.success(f"HTTP {e.code}\n{_body__tools_web_http_post(e)}")
-        except Exception as e:
-            return self.error("HTTP请求失败: " + str(e))
 
 
 def _body__tools_web_http_post(response) -> str:
@@ -10228,73 +7636,6 @@ TIMEOUT__tools_web_translate = 25
 UA__tools_web_translate = "Lion Code/1.3 (translate tool)"
 
 
-@tool
-class TranslateTool(ToolPlugin):
-    """文本翻译"""
-
-    minimal_mode = False
-
-    @property
-    def id(self) -> str:  # noqa: A003
-        return "tool.web.translate"
-
-    @property
-    def name(self) -> str:
-        return "translate"
-
-    @property
-    def description(self) -> str:
-        return "文本翻译（免密钥，走公开接口；也可用它把中文译成英文再搜）"
-
-    @property
-    def category(self) -> str:
-        return ToolCategory.WEB
-
-    @property
-    def permission(self) -> str:
-        return PermissionLevel.READ_ONLY
-
-    def parameters_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "待翻译文本"},
-                "from": {"type": "string", "description": "源语言，默认 auto",
-                         "default": "auto"},
-                "to": {"type": "string", "description": "目标语言，默认 zh", "default": "zh"},
-            },
-            "required": ["text"],
-        }
-
-    def execute(self, args: dict[str, Any]) -> ToolResult:
-        try:
-            text = self.get_required_string_arg(args, "text")
-        except ValueError as e:
-            return self.error(str(e))
-
-        to = self.get_string_arg(args, "to", "zh")
-        source = self.get_string_arg(args, "from", "auto")
-        if to is None or to.strip() == "":
-            to = "zh"
-        if source is None or source.strip() == "" or source.lower() == "auto":
-            source = _guess_source(text, to)
-
-        pieces: list[str] = []
-        done = 0
-        for chunk in _split(text, CHUNK):
-            piece = _translate_chunk(chunk, source, to)
-            if piece is None:
-                if not pieces:
-                    return self.error(
-                        "翻译没成功（免费接口没响应或超时）。可以先试短一点的一段，"
-                        f"或直接把原文交给模型自己翻。原文长度 {len(text)} 字符。")
-                break        # 部分成功：把已经翻好的给出去，并标注
-            pieces.append(piece)
-            done += 1
-        if not pieces:
-            return self.error("翻译没成功（没拿到内容）。")
-        tail = "\n（注：只翻好了前面一部分，原文较长）" if done * CHUNK < len(text) else ""
-        return self.success(f"{source} → {to}：\n" + "".join(pieces) + tail)
 
 
 def _translate_chunk(chunk: str, source: str, to: str) -> str | None:
@@ -10466,7 +7807,7 @@ class WebSearchTool(ToolPlugin):
             except Exception as e:
                 tried.append(f"{candidate}：结果页解析失败（{e}）")
         return self.error(f"没搜到结果（{query}）。尝试过 → " + "；".join(tried)
-                          + "\n建议：换个更短的关键词；或用 fetch_url 直接打开某个具体网址。")
+                          + "\n建议：换个更短的关键词；已知具体网址就用 download_file 把它拉下来看。")
 
 
 # ==========================================================================
@@ -10758,13 +8099,8 @@ minimal_mode 对齐 `isAvailableInMode(MINIMAL)`：这一批在 Java 里类别�
 
 
 __all__ = [
-    "DnsLookupTool",
     "DownloadTool",
     "HeadlessBrowser",
-    "HttpGetTool",
-    "HttpPostTool",
-    "TranslateTool",
-    "UrlFetchTool",
     "WebSearchTool",
 ]
 
@@ -10791,18 +8127,19 @@ r"""工具补全：把提示词里**广告出去但没有实现**的工具做成
 【为什么单独一个文件】main.py 是 1.1 MB 的内联引擎。新增工具写在独立模块里、
 只改 build_registry 两行来注册，风险最小，也方便逐批测。
 
-【盘点结论（实测）】
-  A 广告出去 57 个（TOOL_PROMPT_HINTS 57 + 别名表正名 55）
-  B 实际注册 8 个
-  C 其中仍是桩：execute_command（只回显 "$ "）、move_file（只查参数）、
-              context_window（"窗口 = None"）、web_search（"搜索结果"）
-  A − B = **49 个广告了但没注册** —— 模型喊了只会得到"未找到工具"
+【2026-10 起的口径：工具砍到 21 个】下面这段"57 → 8 → 缺 49"的盘点是**历史记录**，
+保留是因为它解释了这批真实现的来历；现在的权威名单只有三处，且必须一致：
+  · main.py `TOOL_PROMPT_HINTS`（21 个）
+  · main.py `_alias(...)` 表（只指向存活工具）
+  · `build_registry()` / `load_all()` 实际注册（21 个，另加插件的 skill_load）
+被砍掉的 36 个（git 全家、编码/格式化、网络三件套、后台进程、list_directory /
+move_file / word_count / file_info / working_directory / change_permissions …）
+**类定义与注册都已删除**，别再往回加。
 
-【本模块补齐（第一批：编码 Agent 最常用的 18 个）】
-  execute_command / search_in_files / glob_files / line_count / word_count /
-  file_info / directory_tree / modify_file / create_file / append_file /
-  delete_file / copy_file / move_file / create_directory / system_info /
-  timestamp / working_directory / fetch_url
+【本模块（第一批）保留下来的】
+  execute_command / search_in_files / glob_files / line_count /
+  directory_tree / modify_file / create_file / append_file /
+  delete_file / copy_file / create_directory / system_info / timestamp
 
 【约定】
   · 路径一律走 `self.resolve_path()`（沙箱的工作区约束，别绕过去）
@@ -10932,19 +8269,7 @@ def _build_batch1(NS: dict) -> list:
 
         @property
         def description(self):
-            return (
-                "执行命令并拿到输出（装了什么、跑测试、用 git 等都用它）。\n"
-                "用法：\n"
-                "- 本机是 **Windows + PowerShell**：没有 `which`（用 **`where.exe 名字`** —— 裸 `where` 是 PowerShell 的 Where-Object 别名，什么都不输出）、"
-                "没有 `python3`（用 `python`）、**不要用 `&&` / `||`**"
-                "（PS 5.1 不认，用 `A; if ($?) { B }`）。\n"
-                "- 一条 command 只做一件相关的事；互不相关的拆成多个调用，一轮里一起发。\n"
-                "- 命令输出会被收走并截断，**不要用 `2>&1` / `2>/dev/null`**。\n"
-                "- 非零退出码会如实报给你（不是失败就别假装成功）。\n"
-                "- 危险命令（格式化、递归删根目录等）会被直接拒绝。\n"
-                "- 长驻进程（服务器、watch）用 run_background，别在这里等它。\n"
-                "- 可选 timeout（秒，默认 60）；超时会杀掉进程并如实报告。"
-            )
+            return "执行命令并返回输出。"
 
         @property
         def category(self): return ToolCategory.SHELL
@@ -11016,7 +8341,7 @@ def _build_batch1(NS: dict) -> list:
                 return ToolResult.fail(
                     f"命令超时（{timeout:.0f}s）已被终止（含它拉起的子进程）：{cmd}\n"
                     + ("".join(seg + "\n" for seg in partial))
-                    + f"（耗时 {dt:.1f}s；要跑长时间任务请用 run_background）")
+                    + f"（耗时 {dt:.1f}s；长时间任务请拆成会自己结束的命令）")
             dt = __import__("time").time() - t0
 
             stdout = dec(out_bytes or b"")
@@ -11055,7 +8380,7 @@ def _build_batch1(NS: dict) -> list:
                 "- `pattern` 必填；`path` 默认当前目录；`glob` 限定文件名（如 `*.py`）。\n"
                 "- `regex: true` 时按正则解释 pattern。\n"
                 "- 返回 `文件:行号: 内容`，最多 200 条；要读上下文再用 read_file / head_tail_file。\n"
-                "- **不要**用它列目录（用 list_directory / directory_tree）。"
+                "- **不要**用它列目录（用 directory_tree）。"
             )
 
         @property
@@ -11183,7 +8508,7 @@ def _build_batch1(NS: dict) -> list:
                 "树形展示目录结构（了解项目布局时用它）。\n"
                 "用法：\n"
                 "- `maxDepth` 默认 2；**别一下开到很深**（大仓库会吃掉上下文）。\n"
-                "- 只看一层用 list_directory；找特定文件用 glob_files。\n"
+                "- 只想看某一层就调小 maxDepth；找特定文件用 glob_files。\n"
                 "- 默认跳过 .git / node_modules / __pycache__ 等噪音目录。"
             )
 
@@ -11275,49 +8600,11 @@ def _build_batch1(NS: dict) -> list:
         return ToolResult.ok(f"{p}\n行数 {len(lines)}（其中空行 "
                              f"{sum(1 for x in lines if not x.strip())}）")
 
-    def _do_word_count(self, p):
-        if not p.is_file():
-            return ToolResult.fail("不是文件: " + str(p))
-        try:
-            text = p.read_bytes().decode("utf-8", "replace")
-        except OSError as e:
-            return ToolResult.fail("读不了: " + str(e))
-        words = text.split()
-        return ToolResult.ok(f"{p}\n词数 {len(words)}，字符（含空白）{len(text)}，"
-                             f"字符（不含空白）{len(text) - sum(1 for c in text if c.isspace())}")
 
-    def _do_file_info(self, p):
-        if not p.exists():
-            return ToolResult.fail("不存在: " + str(p))
-        try:
-            st = p.stat()
-        except OSError as e:
-            return ToolResult.fail("取不到信息: " + str(e))
-        kind = "目录" if p.is_dir() else ("文件" if p.is_file() else "其它")
-        mt = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        size = "" if p.is_dir() else f"\n大小 {_fmt_bytes(st.st_size)}（{st.st_size} 字节）"
-        extra = ""
-        if p.is_file():
-            try:
-                # 【只读需要的那 2MB】原来 `p.read_bytes()[:2_000_000]` 是把**整个文件**
-                # 读进内存再切片 —— GB 级文件为了算个"前 2MB"哈希瞬时吃掉等量内存。
-                with open(p, "rb") as fh:
-                    h = hashlib.sha256(fh.read(2_000_000)).hexdigest()[:16]
-                extra = f"\nsha256(前2MB) {h}"
-            except OSError:
-                pass
-        return ToolResult.ok(f"{p}\n类型 {kind}{size}\n修改时间 {mt}{extra}")
 
     _stat_tool("line_count", "tool.file.linecount",
                "数文件行数（用户问「多少行」时用它）。空行数也一并给出。",
                _do_line_count)
-    _stat_tool("word_count", "tool.file.wordcount",
-               "数文件的词数/字符数。",
-               _do_word_count)
-    _stat_tool("file_info", "tool.file.info",
-               "看文件/目录的元信息（类型、大小、修改时间、哈希）。\n"
-               "要看内容用 read_file；要列目录用 list_directory。",
-               _do_file_info)
 
     # ────────────────────────────── 写操作 ──────────────────────────────
     @tool
@@ -11516,7 +8803,7 @@ def _build_batch1(NS: dict) -> list:
                 "删除文件（危险，需要授权）。\n"
                 "用法：\n"
                 "- **只能删文件或空目录**；非空目录会被拒绝（避免误删一整棵树）。\n"
-                "- 删之前先确认路径（file_info / list_directory）；不确定就不要删。\n"
+                "- 删之前先用 read_file / directory_tree 确认路径；不确定就不要删。\n"
                 "- 用户没明确要求删除时，**不要**主动删任何东西。"
             )
 
@@ -11603,8 +8890,6 @@ def _build_batch1(NS: dict) -> list:
 
     _copy_move("copy_file", "tool.file.copy",
                "复制文件或目录（目标已存在会拒绝，不覆盖）。", move=False)
-    _copy_move("move_file", "tool.file.move",
-               "移动/重命名文件或目录（危险，需要授权；目标已存在会拒绝）。", move=True)
 
     @tool
     class CreateDirectoryTool(ToolPlugin):
@@ -11737,36 +9022,6 @@ def _build_batch1(NS: dict) -> list:
                                  + f"（{now.strftime('%A')}，本地时区，UTC"
                                  + datetime.datetime.now().astimezone().strftime("%z") + "）")
 
-    @tool
-    class WorkingDirectoryTool(ToolPlugin):
-        """看当前工作目录。"""
-
-        @property
-        def id(self): return "tool.system.cwd"
-
-        @property
-        def name(self): return "working_directory"
-
-        @property
-        def description(self):
-            return ("看当前工作目录（不确定自己在哪个目录时用它）。")
-
-        @property
-        def category(self): return ToolCategory.SYSTEM
-
-        @property
-        def permission(self): return PermissionLevel.READ_ONLY
-
-        def parameters_schema(self):
-            return {"type": "object", "properties": {}, "required": []}
-
-        def execute(self, args):
-            lines = ["进程目录 " + os.getcwd()]
-            try:
-                lines.append("工作区 " + str(self.resolve_path(".")))
-            except Exception as e:                         # noqa: BLE001
-                lines.append("工作区取不到: " + type(e).__name__)
-            return ToolResult.ok("\n".join(lines))
 
     @tool
     class ContextWindowTool(ToolPlugin):
@@ -11817,88 +9072,26 @@ def _build_batch1(NS: dict) -> list:
                     "默认 16384，可用 /context-limit 命令调整。")
             return ToolResult.ok("\n".join(info))
 
-    @tool
-    class FetchUrlTool(ToolPlugin):
-        """抓取一个网址的内容。"""
+    # ── 权限等级覆盖（一处收口，便于复查）──────────────────────────────────
 
-        @property
-        def id(self): return "tool.web.fetch"
+    # 【为什么需要】有些工具没声明 permission（属性是 None，不是基类默认值），
+    # 而权限门禁判的是 `required == PermissionLevel.READ_ONLY` —— None 不成立，
+    # 于是在**只读工作区**里连纯读操作都被拦。这里按名字统一纠正。
 
-        @property
-        def name(self): return "fetch_url"
-
-        @property
-        def description(self):
-            return ("抓取指定 URL 的文本内容（已知确切网址时用它）。\n"
-                    "用法：\n"
-                    "- 只知道要查什么、不知道网址，用 web_search。\n"
-                    "- 返回会被截断（默认前 20000 字符）。\n"
-                    "- 网络不通/超时会**如实报错**，不要据此编内容。")
-
-        @property
-        def category(self): return ToolCategory.WEB
-
-        @property
-        def permission(self): return PermissionLevel.EXECUTE
-
-        def parameters_schema(self):
-            return {"type": "object",
-                    "properties": {"url": {"type": "string"},
-                                   "maxChars": {"type": "number"}},
-                    "required": ["url"]}
-
-        def execute(self, args):
-            url = str(args.get("url") or "").strip()
-            if not url:
-                return ToolResult.fail("缺少 url 参数")
-            if not re.match(r"^https?://", url, re.IGNORECASE):
-                return ToolResult.fail("只支持 http/https 网址: " + url)
-            try:
-                limit = int(args.get("maxChars") or 20_000)
-            except (TypeError, ValueError):
-                limit = 20_000
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; LionCode/1.0)"})
-            try:
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    raw = r.read(4_000_000)
-                    ctype = r.headers.get("Content-Type", "")
-            except urllib.error.HTTPError as e:
-                return ToolResult.fail(f"HTTP {e.code} {e.reason}（{url}）")
-            except urllib.error.URLError as e:
-                return ToolResult.fail("网络不通: " + str(e.reason) + "（" + url + "）")
-            except Exception as e:                         # noqa: BLE001
-                return ToolResult.fail("抓取失败: " + type(e).__name__ + ": " + str(e))
-            text = raw.decode("utf-8", "replace")
-            if "html" in ctype.lower():
-                text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
-                text = re.sub(r"(?s)<[^>]+>", " ", text)
-                text = re.sub(r"[ \t\r\f\v]+", " ", text)
-                text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
-            return ToolResult.ok(_truncate(text, limit) if len(text) > limit else text)
-    # ── 权限等级覆盖（本次修正）──────────────────────────────────────────
-
-    # 【为什么需要】核查发现 20 个工具没声明 permission（属性是 None，不是基类
-
-    # 默认值），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` ——
-
-    # None 不成立，于是在**只读工作区**里连 base64/hash/json_format 这类纯计算
-
-    # 都被拦；git_status/diff/log/branch 又错标成 EXECUTE。这里按名字统一纠正，
-
-    # 一处收口、便于复查（不改各工具类本身，避免散落 24 处）。
+    # 【2026-10：只留下还活着的工具】工具砍到 21 个之后，指向已删工具的条目全部清掉
+    # （原来那 29 条里只剩 6 条还查得到），否则看表的人会以为那些工具还在。
 
     _LEVEL_OVERRIDE = {}
 
-    for _n in ['base64', 'hash', 'generate_uuid', 'escape_string', 'string_utils', 'regex_test', 'number_convert', 'diff_text', 'json_format', 'yaml_process', 'cron_parse', 'format_code', 'markdown_render', 'translate', 'dns_lookup', 'get_env', 'http_get', 'ask_user', 'working_directory', 'context_window', 'system_info', 'timestamp', 'git_status', 'git_diff', 'git_log', 'git_branch']:
+    for _n in ['ask_user', 'context_window', 'system_info', 'timestamp']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
 
-    for _n in ['git_add', 'git_commit', 'git_stash', 'git_init', 'git_remote', 'context_prune']:
+    for _n in ['context_prune']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
 
-    for _n in ['delete_file', 'move_file', 'change_permissions', 'git_reset']:
+    for _n in ['delete_file']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
 
@@ -11965,20 +9158,14 @@ def register_extra(reg, NS: dict) -> int:
 
 
 # -*- coding: utf-8 -*-
-r"""工具补全 第二批：把**剩下 33 个广告名**全部做成真实现。
+r"""工具补全 第二批：**2026-10 工具削减后只剩 3 个**。
 
-【盘点（脚本从代码取的权威名单，不是猜）】
-  A 广告 57 个 = 别名表正名 55 ∪ TOOL_PROMPT_HINTS 57
-  B 已注册 24 个（第一批 工具集.py ✓）
-  缺 33 个 —— 本模块补齐：
-    git 类(9)   git_status git_diff git_log git_commit git_branch git_init
-                git_remote git_reset git_stash
-    网络类(4)   http_get http_post download_file dns_lookup
-    编码文本(8) base64 hash generate_uuid escape_string string_utils
-                regex_test number_convert diff_text
-    格式数据(6) json_format yaml_process cron_parse format_code markdown_render translate
-    进程类(2)   run_background stop_background
-    杂项(4)     get_env context_prune ask_user change_permissions
+【盘点的口径变了】原来是"广告 57 个 / 已注册 24 个 / 缺 33 个"，按用户指令砍到
+**21 个**之后，这批里留下的只有：
+    下载与上下文(3)   download_file context_prune ask_user
+被删的 22 个（git 9 + 网络 4 + 编码文本 + 格式数据 + 后台 2 + get_env +
+change_permissions）连同它们的类定义、工厂调用（`git_tool(...)`）一起删掉了 ——
+**别照着下面那段历史名单往回加**。
 
 【三条硬约定（照第一批）】
   · 路径走 `self.resolve_path()`（沙箱的工作区约束，不绕过去）
@@ -12122,129 +9309,16 @@ def _build_batch2(NS: dict) -> list:
         out.append(cls)
         return cls
 
-    def git_tool(name, ident, desc, params, build_args):
-        """git 类工具的公共壳：统一处理"不是仓库"与"git 不存在"。"""
-        @tool
-        class _Git(ToolPlugin):
-            @property
-            def id(self): return ident
-            @property
-            def name(self): return name
-            @property
-            def description(self): return desc
-            @property
-            def category(self): return CAT_SHELL
-            @property
-            def permission(self): return LV_EXEC
-            def parameters_schema(self): return {"type": "object", "properties": params,
-                                                 "required": []}
-            def execute(self, args):
-                cwd = str(self.resolve_path(args.get("path") or "."))
-                # 【防呆 · 血的教训】目标路径存在但是**文件**时直接拒绝。
-                # 曾经发生过：有人以 path="main.py" 调 git 类工具，而预检
-                # `git rev-parse --is-inside-work-tree` 对**外层仓库的子目录**会通过
-                # （main.py/ 若已被建成目录，它就在外层工作树里 → rc=0），
-                # 于是 git init 真的在里面跑起来，把 1.1 MB 的 main.py 覆盖成一个空仓库。
-                # 这条守卫对所有走这个壳的 git 工具生效。
-                if os.path.isfile(cwd):
-                    return ToolResult.fail(
-                        f"目标路径是一个**文件**，不是目录：{cwd}\n"
-                        "（拒绝执行：把文件当仓库目录会破坏它。要操作这个文件请用 read_file / modify_file）")
-                rc, _ = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd, 20)
-                if rc != 0:
-                    return ToolResult.fail(
-                        f"当前目录不是 git 仓库：{cwd}\n"
-                        "（要用 git_init 初始化，或把 path 指向仓库目录）")
-                argv = build_args(args)
-                if isinstance(argv, str):                  # 参数校验失败
-                    return ToolResult.fail(argv)
-                rc, text = _run(["git"] + argv, cwd, _int_b2(args.get("timeout"), 60))
-                body = text or "(无输出)"
-                if rc != 0:
-                    return ToolResult.fail(f"git {' '.join(argv)} 退出码 {rc}：\n{body}")
-                return ToolResult.ok(body)
-        _Git.__name__ = name + "_tool"
-        return _Git
 
     # ───────────────────────────── git 类（9） ─────────────────────────────
     P_PATH = {"path": {"type": "string", "description": "仓库目录，默认当前目录"},
               "timeout": {"type": "number"}}
 
-    git_tool("git_status", "tool.git.status",
-             "看仓库当前状态（分支 + 改动清单）。用户问'改了哪些文件/有没有未提交'就用它。",
-             P_PATH, lambda a: ["status", "--short", "--branch"])
 
-    git_tool("git_diff", "tool.git.diff",
-             "看改动内容。默认看工作区未暂存的改动；staged=true 看已暂存的。"
-             "只想知道改了哪些文件、不需要内容时用 git_status（更快）。",
-             {**P_PATH, "staged": {"type": "boolean"}, "file": {"type": "string"}},
-             lambda a: (["diff", "--cached"] if a.get("staged") else ["diff"])
-                       + ([str(a["file"])] if a.get("file") else []))
 
-    git_tool("git_log", "tool.git.log",
-             "看提交历史（默认最近 20 条，一行一条）。想看某文件的改动用 git_diff 配 file。",
-             {**P_PATH, "limit": {"type": "number"}},
-             # limit 乱值/0/负数都不能让整次调用炸掉或拼出 `git log -0`：兜成 >=1
-             lambda a: ["log", "-" + str(max(1, _int_b2(a.get("limit"), 20) or 20)),
-                        "--oneline", "--decorate"])
 
-    def _commit_args(a):
-        msg = str(a.get("message") or "").strip()
-        if not msg:
-            return "缺少 message 参数（提交必须写提交信息）"
-        return ["commit", "-m", msg]
 
-    @tool
-    class GitCommitTool(ToolPlugin):
-        """git 提交（**两步：先 add -A，再 commit**）。"""
-        @property
-        def id(self): return "tool.git.commit"
-        @property
-        def name(self): return "git_commit"
-        @property
-        def description(self):
-            return ("提交改动。默认先把所有改动 `add -A` 再提交（add_all=false 只提交已暂存的）。\n"
-                    "空暂存区会**如实报\"没有可提交的改动\"**，不会假装成功。\n"
-                    "失败时把 git 的原话带回来，不吞掉。")
-        @property
-        def category(self): return CAT_SHELL
-        @property
-        def permission(self): return LV_EXEC
-        def parameters_schema(self):
-            return {"type": "object",
-                    "properties": {"path": {"type": "string"},
-                                   "message": {"type": "string"},
-                                   "add_all": {"type": "boolean"},
-                                   "timeout": {"type": "number"}},
-                    "required": ["message"]}
-        def execute(self, args):
-            cwd = str(self.resolve_path(args.get("path") or "."))
-            rc, _ = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd, 20)
-            if rc != 0:
-                return ToolResult.fail(f"当前目录不是 git 仓库：{cwd}")
-            msg = str(args.get("message") or "").strip()
-            if not msg:
-                return ToolResult.fail("缺少 message 参数（提交必须写提交信息）")
-            # 第一步：暂存（可关）。**这一步以前漏了** —— 那时 build_args 只返回
-            # ["add","-A"]，而公共外壳只跑一条命令，于是"提交"实际只做了 add，
-            # 工具却回报成功（自测抓到的：git_commit 之后 git_log 里没有那条提交）。
-            if args.get("add_all") is not False:
-                rc, text = _run(["git", "add", "-A"], cwd, 60)
-                if rc != 0:
-                    return ToolResult.fail(f"git add -A 失败（退出码 {rc}）：\n{text}")
-            # 第二步：提交
-            rc, text = _run(["git", "commit", "-m", msg], cwd,
-                            _int_b2(args.get("timeout"), 60))
-            if rc != 0:
-                low = (text or "").lower()
-                if "nothing to commit" in low or "no changes added" in low:
-                    return ToolResult.fail("没有可提交的改动（暂存区是空的）")
-                return ToolResult.fail(f"git commit 失败（退出码 {rc}）：\n{text or '(无输出)'}")
-            return ToolResult.ok(text or f"已提交：{msg}")
 
-    git_tool("git_branch", "tool.git.branch",
-             "列出分支（当前分支带 *）。不切换分支。",
-             P_PATH, lambda a: ["branch", "-a", "-vv"])
 
     # 【git_init 必须独立实现，不能走公共壳】两个原因：
     #   ① 公共壳开头就验"是不是仓库"，而 init 的对象**本来就不是**仓库 → 永远跑不通；
@@ -12252,134 +9326,12 @@ def _build_batch2(NS: dict) -> list:
     #      于是 git_init 会在一个子目录里再 init 一次 —— 实测就是这条把 main.py 覆盖了：
     #      有人以 path="main.py" 调它，main.py 被建成目录后落在外层工作树里 →
     #      预检通过 → git init 在里面跑 → 源文件变成一个空仓库 ✗
-    @tool
-    class _GitInit(ToolPlugin):
-        @property
-        def id(self): return "tool.git.init"
-        @property
-        def name(self): return "git_init"
-        @property
-        def description(self): return (
-            "把一个**目录**初始化成 git 仓库（git init）。"
-            "目标已存在且是仓库时会如实说明；**目标是文件时拒绝执行**。")
-        @property
-        def category(self): return CAT_SHELL
-        @property
-        def permission(self): return LV_EXEC
-        def parameters_schema(self):
-            return {"type": "object", "properties": P_PATH, "required": []}
 
-        def execute(self, args):
-            p = Path(str(self.resolve_path(args.get("path") or ".")))
-            # ① 目标是文件 → 拒绝（这是那次事故的形态）
-            if p.is_file():
-                return ToolResult.fail(
-                    f"目标是一个**文件**而不是目录：{p}\n"
-                    "（拒绝执行：git init 会把它变成目录并覆盖内容）")
-            # ② 已存在且已是仓库 → 如实说明，不重复 init
-            if p.is_dir():
-                rc, _ = _run(["git", "-C", str(p), "rev-parse", "--git-dir"], str(p), 20)
-                if rc == 0:
-                    return ToolResult.ok(f"已经是 git 仓库了，无需初始化：{p}")
-            else:
-                # ③ 不存在 → 这才是 init 的正常用法：建目录再 init
-                try:
-                    p.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    return ToolResult.fail(f"建目录失败：{p}（{type(e).__name__}: {e}）")
-            rc, text = _run(["git", "init"], str(p), _int_b2(args.get("timeout"), 60))
-            if rc != 0:
-                return ToolResult.fail(f"git init 失败（退出码 {rc}）：\n{text or '(无输出)'}")
-            return ToolResult.ok(text or f"已初始化：{p}")
 
-    git_tool("git_remote", "tool.git.remote",
-             "看/加远端。不带参数列出远端；带 name+url 则添加。",
-             {**P_PATH, "name": {"type": "string"}, "url": {"type": "string"}},
-             lambda a: (["remote", "-v"] if not a.get("name")
-                        else (["remote", "add", str(a["name"]), str(a["url"])]
-                              if a.get("url") else "加远端要同时给 name 和 url")))
 
-    def _reset_args(a):
-        mode = str(a.get("mode") or "--mixed")
-        if mode not in ("--soft", "--mixed"):
-            return ("git_reset 只允许 --soft / --mixed；"
-                    "--hard 会丢改动，已被拒绝（要丢弃改动请自己在终端确认后操作）")
-        return ["reset", mode, str(a.get("target") or "HEAD")]
-    git_tool("git_reset", "tool.git.reset",
-             "撤销提交但保留改动（默认 --mixed）。**不允许 --hard**（会丢改动，已拦）。",
-             {**P_PATH, "mode": {"type": "string"}, "target": {"type": "string"}},
-             _reset_args)
-
-    git_tool("git_stash", "tool.git.stash",
-             "暂存/恢复未提交改动。action: list（默认）/ push / pop。",
-             {**P_PATH, "action": {"type": "string"}},
-             lambda a: ({"list": ["stash", "list"], "push": ["stash", "push"],
-                         "pop": ["stash", "pop"]}.get(str(a.get("action") or "list"))
-                        or "action 只能是 list / push / pop"))
 
     # ───────────────────────────── 网络类（4） ─────────────────────────────
-    @tool
-    class HttpGetTool(ToolPlugin):
-        """抓取 URL 内容（只读）。"""
-        @property
-        def id(self): return "tool.net.http_get"
-        @property
-        def name(self): return "http_get"
-        @property
-        def description(self):
-            return ("GET 一个 http/https 地址并返回内容（文本展开、非文本报大小）。\n"
-                    "本机 HTTPS 对部分站点不通，连不上会**如实报错**（不是空结果）。\n"
-                    "只想抓网页正文时用 fetch_url；这个更偏裸接口调用。")
-        @property
-        def category(self): return CAT_NET
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"url": {"type": "string"},
-                                                     "timeout": {"type": "number"}},
-                    "required": ["url"]}
-        def execute(self, args):
-            url = str(args.get("url") or "").strip()
-            if not url:
-                return ToolResult.fail("缺少 url 参数")
-            ok, text = _http(url, timeout=_int_b2(args.get("timeout"), 30))
-            return ToolResult.ok(text) if ok else ToolResult.fail(text)
 
-    @tool
-    class HttpPostTool(ToolPlugin):
-        """向 URL POST（JSON 或表单）。"""
-        @property
-        def id(self): return "tool.net.http_post"
-        @property
-        def name(self): return "http_post"
-        @property
-        def description(self):
-            return ("POST 请求。body 给字符串原样发；给对象则按 JSON 发。\n"
-                    "失败会如实报 HTTP 状态与原因。")
-        @property
-        def category(self): return CAT_NET
-        @property
-        def permission(self): return LV_EXEC
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"url": {"type": "string"},
-                                                     "body": {}, "timeout": {"type": "number"}},
-                    "required": ["url"]}
-        def execute(self, args):
-            url = str(args.get("url") or "").strip()
-            if not url:
-                return ToolResult.fail("缺少 url 参数")
-            body = args.get("body")
-            if isinstance(body, (dict, list)):
-                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-                hdrs = {"Content-Type": "application/json"}
-            elif isinstance(body, str):
-                data = body.encode("utf-8")
-                hdrs = {"Content-Type": "text/plain; charset=utf-8"}
-            else:
-                data, hdrs = b"", {}
-            ok, text = _http(url, data=data, headers=hdrs,
-                             timeout=_int_b2(args.get("timeout"), 30))
-            return ToolResult.ok(text) if ok else ToolResult.fail(text)
 
     @tool
     class DownloadFileTool(ToolPlugin):
@@ -12435,320 +9387,14 @@ def _build_batch2(NS: dict) -> list:
                         pass
                 return ToolResult.fail(f"下载失败（{type(e).__name__}）：{e}")
 
-    @tool
-    class DnsLookupTool(ToolPlugin):
-        """域名解析（本地就能做，不依赖外网 HTTP）。"""
-        @property
-        def id(self): return "tool.net.dns"
-        @property
-        def name(self): return "dns_lookup"
-        @property
-        def description(self):
-            return ("把域名解析成 IP（socket.getaddrinfo，走本机 DNS）。\n"
-                    "解析不了会如实报错——这**不代表**该站点 HTTP 可达/不可达。")
-        @property
-        def category(self): return CAT_NET
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"host": {"type": "string"}},
-                    "required": ["host"]}
-        def execute(self, args):
-            host = str(args.get("host") or "").strip()
-            if not host:
-                return ToolResult.fail("缺少 host 参数")
-            try:
-                infos = socket.getaddrinfo(host, None)
-                ips = sorted({i[4][0] for i in infos})
-                return ToolResult.ok(f"{host} → " + ", ".join(ips))
-            except socket.gaierror as e:
-                return ToolResult.fail(f"解析失败：{e}（域名可能不存在，或本机 DNS 不可用）")
 
     # ───────────────────────── 编码 / 文本 / 数据（14） ─────────────────────────
-    @tool
-    class Base64Tool(ToolPlugin):
-        """base64 编解码。"""
-        @property
-        def id(self): return "tool.text.base64"
-        @property
-        def name(self): return "base64"
-        @property
-        def description(self):
-            return ("base64 编码或解码。mode=encode（默认）/ decode。\n"
-                    "decode 遇到非法 base64 会如实报错（不会给你一堆乱码）。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "mode": {"type": "string"}},
-                    "required": ["text"]}
-        def execute(self, args):
-            text = str(args.get("text") or "")
-            if not text and args.get("text") is None:
-                return ToolResult.fail("缺少 text 参数")
-            mode = str(args.get("mode") or "encode").lower()
-            try:
-                if mode.startswith("dec"):
-                    return ToolResult.ok(_b64.b64decode(text, validate=True)
-                                         .decode("utf-8", "replace"))
-                return ToolResult.ok(_b64.b64encode(text.encode("utf-8")).decode())
-            except Exception as e:                          # noqa: BLE001
-                return ToolResult.fail(f"{mode} 失败：{type(e).__name__}: {e}")
 
-    @tool
-    class HashTool(ToolPlugin):
-        """算哈希（文件或字符串）。"""
-        @property
-        def id(self): return "tool.text.hash"
-        @property
-        def name(self): return "hash"
-        @property
-        def description(self):
-            return ("算哈希。给 path 则算文件（大文件也流式读完），给 text 则算字符串。\n"
-                    "algo 默认 sha256，可选 md5 / sha1 / sha512。")
-        @property
-        def category(self): return CAT_FILE
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"path": {"type": "string"},
-                                                     "text": {"type": "string"},
-                                                     "algo": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            algo = str(args.get("algo") or "sha256").lower()
-            if algo not in ("md5", "sha1", "sha256", "sha512"):
-                return ToolResult.fail("algo 只能是 md5 / sha1 / sha256 / sha512")
-            if args.get("path"):
-                p = self.resolve_path(str(args["path"]))
-                if not p.is_file():
-                    return ToolResult.fail(f"不是文件：{p}")
-                h = _hash.new(algo)
-                with open(p, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-                return ToolResult.ok(f"{algo}({p.name}) = {h.hexdigest()}")
-            if args.get("text") is not None:
-                h = _hash.new(algo)
-                h.update(str(args["text"]).encode("utf-8"))
-                return ToolResult.ok(f"{algo}(text) = {h.hexdigest()}")
-            return ToolResult.fail("至少给 path 或 text 之一")
 
-    @tool
-    class UuidTool(ToolPlugin):
-        """生成 UUID。"""
-        @property
-        def id(self): return "tool.text.uuid"
-        @property
-        def name(self): return "generate_uuid"
-        @property
-        def description(self):
-            return "生成 UUID（默认 1 个，count 可指定个数，最多 100）。version 1 或 4。"
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"count": {"type": "number"},
-                                                     "version": {"type": "number"}},
-                    "required": []}
-        def execute(self, args):
-            # count/version 乱值（"abc"）原来直接抛 ValueError → "工具执行异常"，
-            # 这里兜成默认值（uuid 一次一个、version 4）
-            n = max(1, min(100, _int_b2(args.get("count"), 1)))
-            v = _int_b2(args.get("version"), 4)
-            gen = _uuid.uuid1 if v == 1 else _uuid.uuid4
-            return ToolResult.ok("\n".join(str(gen()) for _ in range(n)))
 
-    @tool
-    class EscapeStringTool(ToolPlugin):
-        """转义/反转义字符串。"""
-        @property
-        def id(self): return "tool.text.escape"
-        @property
-        def name(self): return "escape_string"
-        @property
-        def description(self):
-            return ("按目标环境转义：json（默认）/ url / html / regex / shell_ps。\n"
-                    "mode=unescape 则反向。用于把一段文本塞进别的语法里。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "kind": {"type": "string"},
-                                                     "mode": {"type": "string"}},
-                    "required": ["text"]}
-        def execute(self, args):
-            text = str(args.get("text") or "")
-            kind = str(args.get("kind") or "json").lower()
-            un = str(args.get("mode") or "escape").lower().startswith("un")
-            try:
-                if kind == "json":
-                    return ToolResult.ok(json.dumps(text, ensure_ascii=False)[1:-1] if not un
-                                         else json.loads('"' + text + '"'))
-                if kind == "url":
-                    return ToolResult.ok(urllib.parse.unquote(text) if un
-                                         else urllib.parse.quote(text, safe=""))
-                if kind == "html":
-                    import html
-                    return ToolResult.ok(html.unescape(text) if un else html.escape(text))
-                if kind == "regex":
-                    return ToolResult.ok(re.escape(text) if not un
-                                         else text.replace("\\", ""))
-                if kind == "shell_ps":
-                    return ToolResult.ok(text.replace("'", "''") if not un
-                                         else text.replace("''", "'"))
-                return ToolResult.fail("kind 只能是 json / url / html / regex / shell_ps")
-            except Exception as e:                          # noqa: BLE001
-                return ToolResult.fail(f"转义失败：{type(e).__name__}: {e}")
 
-    @tool
-    class StringUtilsTool(ToolPlugin):
-        """字符串统计与变换。"""
-        @property
-        def id(self): return "tool.text.string_utils"
-        @property
-        def name(self): return "string_utils"
-        @property
-        def description(self):
-            return ("对一段文本做统计或变换。op：stats（默认）/ upper / lower / trim / "
-                    "snake / camel / kebab / reverse / unique_lines / sort_lines。\n"
-                    "stats 给字符数、词数、行数、最长行。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "op": {"type": "string"}},
-                    "required": ["text"]}
-        def execute(self, args):
-            t = str(args.get("text") or "")
-            op = str(args.get("op") or "stats").lower()
-            words = re.findall(r"\S+", t)
-            lines = t.splitlines()
-            if op == "stats":
-                longest = max(lines, key=len) if lines else ""
-                return ToolResult.ok(
-                    f"字符 {len(t)} · 词 {len(words)} · 行 {len(lines)} · "
-                    f"最长行 {len(longest)} 字符")
-            if op == "upper":   return ToolResult.ok(t.upper())
-            if op == "lower":   return ToolResult.ok(t.lower())
-            if op == "trim":    return ToolResult.ok(t.strip())
-            if op == "reverse": return ToolResult.ok(t[::-1])
-            if op == "snake":
-                return ToolResult.ok(re.sub(r"(?<!^)(?=[A-Z])", "_", t).replace("-", "_").lower())
-            if op == "kebab":
-                return ToolResult.ok(re.sub(r"(?<!^)(?=[A-Z])", "-", t).replace("_", "-").lower())
-            if op == "camel":
-                parts = re.split(r"[_\-\s]+", t)
-                return ToolResult.ok(parts[0].lower() + "".join(p.title() for p in parts[1:]))
-            if op == "unique_lines":
-                seen, out2 = set(), []
-                for ln in lines:
-                    if ln not in seen:
-                        seen.add(ln)
-                        out2.append(ln)
-                return ToolResult.ok("\n".join(out2))
-            if op == "sort_lines":
-                return ToolResult.ok("\n".join(sorted(lines)))
-            return ToolResult.fail("op 不支持：" + op)
 
-    @tool
-    class RegexTestTool(ToolPlugin):
-        """正则测试（真跑，给匹配位置）。"""
-        @property
-        def id(self): return "tool.text.regex"
-        @property
-        def name(self): return "regex_test"
-        @property
-        def description(self):
-            return ("用 pattern 在 text 上跑正则，返回**所有匹配**（含分组与位置）。\n"
-                    "flags 可给 i / m / s。写正则前先在这里验证，比在代码里试快。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"pattern": {"type": "string"},
-                                                     "text": {"type": "string"},
-                                                     "flags": {"type": "string"}},
-                    "required": ["pattern", "text"]}
-        def execute(self, args):
-            pat = str(args.get("pattern") or "")
-            if not pat:
-                return ToolResult.fail("缺少 pattern")
-            f = 0
-            for ch in str(args.get("flags") or ""):
-                f |= {"i": re.I, "m": re.M, "s": re.S}.get(ch, 0)
-            try:
-                rx = re.compile(pat, f)
-            except re.error as e:
-                return ToolResult.fail(f"正则非法：{e}")
-            ms = list(rx.finditer(str(args.get("text") or "")))
-            if not ms:
-                return ToolResult.ok("没有匹配（0 处）")
-            rows = [f"共 {len(ms)} 处："]
-            for i, mo in enumerate(ms[:100], 1):
-                g = mo.groups()
-                rows.append(f"  {i}. [{mo.start()}:{mo.end()}] {mo.group(0)!r}"
-                            + (f"  分组={g}" if g else ""))
-            if len(ms) > 100:
-                rows.append(f"  …（还有 {len(ms) - 100} 处未列）")
-            return ToolResult.ok("\n".join(rows))
 
-    @tool
-    class NumberConvertTool(ToolPlugin):
-        """进制转换。"""
-        @property
-        def id(self): return "tool.text.number"
-        @property
-        def name(self): return "number_convert"
-        @property
-        def description(self):
-            return ("进制转换：给 value 与 from_base（默认 10）、to_base（默认 16）。\n"
-                    "也支持 to_base=bin/oct/hex/dec 这种写法。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"value": {"type": "string"},
-                                                     "from_base": {}, "to_base": {}},
-                    "required": ["value"]}
-        def execute(self, args):
-            names = {"bin": 2, "oct": 8, "dec": 10, "hex": 16}
-            # 【from_base/to_base 的 int() 必须在 try 里】fb="0x16" 这种 names 表之外的
-            # 字符串在**取值那一步**就抛 ValueError，原来它在 try 之外 → 整次调用变成
-            # "工具执行异常"，而本该走下面"按 N 进制解析失败"的可读报错分支。
-            try:
-                fb = args.get("from_base") or 10
-                tb = args.get("to_base") or 16
-                if isinstance(fb, str):
-                    fb = names.get(fb.lower(), None) or int(fb)
-                if isinstance(tb, str):
-                    tb = names.get(tb.lower(), None) or int(tb)
-                fb, tb = int(fb), int(tb)
-            except (TypeError, ValueError):
-                return ToolResult.fail(
-                    "from_base/to_base 必须是 2-36 的数字，或 bin/oct/dec/hex（你给的: "
-                    f"from_base={args.get('from_base')!r}, to_base={args.get('to_base')!r}）")
-            if not (2 <= fb <= 36):
-                return ToolResult.fail(f"from_base 只能是 2~36（你给的是 {fb}）")
-            raw = str(args.get("value") or "").strip().replace("_", "")
-            try:
-                n = int(raw, fb)
-            except ValueError as e:
-                return ToolResult.fail(f"按 {fb} 进制解析失败：{e}")
-            if not (2 <= tb <= 36):
-                return ToolResult.fail("to_base 只能是 2~36")
-            builtin = {2: format(n, "b"), 8: format(n, "o"), 10: str(n), 16: format(n, "x")}
-            shown = builtin.get(tb) or _to_base(n, tb)
-            return ToolResult.ok(f"{raw}(base{fb}) = {shown}（base{tb}）")
 
     def _to_base(n: int, base: int) -> str:
         digits, sign, out2 = "0123456789abcdefghijklmnopqrstuvwxyz", "", ""
@@ -12759,489 +9405,17 @@ def _build_batch2(NS: dict) -> list:
             n //= base
         return sign + (out2 or "0")
 
-    @tool
-    class DiffTextTool(ToolPlugin):
-        """比较两段文本/两个文件的差异。"""
-        @property
-        def id(self): return "tool.text.diff"
-        @property
-        def name(self): return "diff_text"
-        @property
-        def description(self):
-            return ("比较两段文本或两个文件的差异（统一 diff 格式）。\n"
-                    "给 a/b 两个路径，或 a_text/b_text 两段字符串。\n"
-                    "只看文件有没有变用 git_status；要看具体改了哪几行用这个。")
-        @property
-        def category(self): return CAT_FILE
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object",
-                    "properties": {"a": {"type": "string"}, "b": {"type": "string"},
-                                   "a_text": {"type": "string"}, "b_text": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            def side(path_key, text_key):
-                if args.get(path_key):
-                    p = self.resolve_path(str(args[path_key]))
-                    if not p.is_file():
-                        return None, f"不是文件：{p}"
-                    return p.read_text(encoding="utf-8", errors="replace").splitlines(), None
-                if args.get(text_key) is not None:
-                    return str(args[text_key]).splitlines(), None
-                return None, f"缺少 {path_key} 或 {text_key}"
-            la, err = side("a", "a_text")
-            if err:
-                return ToolResult.fail(err)
-            lb, err = side("b", "b_text")
-            if err:
-                return ToolResult.fail(err)
-            d = list(difflib.unified_diff(la, lb, "a", "b", lineterm="", n=2))
-            return ToolResult.ok("\n".join(d) if d else "两段内容完全一致（无差异）")
 
-    @tool
-    class JsonFormatTool(ToolPlugin):
-        """JSON 校验 / 美化 / 压缩 / 取值。"""
-        @property
-        def id(self): return "tool.data.json"
-        @property
-        def name(self): return "json_format"
-        @property
-        def description(self):
-            return ("JSON 工具。给 text 或 path。op：format（默认，美化 2 空格）/ minify / "
-                    "validate / keys（列顶层键）。\n"
-                    "解析失败会**指出具体位置**，不是只说一句'非法'。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "path": {"type": "string"},
-                                                     "op": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            if args.get("path"):
-                p = self.resolve_path(str(args["path"]))
-                if not p.is_file():
-                    return ToolResult.fail(f"不是文件：{p}")
-                raw = p.read_text(encoding="utf-8", errors="replace")
-            elif args.get("text") is not None:
-                raw = str(args["text"])
-            else:
-                return ToolResult.fail("至少给 text 或 path")
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError as e:
-                lines = raw.splitlines()
-                bad = lines[e.lineno - 1] if 0 < e.lineno <= len(lines) else ""
-                return ToolResult.fail(
-                    f"JSON 非法：第 {e.lineno} 行第 {e.colno} 列 —— {e.msg}\n    {bad.strip()[:120]}")
-            op = str(args.get("op") or "format").lower()
-            if op == "validate":
-                return ToolResult.ok(f"合法 JSON：顶层是 {type(obj).__name__}，"
-                                     f"{len(obj)} 个成员" if isinstance(obj, (dict, list))
-                                     else f"合法 JSON：{type(obj).__name__}")
-            if op == "minify":
-                return ToolResult.ok(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
-            if op == "keys":
-                if not isinstance(obj, dict):
-                    return ToolResult.ok(f"顶层不是对象，是 {type(obj).__name__}")
-                return ToolResult.ok("\n".join(f"{k}: {type(v).__name__}" for k, v in obj.items()))
-            return ToolResult.ok(_truncate_b2(json.dumps(obj, ensure_ascii=False, indent=2)))
 
-    @tool
-    class YamlProcessTool(ToolPlugin):
-        """YAML 校验（有 PyYAML 就完整解析，没有就做缩进/制表符等结构检查）。"""
-        @property
-        def id(self): return "tool.data.yaml"
-        @property
-        def name(self): return "yaml_process"
-        @property
-        def description(self):
-            return ("校验 YAML 文档。**没有 PyYAML 时会如实说明只做了结构检查**，"
-                    "不会假装解析过。\n给 text 或 path。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "path": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            if args.get("path"):
-                p = self.resolve_path(str(args["path"]))
-                if not p.is_file():
-                    return ToolResult.fail(f"不是文件：{p}")
-                raw = p.read_text(encoding="utf-8", errors="replace")
-            elif args.get("text") is not None:
-                raw = str(args["text"])
-            else:
-                return ToolResult.fail("至少给 text 或 path")
-            try:
-                import yaml                                    # type: ignore
-                obj = yaml.safe_load(raw)
-                return ToolResult.ok(f"PyYAML 解析成功：顶层 {type(obj).__name__}"
-                                     + (f"，{len(obj)} 个键" if isinstance(obj, dict) else ""))
-            except ImportError:
-                problems = []
-                for i, ln in enumerate(raw.splitlines(), 1):
-                    if "\t" in ln:
-                        problems.append(f"第 {i} 行含制表符（YAML 不允许缩进用 tab）")
-                    if ln.rstrip() != ln and ln.strip() and not ln.lstrip().startswith("#"):
-                        problems.append(f"第 {i} 行有多余行尾空格")
-                return ToolResult.ok(
-                    "本机没装 PyYAML —— **只做了结构检查**（不代表已完整校验）：\n"
-                    + ("\n".join(problems[:20]) if problems else "未发现 tab 缩进/行尾空格问题"))
-            except Exception as e:                              # noqa: BLE001
-                return ToolResult.fail(f"YAML 非法：{type(e).__name__}: {e}")
 
-    @tool
-    class CronParseTool(ToolPlugin):
-        """解析 cron 表达式，说明它什么时候跑。"""
-        @property
-        def id(self): return "tool.data.cron"
-        @property
-        def name(self): return "cron_parse"
-        @property
-        def description(self):
-            return ("解析 5 段 cron 表达式（分 时 日 月 周），逐段说明含义。\n"
-                    "**只做解释，不预测下次执行时间**（那要完整调度器，这里不假装）。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"expression": {"type": "string"}},
-                    "required": ["expression"]}
-        def execute(self, args):
-            expr = str(args.get("expression") or "").strip()
-            parts = expr.split()
-            if len(parts) != 5:
-                return ToolResult.fail(f"需要 5 段（分 时 日 月 周），你给了 {len(parts)} 段：{expr!r}")
-            names = ("分钟", "小时", "日", "月", "星期")
-            special = {"*": "每一", "*/": "每隔 ", "-": "范围", ",": "多个",
-                       "?": "不指定"}
-            rows = [f"表达式 {expr}："]
-            for n, seg in zip(names, parts):
-                hint = next((v for k, v in special.items() if seg.startswith(k)), "")
-                rows.append(f"  {n}：{seg}" + (f"（{hint}）" if hint else ""))
-            return ToolResult.ok("\n".join(rows))
 
-    @tool
-    class FormatCodeTool(ToolPlugin):
-        """格式化代码/JSON（**只支持能确定做对的格式**）。"""
-        @property
-        def id(self): return "tool.text.format"
-        @property
-        def name(self): return "format_code"
-        @property
-        def description(self):
-            return ("格式化。**目前只支持 json**（用标准库，结果一定对）。\n"
-                    "其它语言本机没有可靠的格式化器 —— 会**如实拒绝**，"
-                    "而不是随便缩进了事（那会改坏代码）。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "path": {"type": "string"},
-                                                     "language": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            # 【恒等三元 + None.endswith 都修掉】原来两支都是 "json"（条件纯属死代码），
-            # 而且 args.get("path", "") 在键**存在但值是 null** 时返回 None
-            # （默认值只在键缺失时生效）→ None.endswith 抛 AttributeError。
-            path = args.get("path")
-            if not args.get("language") and isinstance(path, str) and path.lower().endswith(".json"):
-                lang = "json"
-            else:
-                lang = str(args.get("language") or "json").lower()
-            if lang not in ("json", "jsonc"):
-                return ToolResult.fail(
-                    f"format_code 目前只支持 json（你给的是 {lang}）——\n"
-                    "其它语言本机没有可靠的格式化器，硬做会改坏代码，所以选择如实拒绝。\n"
-                    "如果确实需要，可以先装对应工具再让我用 execute_command 调用它。")
-            # 【不要在这里 new 一个别的工具类】`JsonFormatTool(self)` 是错的 ——
-            # 那些类要的是 NS（含 ToolPlugin/ToolResult/…），传 self 会在运行时炸。
-            # 所以把 JSON 美化的逻辑就地写一遍（就三行）。
-            if args.get("path"):
-                p = self.resolve_path(str(args["path"]))
-                if not p.is_file():
-                    return ToolResult.fail(f"不是文件：{p}")
-                raw = p.read_text(encoding="utf-8", errors="replace")
-            elif args.get("text") is not None:
-                raw = str(args["text"])
-            else:
-                return ToolResult.fail("至少给 text 或 path")
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError as e:
-                return ToolResult.fail(f"JSON 非法：第 {e.lineno} 行第 {e.colno} 列 —— {e.msg}")
-            return ToolResult.ok(_truncate_b2(json.dumps(obj, ensure_ascii=False, indent=2)))
 
-    @tool
-    class MarkdownRenderTool(ToolPlugin):
-        """把 Markdown 渲染成纯文本（去标记）。"""
-        @property
-        def id(self): return "tool.text.markdown"
-        @property
-        def name(self): return "markdown_render"
-        @property
-        def description(self):
-            return ("把 Markdown 转成**纯文本**（去 #、*、链接语法等），用于终端阅读。\n"
-                    "**不是** HTML 渲染器（本机没有渲染依赖，不假装）。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "path": {"type": "string"}},
-                    "required": []}
-        def execute(self, args):
-            if args.get("path"):
-                p = self.resolve_path(str(args["path"]))
-                if not p.is_file():
-                    return ToolResult.fail(f"不是文件：{p}")
-                raw = p.read_text(encoding="utf-8", errors="replace")
-            elif args.get("text") is not None:
-                raw = str(args["text"])
-            else:
-                return ToolResult.fail("至少给 text 或 path")
-            t = raw
-            t = re.sub(r"```.*?```", lambda m: re.sub(r"^```\w*\n?", "", m.group(0)).rstrip("`"),
-                       t, flags=re.S)
-            t = re.sub(r"`([^`]+)`", r"\1", t)
-            t = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"[图: \1]", t)
-            t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", t)
-            t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)
-            t = re.sub(r"(\*\*|__)(.*?)\1", r"\2", t)
-            t = re.sub(r"(\*|_)(.*?)\1", r"\2", t)
-            t = re.sub(r"^\s*[-*+]\s+", "· ", t, flags=re.M)
-            return ToolResult.ok(_truncate_b2(t.strip()))
 
-    @tool
-    class TranslateTool(ToolPlugin):
-        """翻译（需要联网服务；不可达时如实说明）。"""
-        @property
-        def id(self): return "tool.text.translate"
-        @property
-        def name(self): return "translate"
-        @property
-        def description(self):
-            return ("翻译文本。**本机 HTTPS 对多数外部站点不通** —— 连不上会如实报错，"
-                    "不会把原文当译文返回。\n可选 endpoint 指定自建翻译服务"
-                    "（应接受 POST JSON {text,to} 并返回 {text}）。")
-        @property
-        def category(self): return CAT_NET
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"text": {"type": "string"},
-                                                     "to": {"type": "string"},
-                                                     "endpoint": {"type": "string"}},
-                    "required": ["text"]}
-        def execute(self, args):
-            text = str(args.get("text") or "")
-            if not text:
-                return ToolResult.fail("缺少 text 参数")
-            endpoint = str(args.get("endpoint") or "").strip()
-            if not endpoint:
-                return ToolResult.fail(
-                    "translate 需要一个可用的翻译服务 endpoint ——\n"
-                    "本机 HTTPS 对外基本不通（实测连 github 都是 Connection reset），"
-                    "所以没有内置默认服务。\n"
-                    "用法：translate(text=..., to=\"zh\", endpoint=\"http://<你的服务>/translate\")，"
-                    "该服务应接受 POST JSON {text, to} 并返回 {text: \"译文\"}。")
-            ok, out = _http(endpoint, data=json.dumps({"text": text, "to": args.get("to") or "zh"}
-                                                      ).encode("utf-8"),
-                            headers={"Content-Type": "application/json"})
-            if not ok:
-                return ToolResult.fail(f"翻译服务不可达：{out}")
-            try:
-                return ToolResult.ok(str(json.loads(out).get("text") or out))
-            except Exception:                               # noqa: BLE001
-                return ToolResult.ok(out)
 
     # ───────────────────────── 进程类（2） ─────────────────────────
-    @tool
-    class RunBackgroundTool(ToolPlugin):
-        """后台跑长驻进程。"""
-        @property
-        def id(self): return "tool.shell.background"
-        @property
-        def name(self): return "run_background"
-        @property
-        def description(self):
-            return ("把长驻进程（服务器、watch、npm run dev）放后台跑，立刻返回 PID。\n"
-                    "输出落到 `.lbcheck/bg-<pid>.log`，之后可以用 read_file 看。\n"
-                    "**不要在 execute_command 里等长驻进程**（会超时被杀）。")
-        @property
-        def category(self): return CAT_SHELL
-        @property
-        def permission(self): return LV_EXEC
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"command": {"type": "string"},
-                                                     "cwd": {"type": "string"}},
-                    "required": ["command"]}
-        def execute(self, args):
-            cmd = str(args.get("command") or "").strip()
-            if not cmd:
-                return ToolResult.fail("缺少 command 参数")
-            cwd = str(self.resolve_path(args.get("cwd") or "."))
-            logdir = Path(cwd) / ".lbcheck"
-            try:
-                logdir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                logdir = Path(cwd)
-            # 【工具说明承诺了日志文件，就必须真的落盘】原来 stdout/stderr 接 DEVNULL：
-            # `.lbcheck/bg-<pid>.log` 从没被创建过，模型按说明去 read_file 必然"文件不存在"，
-            # 进程起挂了也没有任何日志可查。文件名要 pid → 只能先把进程起来再开日志，
-            # stdout/stderr 合并成一条管道（stderr=STDOUT），由一个守护线程边读边写。
-            try:
-                if os.name == "nt":
-                    # 【别再带 DETACHED_PROCESS(0x8)】实测：powershell 带 0x8 时
-                    # stdout 永远不往管道里写（进程活着、日志一直空），带它是因为以前
-                    # 输出接 DEVNULL 根本没人看。现在日志要落盘，只留 CREATE_NO_WINDOW
-                    # （0x08000000，GUI 不弹黑框）—— 实测这样输出立刻流进管道。
-                    p = subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd],
-                                         cwd=cwd, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT,
-                                         creationflags=0x08000000)
-                else:
-                    p = subprocess.Popen(["sh", "-c", cmd], cwd=cwd,
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            except Exception as e:                          # noqa: BLE001
-                return ToolResult.fail(f"起不来：{type(e).__name__}: {e}")
 
-            log_path = logdir / f"bg-{p.pid}.log"
-            log_note = ""
-            fh = None
-            try:
-                fh = open(log_path, "wb")
-            except OSError as e:
-                # 日志建不了也**必须照样把管道读干**：没人读的话输出一多，
-                # 子进程会卡死在 write 上（"后台任务永远不结束"那个坑）。
-                log_note = f"\n（日志文件创建失败：{type(e).__name__}: {e}，输出会被丢弃）"
-
-            def _pump() -> None:
-                try:
-                    # 必须用 read1（有就用）：BufferedReader.read(n) 会**凑满 n 字节**才返回，
-                    # 输出不满 64KB 时管道没人读 → 子进程卡在 write 上。
-                    reader = getattr(p.stdout, "read1", p.stdout.read)
-                    while True:
-                        chunk = reader(65536)
-                        if not chunk:
-                            break
-                        if fh is not None:
-                            fh.write(chunk)
-                            # 【必须立刻 flush】文件对象默认带 8KB 缓冲，不 flush 的话
-                            # "边跑边 read_file 看日志"永远读到空文件（进程还没退出，
-                            # finally 里的 close 还没发生）——工具的承诺就落空了。
-                            fh.flush()
-                except Exception:                          # noqa: BLE001
-                    pass
-                finally:
-                    try:
-                        p.stdout.close()
-                    except Exception:                      # noqa: BLE001
-                        pass
-                    if fh is not None:
-                        try:
-                            fh.close()
-                        except Exception:                  # noqa: BLE001
-                            pass
-
-            threading.Thread(target=_pump, name="lionbox-bg-log", daemon=True).start()
-
-            _BG[p.pid] = {"cmd": cmd, "cwd": cwd, "proc": p}
-            return ToolResult.ok(
-                f"已在后台启动，PID {p.pid}\n命令：{cmd}\n工作目录：{cwd}\n"
-                f"输出日志：{log_path}{log_note}\n"
-                f"（要停它用 stop_background(pid={p.pid})）")
-
-    @tool
-    class StopBackgroundTool(ToolPlugin):
-        """停掉后台进程。"""
-        @property
-        def id(self): return "tool.shell.bgstop"
-        @property
-        def name(self): return "stop_background"
-        @property
-        def description(self):
-            return ("停掉 run_background 起的进程。pid 省略则停**本会话起的全部**。\n"
-                    "只停自己起的（不会去杀别人/系统的进程）。")
-        @property
-        def category(self): return CAT_SHELL
-        @property
-        def permission(self): return LV_EXEC
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"pid": {"type": "number"}}, "required": []}
-        def execute(self, args):
-            pid = args.get("pid")
-            if pid not in (None, "", False):
-                try:
-                    targets = [int(pid)]
-                except (TypeError, ValueError):
-                    # pid 乱值（"abc"）原来直接抛 ValueError → "工具执行异常"，
-                    # 这里如实说清楚：一个进程也没停
-                    return ToolResult.fail(f"pid 必须是数字（你给的是 {pid!r}）—— 没有停任何进程")
-            else:
-                targets = list(_BG.keys())
-            if not targets:
-                return ToolResult.ok("没有本会话起的后台进程")
-            rows = []
-            for tp in targets:
-                rec = _BG.get(tp)
-                if not rec:
-                    rows.append(f"PID {tp}：不是本会话起的，**不动它**")
-                    continue
-                rows.append(_stop_one(tp, rec))
-                _BG.pop(tp, None)
-            return ToolResult.ok("\n".join(rows))
 
     # ───────────────────────── 杂项（4） ─────────────────────────
-    @tool
-    class GetEnvTool(ToolPlugin):
-        """读环境变量 / 看关键路径。"""
-        @property
-        def id(self): return "tool.sys.env"
-        @property
-        def name(self): return "get_env"
-        @property
-        def description(self):
-            return ("不带 name：列出关键环境变量与系统路径（cwd、临时目录、PATH 条目数等）。\n"
-                    "带 name：返回该变量的值（不存在会明确说'未设置'）。\n"
-                    "**不会打印含 KEY/TOKEN/SECRET/PASSWORD 的值**（只显示已设置与否）。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {"name": {"type": "string"}}, "required": []}
-        def execute(self, args):
-            name = str(args.get("name") or "").strip()
-            secret = re.search(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", name, re.I)
-            if name:
-                if name not in os.environ:
-                    return ToolResult.fail(f"环境变量未设置：{name}")
-                if secret:
-                    return ToolResult.ok(f"{name} 已设置（值疑似敏感，共 {len(os.environ[name])} 字符，不显示）")
-                return ToolResult.ok(f"{name} = {os.environ[name]}")
-            rows = [f"cwd            = {os.getcwd()}",
-                    f"OS             = {sys.platform} ({os.name})",
-                    f"Python         = {sys.version.split()[0]}",
-                    f"TEMP           = {os.environ.get('TEMP', '(未设置)')}",
-                    f"PATH 条目数    = {len(os.environ.get('PATH', '').split(os.pathsep))}",
-                    f"环境变量总数   = {len(os.environ)}"]
-            interesting = [k for k in os.environ
-                           if re.match(r"^(MIMOCODE|LION|LIONBOX|PYTHON|NODE|BUN|GIT)", k, re.I)]
-            if interesting:
-                rows.append("相关变量：" + ", ".join(sorted(interesting)[:20]))
-            return ToolResult.ok("\n".join(rows))
 
     @tool
     class ContextPruneTool(ToolPlugin):
@@ -13309,58 +9483,23 @@ def _build_batch2(NS: dict) -> list:
                     "不要假定用户已收到；换个方式继续或让用户手动输入。")
             return real.execute(self, args)
 
-    @tool
-    class ChangePermissionsTool(ToolPlugin):
-        """查看/申请权限（**不能自己提权**）。"""
-        @property
-        def id(self): return "tool.sec.perms"
-        @property
-        def name(self): return "change_permissions"
-        @property
-        def description(self):
-            return ("查看当前权限策略（只读）。\n"
-                    "**工具不能给自己提权** —— 权限变更必须由用户在设置里做，"
-                    "所以这里只报告，不会修改任何策略。")
-        @property
-        def category(self): return CAT_OTHER
-        @property
-        def permission(self): return LV_READ
-        def parameters_schema(self):
-            return {"type": "object", "properties": {}, "required": []}
-        def execute(self, args):
-            rows = ["权限变更必须由用户在设置里完成；工具侧只读报告："]
-            try:
-                cfg = NS.get("api")
-                if cfg and hasattr(cfg, "cfg"):
-                    mode = cfg.cfg.get("toolCallMode", "?")
-                    rows.append(f"当前 toolCallMode = {mode}")
-            except Exception as e:                          # noqa: BLE001
-                rows.append(f"（读配置失败：{type(e).__name__}）")
-            rows.append("如果某操作被权限层拒绝：请让用户在设置里放行，或改用不需要该权限的做法。")
-            return ToolResult.ok("\n".join(rows))
-    # ── 权限等级覆盖（本次修正）──────────────────────────────────────────
+    # ── 权限等级覆盖（一处收口，便于复查）──────────────────────────────────
 
-    # 【为什么需要】核查发现 20 个工具没声明 permission（属性是 None，不是基类
-
-    # 默认值），而权限门禁判的是 `required == PermissionLevel.READ_ONLY` ——
-
-    # None 不成立，于是在**只读工作区**里连 base64/hash/json_format 这类纯计算
-
-    # 都被拦；git_status/diff/log/branch 又错标成 EXECUTE。这里按名字统一纠正，
-
-    # 一处收口、便于复查（不改各工具类本身，避免散落 24 处）。
+    # 【为什么需要】有些工具没声明 permission（属性是 None），而权限门禁判的是
+    # `required == PermissionLevel.READ_ONLY` —— None 不成立，只读工作区里会被拦。
+    # 【2026-10：只留下还活着的工具】同 _build_batch1：指向已删工具的条目全部清掉。
 
     _LEVEL_OVERRIDE = {}
 
-    for _n in ['base64', 'hash', 'generate_uuid', 'escape_string', 'string_utils', 'regex_test', 'number_convert', 'diff_text', 'json_format', 'yaml_process', 'cron_parse', 'format_code', 'markdown_render', 'translate', 'dns_lookup', 'get_env', 'http_get', 'ask_user', 'working_directory', 'context_window', 'system_info', 'timestamp', 'git_status', 'git_diff', 'git_log', 'git_branch']:
+    for _n in ['ask_user', 'context_window', 'system_info', 'timestamp']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.READ_ONLY
 
-    for _n in ['git_add', 'git_commit', 'git_stash', 'git_init', 'git_remote', 'context_prune']:
+    for _n in ['context_prune']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.WRITE
 
-    for _n in ['delete_file', 'move_file', 'change_permissions', 'git_reset']:
+    for _n in ['delete_file']:
 
         _LEVEL_OVERRIDE[_n] = PermissionLevel.DANGEROUS
 
@@ -13376,32 +9515,9 @@ def _build_batch2(NS: dict) -> list:
 
     return out
 
-#: run_background 起的进程表（进程内有效；stop 只动这里面的）
-_BG: dict = {}
-
-
-def _stop_one(tp, rec: dict) -> str:
-    """停掉一个后台进程，返回如实的一行结果。
-
-    【为什么不能只 `proc.terminate()`】run_background 起的是 powershell，命令里的
-    node/npm/服务器全是它的**孙进程**：只杀直接子进程，孙进程在 Windows 上全部存活，
-    却回报"已终止"（模型据此认为任务停了，实际还在占端口/占 CPU）。对照本文件
-    HeadlessBrowser._kill_tree 的做法：`taskkill /F /T /PID`（/T = 连进程树一起杀）。
-    """
-    proc = rec["proc"]
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(tp)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=15, creationflags=NO_WINDOW)
-        else:
-            proc.terminate()
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        return f"PID {tp}：发了终止信号但 5 秒内还没退出，**可能还活着**（{rec['cmd'][:60]}）"
-    except Exception as e:                                  # noqa: BLE001
-        return f"PID {tp}：终止失败 {type(e).__name__}: {e}"
-    return f"PID {tp}：已终止（连子进程；{rec['cmd'][:60]}）"
+# 【run_background / stop_background 已随工具削减删除（57 → 21）】
+# 原来这里还留着它们的进程表 `_BG` 与 `_stop_one()` —— 没有任何调用方了，一并删掉，
+# 不留死代码。要跑常驻进程请用 execute_command（前台）或交给系统服务。
 
 
 # ============================================================================
