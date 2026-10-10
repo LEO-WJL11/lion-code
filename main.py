@@ -8883,19 +8883,45 @@ class OpenAICompatibleAdapter(ModelAdapter):
             msg_list.append(node)
         request["messages"] = msg_list
 
-        # 工具定义（function calling）。统一形状：{"name","description","parameters"}
+        # 工具定义（function calling）。
+        # 【必须兼容两种形状 ✗ 否则 tools 全是 name:null】本仓有两种来源：
+        #   ① `build_tool_definitions()` 返回的是**已经包好的**
+        #        {"type": "function", "function": {"name", "description", "parameters"}}
+        #   ② 旧路径/测试给的是平铺的 {"name", "description", "parameters"}
+        # 原代码一律按 ② 再包一层 ✗ —— 对 ① 就是 `tool_def.get("name")` 恒 None，
+        # 于是 **60 个工具全成 {"name":null,"description":null,"parameters":null}**，
+        # 云端直接 400：`Param Incorrect / "name" is null`（实测抓包：带 tools 的请求全中）。
+        # 这条曾经"看起来能用"，是因为走**纯文本通道**的请求根本不带 `tools` 键 ✓ ——
+        # 只要走原生 function calling（带 tools）就必炸 ✗✗。已用本地 sink 抓包复现并修复。
         if tools:
             tools_node: list[dict[str, Any]] = []
             for tool_def in tools:
-                tools_node.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool_def.get("name"),
-                        "description": tool_def.get("description"),
-                        "parameters": tool_def.get("parameters"),
-                    },
-                })
-            request["tools"] = tools_node
+                if not isinstance(tool_def, dict):
+                    continue
+                if "function" in tool_def and isinstance(tool_def.get("function"), dict):
+                    fn = tool_def["function"]
+                    name = fn.get("name")
+                else:
+                    name = tool_def.get("name")
+                # 名字为空的工具发出去就是 400 ✗ —— 与上面 tool_calls 的过滤同一理由 ✓
+                if not name or not str(name).strip():
+                    log__llm_openai.warning("跳过无效工具定义（name为空）: %s",
+                                            str(tool_def)[:120])
+                    continue
+                if "function" in tool_def and isinstance(tool_def.get("function"), dict):
+                    # 已包好：原样透传，别再包一层
+                    tools_node.append(tool_def)
+                else:
+                    tools_node.append({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": tool_def.get("description"),
+                            "parameters": tool_def.get("parameters"),
+                        },
+                    })
+            if tools_node:
+                request["tools"] = tools_node
             # 原生 function calling 的两个配套参数（可由 strict_tool_params 关掉）：
             #   tool_choice=auto         —— 有的服务不默认走工具通道，显式声明更稳
             #   parallel_tool_calls=true —— AgentLoop 明确鼓励模型一轮给多个互不依赖的调用
