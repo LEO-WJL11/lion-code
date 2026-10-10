@@ -8497,6 +8497,42 @@ def _decode_json(raw: bytes) -> Any:
         raise ModelCallError(f"模型调用失败: 响应不是合法 JSON（{e}）") from e
 
 
+def _prefixed(prefix: str, message: Any) -> str:
+    """给消息加前缀，**已经带了同一个前缀就不再套一层** ✗。
+
+    【为什么必须有】这个前缀在链路上被加了多次：
+      `_open` 抛 "HTTP 429 - …"（无前缀 ✓）
+      → `open_sse` 用 `error_prefix` 包一层 → "模型调用失败: HTTP 429 - …" ✓
+      → 流式 ERROR 帧又拼一次 → **"模型调用失败: 模型调用失败: HTTP 429 - …"** ✗✗
+      → `post_json` 还会再来一层 ✗✗✗
+    实测用户看到的就是三段式。统一走这个助手，任何一层都不再重复 ✗。
+    """
+    msg = str(message)
+    if not prefix:
+        return msg
+    if msg.startswith(prefix):
+        return msg
+    return f"{prefix}: {msg}"
+
+
+def _rate_limit_wait(err: Any, attempt: int) -> float:
+    """429 的等待秒数：优先 `Retry-After`（只认秒数且封顶 60s），否则 2/4/8 指数退避。
+
+    【为什么封顶 60s】一次模型调用本来就可能跑十几秒，等太久用户只会以为卡死 ✗；
+    实测本接口 429 时**并不返回 Retry-After**（None），所以默认走指数退避 ✓。
+    """
+    headers = getattr(err, "headers", None)
+    raw = headers.get("Retry-After") if headers else None
+    if raw is not None:
+        try:
+            secs = float(str(raw).strip())
+            if 0.0 < secs <= 60.0:
+                return secs
+        except ValueError:
+            pass  # HTTP-Date 形式暂不解析（该接口不返回这个头）
+    return float(2 ** (attempt + 1))  # 2, 4, 8
+
+
 def _open(url: str, *, method: str, body: bytes | None, headers: dict[str, str],
           timeout: float) -> Any:
     """发一次请求。HTTP 错误一律转成 `ModelCallError`，消息里保留
@@ -8504,19 +8540,40 @@ def _open(url: str, *, method: str, body: bytes | None, headers: dict[str, str],
     req = urllib.request.Request(url, data=body, method=method)
     for k, v in headers.items():
         req.add_header(k, v)
-    try:
-        return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (端点由用户配置，非外部输入拼装)
-    except urllib.error.HTTPError as e:
-        raise ModelCallError(f"HTTP {e.code} - {_read_error_body(e)}") from e
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", e)
-        if isinstance(reason, socket.timeout):
+    # 【429 必须退避重试，不许直接抛给用户】
+    # 实测：本接口的 429 是**瞬时限流**（同账号 TPM/RPM 超了就会限，几十秒内恢复 200 ✓），
+    # 而**限额是共享的** —— 本机这套环境里，除用户自己的窗口外，开发期的子代理/验证脚本
+    # 也打同一个 token-plan 服务（同模型 mimo-v2.6-flash），并发一高就会把用户挤成 429。
+    # 不重试 = 把一次"抖动"直接变成用户可见的失败 ✗✗（用户看到的就是"发消息没反应"）。
+    # 规则：优先 Retry-After（给秒数才用，且封顶 60s），否则 2/4/8 秒指数退避；
+    #       每次重试都留日志 ✗ 不许静默；三次仍被限才把错误如实抛出（带"已重试"说明）。
+    _max_rate_tries = 3
+    for _attempt in range(_max_rate_tries + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (端点由用户配置，非外部输入拼装)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and _attempt < _max_rate_tries:
+                _wait = _rate_limit_wait(e, _attempt)
+                log__llm_openai.warning(
+                    "触发限流(HTTP 429)，%.1f 秒后重试（第 %d/%d 次）: %s",
+                    _wait, _attempt + 1, _max_rate_tries, _read_error_body(e)[:200])
+                time.sleep(_wait)
+                continue
+            if e.code == 429:
+                raise ModelCallError(
+                    f"HTTP 429 - 连续限流，已重试 {_max_rate_tries} 次仍未恢复"
+                    f"（稍后再试，或错峰使用）: {_read_error_body(e)}") from e
+            raise ModelCallError(f"HTTP {e.code} - {_read_error_body(e)}") from e
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, socket.timeout):
+                raise ModelCallError(f"请求超时（{timeout:.0f} 秒）: {url}") from e
+            raise ModelCallError(f"无法连接模型端点: {reason}") from e
+        except socket.timeout as e:
             raise ModelCallError(f"请求超时（{timeout:.0f} 秒）: {url}") from e
-        raise ModelCallError(f"无法连接模型端点: {reason}") from e
-    except socket.timeout as e:
-        raise ModelCallError(f"请求超时（{timeout:.0f} 秒）: {url}") from e
-    except OSError as e:
-        raise ModelCallError(f"网络错误: {e}") from e
+        except OSError as e:
+            raise ModelCallError(f"网络错误: {e}") from e
+    raise ModelCallError("模型调用失败: 请求未能发出（不应到达此处）")
 
 
 def post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str] | None = None,
@@ -8530,7 +8587,14 @@ def post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str] | No
         with _open(url, method="POST", body=body, headers=hdrs, timeout=timeout) as resp:
             data = _decode_json(resp.read())
     except ModelCallError as e:
-        raise ModelCallError(f"{error_prefix}: {e}") from e
+        # 【别套两层前缀】`_open` / `_decode_json` 抛出来的消息里已经带了
+        # `模型调用失败`（例如 "模型调用失败: HTTP 429 - …"），这里再拼一次就成了
+        #   "模型调用失败: 模型调用失败: HTTP 429 - …" ✗✗ —— 重复、更难读，
+        #   而且会被上层再包一次（用户看到的就是三段式 ✗）。
+        _msg = str(e)
+        if error_prefix and _msg.startswith(error_prefix):
+            raise ModelCallError(_msg) from e
+        raise ModelCallError(f"{error_prefix}: {_msg}") from e
     return data if isinstance(data, dict) else {}
 
 
@@ -8644,7 +8708,9 @@ def open_sse(url: str, payload: dict[str, Any], *, headers: dict[str, str] | Non
     try:
         resp = _open(url, method="POST", body=body, headers=hdrs, timeout=timeout)
     except ModelCallError as e:
-        raise ModelCallError(f"{error_prefix}: {e}") from e
+        # 用 _prefixed：_open 抛的 "HTTP 429 - …" 才没有前缀；其它路径
+        # （_decode_json 等）抛的已经带了 —— 直接再拼会得到两段式 ✗
+        raise ModelCallError(_prefixed(error_prefix, e)) from e
     return SseConnection(resp, error_prefix)
 
 
@@ -13633,9 +13699,9 @@ class AgentLoop:
                                       self.max_tokens_per_round(session_id))
             except Exception as e:
                 self._record(session_id, "SYSTEM_ERROR", {"error": str(e)},
-                             "模型调用失败: " + str(e))
+                             _prefixed("模型调用失败", e))
                 self._sound("ERROR")
-                return "模型调用失败: " + str(e)
+                return _prefixed("模型调用失败", e)
 
             self._record(session_id, "MODEL_RESPONSE",
                          {"content": _truncate(response.content, 200),
@@ -13821,14 +13887,14 @@ class AgentLoop:
                             acc.args_builder.append(str(d["arguments"]))
             except Exception as e:      # 流式调用失败
                 self._record(session_id, "SYSTEM_ERROR", {"error": str(e)},
-                             "流式调用失败: " + str(e))
+                             _prefixed("模型调用失败", e))
                 self._sound("ERROR")
-                yield AgentChunk.error("模型调用失败: " + str(e))
+                yield AgentChunk.error(_prefixed("模型调用失败", e))
                 return
 
             if stream_error:
                 self._sound("ERROR")
-                yield AgentChunk.error("模型调用失败: " + str(stream_error[0]))
+                yield AgentChunk.error(_prefixed("模型调用失败", stream_error[0]))
                 return
 
             # 流结束后把过滤器里扣住的剩余安全内容吐出来（未闭合的工具块会被丢掉）
