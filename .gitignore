@@ -60,3 +60,6 @@ lionbox-model-*.log
 
 # ── 测试临时目录（脚本用 mkdtemp 会落在 CWD，别让它进仓库）──────────
 lb-*/
+
+# Inno Setup 产物（183MB 级，不入库；用 installer/build_installer.ps1 重建）
+installer/output/

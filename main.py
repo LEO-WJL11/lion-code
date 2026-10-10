@@ -12864,7 +12864,7 @@ TOOL_PROMPT_HINTS: dict[str, str] = {
     "read_file": "读文件内容（已知具体路径时用它）。不知道文件在哪先用 glob_files / search_in_files；只看开头结尾用 head_tail_file；列目录/看结构用 directory_tree —— 本工具传目录会失败",
     "head_tail_file": "看文件开头/结尾 N 行。用户说“前 5 行/最后几行/看下开头”就用它，**不要用 read_file 整读**（大日志用这个省上下文）；想看结尾加 tail=true",
     "line_count": "统计行数。用户问“有多少行代码/一共多少行”就用它；path 给目录会递归累计所有文件",
-    "directory_tree": "画目录树（只看结构/有哪些文件用它，替代已停用的 list_directory）。用户说“目录结构/画给我看/树状/列一下目录”用它，path 给目录、maxDepth 控制层数",
+    "directory_tree": "画目录树（只看结构/有哪些文件、当前目录下有什么都用它）。用户说“目录结构/画给我看/树状/列一下目录”用它，path 给目录、maxDepth 控制层数",
     "glob_files": "按名字或后缀找文件。用户说“所有 .java 文件/找找 xyz 文件”用它，pattern 传 **/*.java 这种",
     "search_in_files": "在**文件内容**里搜文本或正则。用户说“哪里提到了 TODO/搜一下内容”用它",
     "create_file": "只创建**空**文件。要写内容请用 write_file",
