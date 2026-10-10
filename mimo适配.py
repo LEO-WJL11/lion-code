@@ -28,6 +28,7 @@ MiMo Code 的前端（OpenTUI + SolidJS，`MiMo-Code-main/packages/cli/src/cli/c
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -249,15 +250,24 @@ def broadcast(payload: dict) -> None:
 
 
 # ─────────────────────────────────────────── 数据构造
-def project() -> dict:
+def project(directory: str | None = None) -> dict:
+    """当前项目对象。
+
+    【`directory` 参数是干什么的】原来这里只用模块级 `_DIRECTORY`（**启动时定死** ✗），
+    而前端切工作区后会带 `?workspace=wrk_xxx` 来问 `GET /project/current` ——
+    我们不读那个参数就永远回启动目录 ⇒ **用户切完工作区，界面显示纹丝不动** ✗✗。
+    调用方用 `workspace_directory(self._workspace_of())` 把 id 解析成目录传进来 ✓，
+    解析不出来（无参数 / 未知 id）时 `directory=None` → 仍回 `_DIRECTORY`（默认工作区）✓。
+    """
     global _PROJECT_ID
     with _LOCK:
         if _PROJECT_ID is None:
             _PROJECT_ID = "prj_" + _slug(10)
         pid = _PROJECT_ID
-    return {"id": pid, "worktree": _DIRECTORY,
-            "vcs": "git" if os.path.isdir(os.path.join(_DIRECTORY, ".git")) else None,
-            "name": os.path.basename(_DIRECTORY.rstrip("\\/")) or "lion-code",
+    d = directory or _DIRECTORY
+    return {"id": pid, "worktree": d,
+            "vcs": "git" if os.path.isdir(os.path.join(d, ".git")) else None,
+            "name": os.path.basename(d.rstrip("\\/")) or "lion-code",
             "time": {"created": now_ms(), "updated": now_ms()},
             "sandboxes": []}
 
@@ -552,6 +562,71 @@ def workspace_directory(mimo_workspace_id: str) -> str:
             if w.get("id") == mimo_workspace_id:
                 return str(w.get("directory") or _DIRECTORY)
     return _DIRECTORY
+
+
+def workspace_id(directory: str) -> str:
+    """**由目录推导的稳定 id**（同目录永远同一个 id）。
+
+    【为什么不能用 `_slug(10)`】原来注册时随机生成 ✗ —— 适配层每重启一次，
+    同一个目录就换一个新 id：界面里存的选择、状态接口的键全都对不上了 ✗✗。
+    用 sha1(目录) 后 12 位 → 重启/重复登记都稳定 ✓（id 变化只影响内存态，
+    前端 store 也是内存的，不涉及持久化引用 ✓）。
+    """
+    norm = os.path.abspath(directory).replace("/", "\\").rstrip("\\").lower()
+    return "wrk_" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+def workspace_entry(directory: str, *, name: str | None = None,
+                    branch=None, extra_type: str | None = None) -> dict:
+    """一条工作区记录（列表元素的规范构造 ✓，保证 id 稳定 + 字段一致）。"""
+    d = os.path.abspath(directory)
+    return {
+        "id": workspace_id(d),
+        "type": str(extra_type or "local"),
+        "name": name or (os.path.basename(d.rstrip("\\/")) or "lion-code"),
+        "branch": branch,
+        "directory": d,
+        "extra": None,
+        "projectID": project()["id"],
+    }
+
+
+_SEEDED = False
+
+
+def seed_workspaces() -> None:
+    """把**后端已持久化**的工作区补进 `_WORKSPACES`（每次进程只做一次）。
+
+    【为什么必须】`_WORKSPACES` 是**纯内存**的 ✗✗ —— 适配层一重启就只剩默认那一个，
+    用户登记过的目录在界面上"消失"；而后端 `GET /api/workspaces` 其实一直留着它们
+    （实测：适配层只有 1 个、后端有 4 个含测试目录 ✓✓）。不同步就是自相矛盾 ✗✗。
+    幂等：同 id 已存在就跳过；解析失败不影响主流程（列表至少还有默认那条 ✓）。
+    """
+    global _SEEDED
+    if _SEEDED:
+        return
+    _SEEDED = True
+    try:
+        resp = _req("/api/workspaces") or {}
+        data = resp.get("data") if isinstance(resp, dict) else None
+        items = data if isinstance(data, list) else []
+    except Exception:                                     # noqa: BLE001
+        return
+    known = set()
+    with _LOCK:
+        known = {w.get("id") for w in _WORKSPACES}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        path = str(it.get("path") or it.get("id") or "").strip()
+        if not path or not os.path.isdir(path):
+            continue
+        entry = workspace_entry(path)
+        with _LOCK:
+            if entry["id"] in known:
+                continue
+            _WORKSPACES.append(entry)
+            known.add(entry["id"])
 
 
 def create_backend_session(directory: str = "") -> str:
@@ -907,6 +982,9 @@ class Handler(BaseHTTPRequestHandler):
         # 于是每次启动都强制你先建一个工作区才能发消息（实测就是这么卡住的）。
         # 结构照 SDK 的 Workspace：{id,type,name,branch,directory,extra,projectID}
         if p == "/experimental/workspace":
+            # 先把后端已持久化的补进来（进程内只做一次）✗ 否则适配层一重启，
+            # 用户登记过的目录在界面上就"消失"（后端其实一直有 ✓ 见 seed_workspaces）
+            seed_workspaces()
             with _LOCK:
                 if not _WORKSPACES:
                     _WORKSPACES.append(self._workspace())
@@ -916,6 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             # 【形状】前端读的是数组 [{workspaceID, status}, ...]
             # （context/project.tsx:64 直接对它 .map），返回字典会被整段丢掉。
             # 取值用前端枚举里的 "connected"，否则会话列表会显示成异常状态。
+            seed_workspaces()
             with _LOCK:
                 if not _WORKSPACES:
                     _WORKSPACES.append(self._workspace())
@@ -946,7 +1025,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"theme": "mimocode", "model": MODEL_ID,
                                **config_snapshot()})
         if p == "/project/current" or p == "/project":
-            return self._json(project())
+            # 【必须按 workspace 参数返回】SDK 调它时带 `?workspace=wrk_xxx`
+            # （context/project.tsx 的 `sdk.client.project.current({ workspace })`）。
+            # 以前直接回 `project()`（用启动时定死的 `_DIRECTORY` ✗），
+            # 于是前端把 store 的 current 切过去了、这边 worktree/name 却纹丝不动 ⇒
+            # **用户看到"切换工作区后显示不变"** ✗✗。现在按 id 解析成真实目录 ✓，
+            # 读不到（无参数/未知 id）就退回默认工作区（`workspace_directory` 内部兜底）。
+            wid = self._workspace_of()
+            return self._json(project(workspace_directory(wid) if wid else None))
 
         if p == "/config":
             # 同上：sync.tsx:864 的 bootstrap 读的是 GET /config（sync.data.config
@@ -1090,8 +1176,10 @@ class Handler(BaseHTTPRequestHandler):
         global _WORKSPACE_DEFAULT_ID
         name = os.path.basename(_DIRECTORY.rstrip("\\/")) or "lion-code"
         with _LOCK:
+            # id 由目录推导（稳定 ✓）—— 用随机 slug 的话适配层一重启就换 id，
+            # 状态接口的键与列表对不上（原注释指出的正是这个风险）。
             if not _WORKSPACE_DEFAULT_ID:
-                _WORKSPACE_DEFAULT_ID = "wrk_" + _slug(10)
+                _WORKSPACE_DEFAULT_ID = workspace_id(_DIRECTORY)
             wid = _WORKSPACE_DEFAULT_ID
         return {"id": wid, "type": "local", "name": name,
                 "branch": None, "directory": _DIRECTORY, "extra": None,
@@ -1324,10 +1412,12 @@ class Handler(BaseHTTPRequestHandler):
             if dup is not None:
                 return self._json(dup)
 
-            ws = {"id": "wrk_" + _slug(10), "type": str(body.get("type") or "local"),
-                  "name": name, "branch": body.get("branch"),
-                  "directory": directory, "extra": None,
-                  "projectID": project()["id"]}
+            # 用统一构造：id 由目录推导（同目录重复登记/重启后仍是同一个 id ✓），
+            # 原来这里 `wrk_ + _slug(10)` 是随机的 ✗ —— 每次登记都换 id。
+            ws = workspace_entry(directory,
+                                 name=name,
+                                 branch=body.get("branch"),
+                                 extra_type=str(body.get("type") or "local"))
             with _LOCK:
                 _WORKSPACES.append(ws)
             broadcast({"type": "project.updated", "properties": {"workspace": ws}})
