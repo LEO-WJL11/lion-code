@@ -389,6 +389,13 @@ def main() -> int:
         os.makedirs(tmp, exist_ok=True)
         frontend_log = open(os.path.join(logdir, "frontend.log"), "a",
                             encoding="utf-8", errors="replace")
+        # 【成功必须把 rc 翻回 0】初始 `rc = 1` 只是"还没做成"的默认值 ✗
+        # —— 我第一版漏了这句，下面 `if … and rc == 0` 于是**恒假**，
+        # **bun 根本没被启动过**，却照样打印"前端已退出（1）"，
+        # watchdog 日志表现为"已启动 → 同一秒停止"（与实测完全吻合）。
+        # 教训（本会话反复强调过、这次栽在自己身上）：**改启动路径必须真跑一次** ✗
+        # —— py_compile + 单元断言发现不了"条件恒假导致整段没执行"这类错 ✓
+        rc = 0
     except OSError as e:
         print(f"✗ 建 MiMo home / 临时目录 / 前端日志失败: {type(e).__name__}: {e}", flush=True)
         frontend_log = None
