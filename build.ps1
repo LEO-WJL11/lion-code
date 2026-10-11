@@ -95,9 +95,16 @@ Write-Host ('  per-target exit codes: ' + (($buildResult.GetEnumerator() | ForEa
 # ---------------------------------------------------------------
 Step 'STAGE 2  verify exes'
 $exeOk = 0
-foreach ($e in @('.lbcheck\snk_main\main.dist\LionCode.exe',
-                 '.lbcheck\build_out\' + ($adapterSrc -replace '\.py$','') + '.dist\adapter.exe',
-                 '.lbcheck\build_out\_start_mimo.dist\start.exe')) {
+# 【路径以 Nuitka 实际输出为准】main 的 dist 也在 build_out 下（旧脚本 build_main.ps1
+# 才用 snk_main；写死老路径会假报 MISSING）。另：字符串拼接不能写在 @() 的逗号列表里
+# （PowerShell 会把它拆成多个元素，上一版就出现过 "MISSING mimo适配" 这种碎片）。
+$adapterExeRel = '.lbcheck\build_out\' + ($adapterSrc -replace '\.py$', '') + '.dist\adapter.exe'
+$exeRels = @(
+  '.lbcheck\build_out\main.dist\LionCode.exe'
+  $adapterExeRel
+  '.lbcheck\build_out\_start_mimo.dist\start.exe'
+)
+foreach ($e in $exeRels) {
   $full = Join-Path $root $e
   if (Test-Path $full) { Ok ($e + '  ' + [math]::Round((Get-Item $full).Length/1MB,1) + ' MB'); $exeOk++ }
   else { Fail ('MISSING ' + $e) }

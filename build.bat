@@ -36,5 +36,7 @@ echo ============================================================
 echo.
 echo Press any key to close this window...
 pause >nul
-endlocal
-exit /b %RC%
+rem %RC% does not survive endlocal - carry it on the SAME line, otherwise this
+rem script always exits 0 even when the build failed (it just did: printed
+rem "RESULT: FAILED exit code 1" but returned 0).
+endlocal & exit /b %RC%
