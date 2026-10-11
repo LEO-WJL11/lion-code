@@ -236,9 +236,86 @@ def _apply_context_limit(limit: int) -> tuple[int, int, int]:
     return ok, fail, len(ids)
 
 
-def broadcast(payload: dict) -> None:
-    """把事件推给所有订阅者（GlobalEvent 外壳在这里补）。"""
-    evt = {"directory": _DIRECTORY, "project": _PROJECT_ID, "payload": payload}
+def session_directory(sid: str) -> str:
+    """会话 id → 它所属的目录（工作区目录）；认不出来退回 `_DIRECTORY`。"""
+    with _LOCK:
+        s = _SESSIONS.get(str(sid or ""))
+    return str((s or {}).get("directory") or "") or _DIRECTORY
+
+
+def event_directory(payload: dict, fallback: str = "") -> str:
+    r"""一条事件该挂哪个 `directory` —— 必须与 `GET /path` / `GET /project/current` 同源。
+
+    【为什么不能固定 `_DIRECTORY`（原来就是，行号 241 → 黑屏根因之一）】
+    GlobalEvent 的 `directory`/`workspace` 是前端**唯一**的事件过滤键
+    （MiMo-Code-main\packages\cli\src\cli\cmd\tui\context\event.ts）：
+      · L20-26 `workspace.current()` 有值时 —— 用户**一选工作区**它就有值
+        （dialog-workspace-list.tsx:119 / dialog-workspace-create.tsx:144 /
+         routes\session\index.tsx:303 都会 set）—— 只有
+        `event.workspace === project.workspace.current()` 的事件会被投递，
+        然后**直接 return**；
+      · L28 没选工作区时按 `event.directory === project.instance.directory()`，
+        而 instance.directory 来自 `GET /path`（本文件 L948-963，已改成按
+        workspace 解析真实目录）。
+    而广播原来发的是 `{directory: _DIRECTORY(=启动目录/安装目录), project, payload}`
+    —— **连 `workspace` 键都没有** ⇒ 选完工作区后 message.part.delta /
+    message.updated / session.idle / session.error **100% 被 useEvent 丢弃**
+    （SSE 只有一条连接、切工作区不重连 ⇒ 不是瞬态），界面"活着但什么都不动"。
+    事件是广播给所有订阅者的、各会话可能属于不同工作区 ⇒ **按事件主体**算目录：
+      ① payload 里显式带目录的工作区记录（project.updated 的 workspace）；
+      ② 会话对象自带的 directory（session.created/updated/deleted/compacted）；
+      ③ properties/part 里的 sessionID → 查会话的 directory；
+      ④ 调用方显式 fallback（无会话上下文的，如 /context-limit 广播）；
+      ⑤ 都没有 → `_DIRECTORY`（默认工作区，老调用方语义不变）。
+    workspace id 由目录派生（workspace_id，与 /experimental/workspace 列表同一个
+    sha1 函数）⇒ 与前端选中的 id 必然相等 ✓。
+    """
+    if not isinstance(payload, dict):
+        return fallback or _DIRECTORY
+    # 候选 id 按优先级排队再逐个查：message.updated 的 info 是**消息**对象
+    # （info.id 是 msg_xxx，查会话必然落空）—— 落空必须继续试
+    # properties.sessionID，不能把整条链短路掉 ✗（第一版就是这个 bug）。
+    cands: list[str] = []
+    props = payload.get("properties")
+    if isinstance(props, dict):
+        ws = props.get("workspace")
+        if isinstance(ws, dict) and ws.get("directory"):
+            return str(ws["directory"])
+        info = props.get("info")
+        if isinstance(info, dict):
+            if info.get("directory"):
+                return str(info["directory"])
+            cands.append(str(info.get("sessionID") or ""))
+        cands.append(str(props.get("sessionID") or ""))
+        part = props.get("part")
+        if isinstance(part, dict):
+            cands.append(str(part.get("sessionID") or ""))
+        if isinstance(info, dict):
+            cands.append(str(info.get("id") or ""))
+    for sid in cands:
+        if not sid:
+            continue
+        with _LOCK:
+            s = _SESSIONS.get(sid)
+        d = str((s or {}).get("directory") or "")
+        if d:
+            return d
+    return fallback or _DIRECTORY
+
+
+def broadcast(payload: dict, directory: str | None = None,
+              workspace: str | None = None) -> None:
+    """把事件推给所有订阅者（GlobalEvent 外壳在这里补）。
+
+    `directory`/`workspace` 按**事件主体**计算（见 event_directory）——
+    这两个字段必须与 `GET /path`、`GET /project/current` 返回的一致，否则
+    useEvent（event.ts:20-28）按当前工作区过滤时会把事件整条丢掉 ✗✗✗。
+    调用方有请求上下文（如 PATCH /context-limit 无 sessionID）时传 `directory`；
+    有会话/工作区记录时不用传（自动解析）。
+    """
+    d = directory or event_directory(payload)
+    wid = workspace or workspace_id(d)
+    evt = {"directory": d, "workspace": wid, "project": _PROJECT_ID, "payload": payload}
     line = "data: " + json.dumps(evt, ensure_ascii=False) + "\n\n"
     with _LOCK:
         subs = list(_SUBS)
@@ -282,8 +359,14 @@ def new_session(title: str = "新会话", parent: str | None = None,
     except Exception:                                     # noqa: BLE001
         pass
     sid = from_backend_id(bid) if bid else "ses_" + _slug(12)
+    d = directory or _DIRECTORY
     s = {"id": sid, "slug": _slug(6), "projectID": project()["id"],
-         "directory": directory or _DIRECTORY, "parentID": parent, "title": title,
+         # 【workspaceID 必须给】routes\session\index.tsx:302-312 拿它自动
+         # 切工作区（session 对象类型见 types.gen.ts:1425）；没有它，
+         # 直接 attach 到工作区会话时 current 不会被设置 → useEvent 只能走
+         # directory 分支，事件与 /path 不一致就整条丢（见 event_directory）。
+         "workspaceID": workspace_id_for(d),
+         "directory": d, "parentID": parent, "title": title,
          "titleSource": "user", "titleRevision": 1, "version": VERSION,
          "backendID": bid,
          "time": {"created": now_ms(), "updated": now_ms()}}
@@ -420,6 +503,11 @@ def backend_sessions() -> list:
             "slug": uuid.replace("-", "")[:8],
             "projectID": project()["id"],
             "directory": ws,
+            # 同 new_session：后端会话也要带 workspaceID（前端 session/index.tsx
+            # :302 靠它自动切工作区）。ws 就是后端记录的工作区**路径**
+            # （create_backend_session 的 POST /api/workspaces id，实测同值），
+            # 派生规则与 /experimental/workspace 列表同源 ✓ 目录没登记 → None。
+            "workspaceID": workspace_id_for(ws),
             "parentID": None,
             "title": _title_of(uuid, x.get("name"), extra=ws),
             # 【必须是合法枚举】SDK 的 Session.titleSource 只认
@@ -494,7 +582,7 @@ def session_messages(sid: str) -> tuple:
                          "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT})
             # 历史消息同样必填 path/cost/tokens —— 重开/刷新会话读的就是这一条路径
             # （对话框崩不崩只看数据形状，历史与流式一视同仁 ✓）
-            base.update(assistant_shape())
+            base.update(assistant_shape(session_directory(sid)))
         msgs.append(base)
         mid_parts = []
         text = str(rec.get("content") or "")
@@ -528,7 +616,12 @@ def backend_session(session_id: str) -> str:
         s = _SESSIONS.get(session_id)
         if s is not None and s.get("backendID"):
             return str(s["backendID"])
-    bid = create_backend_session()
+    # 会话已知 → 把它的真实目录交给后端（POST /api/workspaces 的 id 就是路径）：
+    # 不传的话所有后端会话都挂到 `_DIRECTORY`（安装目录）名下 —— 后端会话列表的
+    # workspaceId 随后又回流成 backend_sessions() 的 directory（L416），
+    # 侧栏里工作区会话就永远显示成安装目录 ✗。目录未知的会话仍退回
+    # `_DIRECTORY`（create_backend_session 内部兜底，老调用方语义不变）。
+    bid = create_backend_session(session_directory(session_id))
     if bid:
         with _LOCK:
             cur = _SESSIONS.get(session_id)
@@ -574,6 +667,37 @@ def workspace_id(directory: str) -> str:
     """
     norm = os.path.abspath(directory).replace("/", "\\").rstrip("\\").lower()
     return "wrk_" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+def workspace_id_for(directory: str) -> str | None:
+    r"""会话目录 → 所属工作区 id；不属于任何已登记工作区（且不是默认目录）→ None。
+
+    【为什么 session 要带 workspaceID —— 前端在消费，我们一直没给】
+    `Session.workspaceID?: string` 是 SDK 类型字段（types.gen.ts:1425），
+    routes\session\index.tsx:302-312 拿它和 `project.workspace.current()` 比，
+    不一致就 `workspace.set(result.data.workspaceID)` 并补一次 bootstrap ——
+    适配层的会话对象**从来没有这个字段** ⇒ 恒 undefined ⇒ 直接 attach 到
+    工作区会话（--session / MIMOCODE_ROUTE / 重启续用）时 current 永远不被设置，
+    事件只能走 event.ts:28 的 directory 分支，与 /path 对不上就全丢 ✗。
+    这里按目录派生（列表 id 同源 workspace_id），目录不在列表里也没和
+    `_DIRECTORY` 相等时返回 None —— 宁可不给（前端保持 undefined），也不给一个
+    会被 workspace.sync（project.tsx:75-77 列表里查不到就清掉）清掉的野 id。
+    """
+    d = str(directory or "").strip() or _DIRECTORY
+    try:
+        d = os.path.abspath(d)
+    except OSError:
+        d = _DIRECTORY
+    with _LOCK:
+        items = list(_WORKSPACES)
+    for w in items:
+        if os.path.normcase(str(w.get("directory") or "")) == os.path.normcase(d):
+            return str(w.get("id") or "") or workspace_id(d)
+    # 默认工作区：列表可能还没 seed（适配层刚启动、/experimental/workspace 还没被
+    # GET 过）——它按定义就是 `_DIRECTORY`，直接派生，别返回 None。
+    if os.path.normcase(d) == os.path.normcase(_DIRECTORY):
+        return workspace_id(_DIRECTORY)
+    return None
 
 
 def workspace_entry(directory: str, *, name: str | None = None,
@@ -659,7 +783,7 @@ def create_backend_session(directory: str = "") -> str:
     return sid
 
 
-def assistant_shape() -> dict:
+def assistant_shape(directory: str = "") -> dict:
     """AssistantMessage 必填、而适配层两处构造都漏掉的三组字段。
 
     【以哪为准】`packages/sdk/src/v2/gen/types.gen.ts` 的 AssistantMessage（L1028）：
@@ -682,7 +806,14 @@ def assistant_shape() -> dict:
     `last` 为 undefined → L37 三元给 undefined → 对话框正常打开、只是不显示用量 ✓。
     要显示真用量得后端加 usage 帧 —— 已记入"未做"，不假装有数据 ✗。
     """
-    return {"path": {"cwd": _DIRECTORY, "root": _DIRECTORY},
+    # 【path.cwd/root 跟会话走，不再固定启动目录】AssistantMessage.path 是必填
+    # （types.gen.ts:1054），三个构造点（session_messages 回放 / new_message /
+    # _chat 兜底）都拿得到 sid ⇒ 传会话自己的 directory（= 工作区目录），
+    # 认不出才退回 `_DIRECTORY`（默认工作区，老语义）。消费方只读形状、不参与
+    # 事件过滤（dialog-status.tsx:28/38、acp/agent.ts:110/1386 读 tokens），
+    # 所以这里改语义只影响显示的目录，不影响投递。
+    d = directory or _DIRECTORY
+    return {"path": {"cwd": d, "root": d},
             "cost": 0,
             "tokens": {"input": 0, "output": 0, "reasoning": 0,
                        "cache": {"read": 0, "write": 0}}}
@@ -702,7 +833,7 @@ def new_message(sid: str, role: str, parent: str = "", text: str = ""):
                      "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT,
                      "time": {"created": now_ms()}})
         # 必填三项（path/cost/tokens）—— 缺了 status 对话框一开就崩，见 assistant_shape()
-        base.update(assistant_shape())
+        base.update(assistant_shape(session_directory(sid)))
     with _LOCK:
         _MESSAGES.setdefault(sid, []).append(base)
         _PARTS[mid] = []
@@ -947,10 +1078,20 @@ class Handler(BaseHTTPRequestHandler):
         # 前端拿到 404 就直接退出（退出码 0，看着像"正常结束"）。
         if p == "/path":
             home = os.path.expanduser("~")
+            # 【必须按 workspace 返回，不能用启动时定死的 `_DIRECTORY`】
+            # 这台机器上 `_DIRECTORY` = 适配层的 cwd = **安装目录**
+            # （`lion-code.cmd` 先 `cd /d "%ROOT%"` 再起它 ✓），于是 worktree/directory
+            # 返回的是安装目录而非当前工作区 —— 前端把它写进 `instance.path` 后，
+            # 与它自己算出的工作区目录不一致（project.tsx:44-51 明写这个后果：
+            # 不一致会让 useEvent 按 instance.directory() 过滤时**丢掉实时事件** ✗✗✗）。
+            # 修法与 /project/current 同源同方法：header/query/body 三处读 workspace id
+            # → 解析成真实目录；读不到就退回 `_DIRECTORY`（默认工作区）。
+            wid = self._workspace_of()
+            d = workspace_directory(wid) if wid else _DIRECTORY
             return self._json({"home": home,
                                "state": os.path.join(home, ".local", "share", "lioncode"),
                                "config": os.path.join(home, ".config", "lioncode"),
-                               "worktree": _DIRECTORY, "directory": _DIRECTORY})
+                               "worktree": d, "directory": d})
         if p == "/experimental/resource":
             # 【必须是"资源 map"，不是 CPU 指标】我原来返回 {"cpu","memory","uptime"}
             # ✗ —— 那是按名字瞎猜的。真消费方（先读再改的）：
@@ -1309,7 +1450,14 @@ class Handler(BaseHTTPRequestHandler):
         with _LOCK:
             _SUBS.append(q)
         try:
-            first = {"directory": _DIRECTORY, "project": _PROJECT_ID,
+            # server.connected 也要带对 directory/workspace：useEvent
+            # （event.ts:20-28）对**每一条**事件都按当前工作区过滤，首条也不例外
+            # （过滤键与 GET /path 同源 —— 连接若带 ?workspace= 就按它解析，
+            #  不带则回默认工作区 `_DIRECTORY`，与 /path 无参时同值 ✓）。
+            wid0 = self._workspace_of()
+            d0 = workspace_directory(wid0) if wid0 else _DIRECTORY
+            first = {"directory": d0, "workspace": workspace_id(d0),
+                     "project": _PROJECT_ID,
                      "payload": {"type": "server.connected", "properties": {}}}
             self.wfile.write(("data: " + json.dumps(first, ensure_ascii=False) + "\n\n").encode())
             self.wfile.flush()
@@ -1470,10 +1618,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat(self, sid: str, body: dict, blocking: bool):
         """发消息：先回执一条 user 消息，再开线程把回答流式推出去。"""
+        # 【会话落进请求所属的工作区】往一个还不存在于内存的 sid 发消息时
+        # （直连 /prompt、历史会话），目录按 header/query/body 三处的 workspace
+        # 解析（_workspace_of），读不到就 `_DIRECTORY`（workspace_directory 内部
+        # 兜底）—— 原来写死 `_DIRECTORY` ⇒ 会话/事件全被算到安装目录名下 ✗。
+        _cd = workspace_directory(self._workspace_of(body))
         with _LOCK:
             if sid not in _SESSIONS:
                 _SESSIONS[sid] = {"id": sid, "slug": _slug(6), "projectID": project()["id"],
-                                  "directory": _DIRECTORY, "title": "会话",
+                                  "workspaceID": workspace_id_for(_cd),
+                                  "directory": _cd, "title": "会话",
                                   "titleSource": "fallback", "titleRevision": 1,
                                   "version": VERSION,
                                   "time": {"created": now_ms(), "updated": now_ms()}}
@@ -1527,7 +1681,7 @@ class Handler(BaseHTTPRequestHandler):
         info = {"id": amid, "sessionID": sid, "agentID": AGENT, "role": "assistant",
                 "parentID": umid, "modelID": MODEL_ID, "providerID": PROVIDER_ID,
                 "mode": "build", "agent": AGENT, "time": {"created": n}}
-        info.update(assistant_shape())      # path/cost/tokens（475-479 同款）
+        info.update(assistant_shape(session_directory(sid)))  # path/cost/tokens（475-479 同款）
         with _LOCK:
             raw = self._encode({"info": info, "parts": list(_PARTS.get(amid, []))})
         return self._emit(raw)
@@ -1595,8 +1749,13 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             comp_cfg["max_context"] = (
                                 dict(mc) if isinstance(mc, dict) else mc)
+                # 这条 info 里既无 sessionID 也无 directory（只有 contextLimit），
+                # 事件主体只能取**请求**所属的工作区（header/query/body 三读），
+                # 否则 event_directory 会退回 `_DIRECTORY`，选了工作区的客户端
+                # 按 event.workspace 过滤时收不到（event.ts:20-26）。
                 broadcast({"type": "session.updated",
-                           "properties": {"info": {"contextLimit": limit}}})
+                           "properties": {"info": {"contextLimit": limit}}},
+                          directory=workspace_directory(self._workspace_of(body)))
 
             # 【/models 选完模型走这里】把模型切换落到后端
             want = None
