@@ -1226,13 +1226,18 @@ def _finish_message(sid: str, mid: str) -> None:
 
 
 # ─────────────────────────────────────────── 聊天：翻译到 Lion Code 后端
-def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> None:
+def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH",
+                    steer: bool = False) -> None:
     """把 Lion Code 后端的 SSE 翻译成 MiMo 的 message.part.* 事件。"""
     url = BACKEND + "/api/chat/stream"
     # 【必须用后端 id】适配层的 ses_xxx 后端不认识 → 直接转发就是"会话不存在"
     bid = backend_session(sid) or sid
-    body = json.dumps({"sessionId": bid, "message": text,
-                       "thinkingLevel": thinking}).encode("utf-8")
+    payload = {"sessionId": bid, "message": text, "thinkingLevel": thinking}
+    # 【插队透传】isSteer 只在为真时才带：正常请求保持原样（后端语义：
+    # steer=True = 停掉当前任务、让这条消息立刻接手；忙时不再直接拒绝）。
+    if steer:
+        payload["isSteer"] = True
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     acc = ""
@@ -2025,8 +2030,11 @@ class Handler(BaseHTTPRequestHandler):
         if text:
             new_part_text(sid, umid, text, start=True, end=True)
         amid = new_message(sid, "assistant", parent=umid)
+        # 【插队透传】TUI 在 prompt_async 的 body 里带 isSteer=true（用户触发的打断），
+        # 原样转给后端的 /api/chat/stream —— 否则"会话正忙"时只能干等（见后端端点注释）。
         t = threading.Thread(target=_stream_backend, args=(sid, text, amid),
-                             kwargs={"thinking": str(body.get("thinkingLevel") or "HIGH")},
+                             kwargs={"thinking": str(body.get("thinkingLevel") or "HIGH"),
+                                     "steer": bool(body.get("isSteer"))},
                              daemon=True)
         t.start()
         if blocking:

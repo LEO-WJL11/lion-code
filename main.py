@@ -22166,8 +22166,30 @@ class ChatApi:
             # 这里到生成器启动之间可能出异常（saved_model/expand_mentions 读盘），
             # 或客户端在响应头写出前断开导致生成器从未被启动 —— 占用若记在这里，
             # _streaming_sessions 的条目将没有任何释放路径，该会话之后永远"会话正忙"。
+            # ---------------------------------------------------------------
+            # 【插队 / steer】isSteer=true = 打断当前任务、让本条消息立刻接手。
+            # 同步端点 /api/chat 一直支持它（L22128 → api.send(..., steer) →
+            # dispatcher.submit：agent_control.stop + 队列 priority=100）；
+            # 而 TUI 走的是**流式**这条 —— 这里原来没有 steer 位，忙时只会拒绝
+            # （"会话正忙，请等待当前任务完成"）⇒ 用户想插队根本插不进来 ✗✗✗。
+            # 修法：忙 + steer 时先停当前任务，等占用真正释放（生成器结束才释放，
+            # 所以要轮询而不是停一次就完），再放行本条；超时就如实报错，不假装成功。
+            # ---------------------------------------------------------------
+            steer = _jackson_boolean(body.get("isSteer"))
             if dispatcher.is_busy(session_id):
-                return _error_response("会话正忙，请等待当前任务完成")
+                if steer is not True:
+                    return _error_response("会话正忙，请等待当前任务完成")
+                api.control().stop(session_id)
+                log__queue_dispatcher.info(
+                    "Steer插队(流式): 已请求停止会话 %s 当前任务，等待占用释放", session_id)
+                for _i in range(60):                     # 30s 上限（60 × 0.5s）
+                    if not dispatcher.is_busy(session_id):
+                        break
+                    time.sleep(0.5)
+                if dispatcher.is_busy(session_id):
+                    return _error_response(
+                        "插队失败：当前任务 30 秒内没有停下来（可能卡在单次长调用里）")
+                log__queue_dispatcher.info("Steer插队(流式): 占用已释放，新消息接手 %s", session_id)
 
             level = _parse_level(level_name)
             if _java_blank__api_chat(model):
