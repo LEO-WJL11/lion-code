@@ -495,11 +495,29 @@ function Invoke-ApiSuite([string]$phase, [bool]$withAdapter) {
         Assert ($a.st -eq 200) ($phase + ': adapter GET /global/health == 200')
     }
 
+    # ------------------------------------------------------------------
+    # CLOUD KEY MUST NEVER LIVE IN GIT (this file used to contain it in
+    # plaintext; it already reached the remote). Resolution order:
+    #   1) $env:LIONCLOUD_API_KEY
+    #   2) <repo>\.lbcheck\cloud_key.txt   (that directory is gitignored)
+    # If neither is present we SKIP the assertions that need a real key and
+    # print SKIP - never fake a pass.
+    # ------------------------------------------------------------------
+    $cloudKey = $env:LIONCLOUD_API_KEY
+    if (-not $cloudKey) {
+        $kf = Join-Path $root '.lbcheck\cloud_key.txt'
+        if (Test-Path $kf) { $cloudKey = (Get-Content $kf -Raw).Trim() }
+    }
+    $haveKey = [bool]$cloudKey
+    if (-not $haveKey) {
+        Write-Host ('  [' + $phase + '] SKIP cloud chat: no LIONCLOUD_API_KEY env and no .lbcheck\cloud_key.txt')
+    }
+
     Write-Host '  --- cloud mode: step 1 POST /api/runtime/mode (custom) ---'
     $r1 = HttpPostJson ($backend + '/api/runtime/mode') @{
         mode = 'custom'
         baseUrl = 'https://token-plan-cn.xiaomimimo.com/v1'
-        apiKey = 'tp-csttjvymida1debrhdu692ubt8qervw0dh6nsbg79mzm0nuu'
+        apiKey = $cloudKey
         model = 'mimo-v2.6-flash'
     }
     Assert ($r1.st -eq 200) ($phase + ': POST /api/runtime/mode == 200')
@@ -509,7 +527,7 @@ function Invoke-ApiSuite([string]$phase, [bool]$withAdapter) {
     Write-Host '  --- cloud mode: step 2 POST /api/chat/adapter/config (re-point active adapter) ---'
     $r2 = HttpPostJson ($backend + '/api/chat/adapter/config') @{
         baseUrl = 'https://token-plan-cn.xiaomimimo.com/v1'
-        apiKey = 'tp-csttjvymida1debrhdu692ubt8qervw0dh6nsbg79mzm0nuu'
+        apiKey = $cloudKey
         model = 'mimo-v2.6-flash'
     }
     Assert ($r2.st -eq 200) ($phase + ': POST /api/chat/adapter/config == 200')
