@@ -22588,6 +22588,34 @@ class AgentControlApi:
     def register__api_agent_control(self, router) -> None:
         api = self
 
+        def stop_children(parent_session_id: str) -> int:
+            """级联：停父会话的同时把它名下还没到终态的子代理也停掉，返回停掉的个数。
+
+            【为什么必须级联】原生 `SessionPrompt.cancel`（`session/prompt.ts:768-826`）
+            停一个会话时会**顺手把该会话下所有非 main actor 一起 cancel 掉** ——
+            我们原来只停父 ✗ ⇒ 界面上按了停止、父任务卡在 `agent_spawn` 的工具调用里，
+            子代理却还在闷头跑，看起来就是"停止按钮没用" ✗✗。
+            【为什么只在这里加】全项目只有适配层会调 `POST /api/chat/control/stop`
+            （`mimo适配.py` 的 `/session/{id}/abort`），没有别的消费者依赖
+            "只停父"这个旧行为 ✓。
+            【停不掉的那条竞态】子代理一进 `agent_loop.process_message` 就会
+            `control.reset(child)`（`main.py:13730` / `main.py:13903`），会把
+            **过早**的这次 stop 抹掉 ⇒ 所以除了 `control().stop(child)` 之外，
+            注册表还要打一个 `stop_requested` 标，由 spawn 侧在开跑前再拦一次
+            （`插件管理.py` 的 `actor_take_stop_request`）。
+            """
+            n = 0
+            for actor_id, child_session_id in 插件管理.actor_running_children(parent_session_id):
+                try:
+                    api.control().stop(child_session_id)
+                except Exception as e:                    # noqa: BLE001
+                    # 级联失败绝不许把"停父"这件事本身带崩
+                    print(f"[agent_control] 级联停子代理 {child_session_id} 失败: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                插件管理.actor_note_stop_requested(actor_id)
+                n += 1
+            return n
+
         @router.post("/api/chat/control/pause")
         def pause(req: Request):
             session_id = api._check(req)
@@ -22610,9 +22638,17 @@ class AgentControlApi:
             if not isinstance(session_id, str):
                 return session_id
             api.control().stop(session_id)
+            # 级联停子代理（原生 prompt.ts:768-826 的语义）—— 详见 stop_children
+            stopped_children = stop_children(session_id)
             cancelled = api._cancel_pending_questions(session_id)
             message = (MSG_STOPPED_CANCELLED.format(n=cancelled) if cancelled > 0
                        else MSG_STOPPED)
+            # 【文案不能动】Java 逐字是"已请求停止"，data/message 形状有实测基线；
+            # 级联停掉几个子代理只写日志，不改给前端的文案（界面状态另有
+            # GET /api/agents + actor.status 事件负责）。
+            if stopped_children:
+                print(f"[agent_control] 级联停止：{session_id} 名下 {stopped_children} 个子代理已请求停止",
+                      flush=True)
             return ApiResponse.ok(data=None, message=message)
 
         @router.get("/api/chat/control/status")
@@ -22621,6 +22657,23 @@ class AgentControlApi:
             if isinstance(session_id, Response):
                 return session_id           # 缺 sessionId 查询参数 → 400
             return ApiResponse.ok(api._state_of(session_id), message=MSG_STATUS)
+
+        @router.get("/api/agents")
+        def agents(req: Request):
+            """该会话名下子代理的状态行（界面「agent 状态」的数据源）。
+
+            【为什么套 `ApiResponse`】这是我们**新加**的接口（原生对应
+            `GET /session/:id/actors`，走的是另一条适配链路），没有 Java 侧的
+            形状要逐字对齐 ⇒ 统一用项目里的 `ApiResponse` 信封，`data` 就是行数组；
+            没有子代理时 `data: []`（**空数组不是 null** —— `ApiResponse.ok` 只省略
+            `None`，`[]` 会原样带上，调用方 `isinstance(data, list)` 才判得对）。
+            sessionId 校验与 `GET /status` 同源：缺参数 400、空白折成 None → 回空表。
+            """
+            session_id = query_session_id(req)
+            if isinstance(session_id, Response):
+                return session_id
+            rows = 插件管理.actor_rows(session_id) if session_id else []
+            return ApiResponse.ok(rows)
 
 
 def register__api_agent_control(router, ctx) -> None:

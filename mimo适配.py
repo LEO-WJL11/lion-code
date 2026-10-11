@@ -726,6 +726,213 @@ def backend_session(session_id: str) -> str:
     return str(bid)
 
 
+# ─────────────────────────────────────────── 子代理状态（界面「agent 状态」）
+#: 后端会话 id 就是标准 UUID；只有 UUID 才做 ses_ 派生（别的原样回，不瞎转）
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _actor_child_sid(raw) -> str:
+    r"""行里的子会话 id：后端 UUID → MiMo 侧 id（不是 UUID 就原样）。
+
+    【为什么必须转】`DialogSubagent`（`...\tui\routes\session\dialog-subagent.tsx:40`）
+    点一行 peer 是 `route.navigate({type:"session", sessionID: a.session_id})` ——
+    把后端 UUID 直接递给前端的话，前端拿它去问 `GET /session/<uuid>` 认不出来 ✗。
+    `from_backend_id` 造出来的 `ses_<32hex>` 又能被 `backend_session()` 原样反查回
+    同一个 UUID（`to_backend_id`），所以这一行上的停止按钮
+    `POST /session/<sid>/abort` 也会落回**同一个子会话** ✓。
+    """
+    s = str(raw or "")
+    return from_backend_id(s) if _UUID_RE.match(s) else s
+
+
+def map_actor_row(row: dict) -> dict:
+    r"""后端注册表行 → 原生 `/session/:id/actors` 行。
+
+    【逐字段对齐谁】`MiMo-Code-main\packages\cli\src\cli\cmd\tui\context\sync.tsx`
+    L1049-1061（只读）逐个读：
+        `row.actorID` `row.sessionID` `row.mode`
+        `actorStatusFromEvent(row)` ← 同文件 L142-160
+        `row.agent` `row.description` `row.parentActorID ?? null`
+        `row.time?.created` `row.time?.updated`
+        `row.turnCount ?? 0` `row.lastTurnTime ?? null`
+    `actorStatusFromEvent` 只认 status / lastOutcome / executionState /
+    executionActive 这四个键 —— 后端（`插件管理.py` 的 `_ACTOR_ROW_STATE`）已经按
+    原生 `actor/waiter.ts:82-94` 的形状给好了，这里**原样透传**，只做 id 转换；
+    自己另发明一套状态会让它落到 `return "unknown"` ✗（对话框里就显示 unknown）。
+    """
+    t = row.get("time") if isinstance(row.get("time"), dict) else {}
+    time_out: dict = {
+        "created": _ms(t.get("created")),
+        "updated": _ms(t.get("updated")),
+    }
+    completed = t.get("completed")
+    if completed is not None:
+        time_out["completed"] = _ms(completed)
+    out: dict = {
+        "actorID": str(row.get("actorID") or ""),
+        "sessionID": _actor_child_sid(row.get("sessionID")),
+        "mode": str(row.get("mode") or "peer"),
+        "agent": str(row.get("agent") or "subagent"),
+        "description": str(row.get("description") or ""),
+        "background": bool(row.get("background") or False),
+        "parentActorID": (str(row["parentActorID"]) if row.get("parentActorID") else None),
+        "time": time_out,
+        "turnCount": _int0(row.get("turnCount")),
+        "lastTurnTime": (None if row.get("lastTurnTime") is None
+                         else _ms(row.get("lastTurnTime"))),
+        # 内部状态给日志/排障用，原生行没有这个键 —— 多一个字段不影响 sync.tsx 的读法
+        "registryStatus": str(row.get("registryStatus") or ""),
+    }
+    # 展示四件套：原样透传（见 docstring）
+    for key in ("status", "executionActive", "executionState", "lastOutcome"):
+        if row.get(key) is not None:
+            out[key] = row[key]
+    return out
+
+
+def _ms(v) -> int:
+    """转毫秒整数；转不动就回当前时间（时间戳只用于展示，不能让一行整条消失）。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return now_ms()
+
+
+def _int0(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def actor_rows_for(mimo_sid: str) -> list[dict]:
+    r"""`GET /session/{id}/actors` → 该会话名下子代理的原生行。
+
+    后端是 `GET /api/agents?sessionId=<后端 id>`（`main.py` 的
+    `AgentControlApi.register__api_agent_control`），响应是 `ApiResponse` 信封，
+    行数组在 `data` 里；没有子代理时是 `data: []`。
+    """
+    bid = backend_session(mimo_sid) or mimo_sid
+    resp = _req("/api/agents?sessionId=" + urllib.parse.quote(bid))
+    if resp is None:
+        # 后端没起来 / 超时：与改动前"恒回空数组"的行为一致，不当错误
+        return []
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not isinstance(data, list):
+        # 【形状不对必须吵】静默当空表会把"子代理不显示"变成查不出来的哑巴 bug ✗
+        print(f"[actors] /api/agents 返回形状不对，原始返回: {resp!r}", flush=True)
+        return []
+    out: list[dict] = []
+    for row in data:
+        if not isinstance(row, dict):
+            print(f"[actors] 行不是对象，原始行: {row!r}", flush=True)
+            continue
+        out.append(map_actor_row(row))
+    return out
+
+
+def _actor_event_state(row: dict) -> str:
+    """把行折成一个**只用于 diff** 的状态名（同名 = 没变化，不发事件）。"""
+    if row.get("executionActive") is True:
+        return "running"
+    if str(row.get("status") or "") == "pending":
+        return "pending"
+    es = str(row.get("executionState") or "")
+    if es in ("running", "completed", "failed", "cancelled", "stopped"):
+        return es
+    return str(row.get("status") or "unknown")
+
+
+def _actor_status_props(sid: str, actor_id: str, row: dict) -> dict:
+    r"""`actor.status` 事件的 properties —— schema 见 `src\actor\events.ts:19-30`。
+
+    【为什么只能给这几个键】那条 zod schema 只有
+    `sessionID / actorID / status / lastOutcome? / turnCount / lastTurnTime / error?`，
+    `status` 还是 `z.enum(["pending","running","idle"])` ✗ —— 我们自己的内部状态名
+    （completed/stopped/…）**放不进去**。所以按 `actorStatusFromEvent` 的规则把
+    终态折成 `status:"idle" + lastOutcome?`：
+        running → "running"；pending → "pending"；
+        completed → idle + lastOutcome:"success"（前端显示 completed）；
+        failed → idle + lastOutcome:"failure"（显示 failed）；
+        stopped / stop_requested → 只给 idle、**不给 lastOutcome**
+        （前端显示 stopped —— 给 cancelled 会显示成 cancelled，与我们后端的
+         "手动停止"语义不符）。
+    """
+    state = _actor_event_state(row)
+    props: dict = {
+        "sessionID": sid,                 # 存进 store.actor[sid] 的**键**（必须是被看的会话）
+        "actorID": actor_id,
+        "turnCount": _int0(row.get("turnCount")),
+        "lastTurnTime": _ms(row.get("lastTurnTime")),
+    }
+    if state == "running":
+        props["status"] = "running"
+    elif state == "pending":
+        props["status"] = "pending"
+    else:
+        props["status"] = "idle"
+        if state == "completed":
+            props["lastOutcome"] = "success"
+        elif state == "failed":
+            props["lastOutcome"] = "failure"
+    return props
+
+
+def _actor_poll_once(sid: str, prev: dict) -> None:
+    """拉一次 `/api/agents`，把**新行**和**状态变化**广播出去。"""
+    rows = actor_rows_for(sid)
+    for row in rows:
+        actor_id = str(row.get("actorID") or "")
+        if not actor_id:
+            continue
+        state = _actor_event_state(row)
+        old = prev.get(actor_id)
+        if old is None:
+            # 首次见到：先 registered 再 status —— `actor.status` 的处理端
+            # （sync.tsx:771-783）**找不到行就直接丢弃**，顺序反了状态就丢了 ✗。
+            # 已经存在的行会被 registered 的去重分支挡掉（sync.tsx:753）✓。
+            broadcast({"type": "actor.registered", "properties": {
+                "sessionID": sid,
+                # 行自己的会话（peer 的子会话），与 REST 行的 sessionID 同源 ——
+                # 见 dialog-subagent 的点行跳转；sync.tsx 用它当 session_id
+                "ownSessionID": row.get("sessionID"),
+                "actorID": actor_id,
+                "mode": row.get("mode") or "peer",
+                "parentActorID": row.get("parentActorID") or None,
+                "description": row.get("description") or "",
+                "agent": row.get("agent") or "subagent",
+                "background": bool(row.get("background") or False),
+            }})
+            broadcast({"type": "actor.status",
+                       "properties": _actor_status_props(sid, actor_id, row)})
+        elif old != state:
+            broadcast({"type": "actor.status",
+                       "properties": _actor_status_props(sid, actor_id, row)})
+        prev[actor_id] = state
+
+
+def _actor_poller(sid: str, stop: threading.Event) -> None:
+    r"""流式期间每 1s 拉一次状态做 diff（选的方案 (a)）。
+
+    【为什么是独立线程】`_stream_backend` 的主循环 `for raw in r` 是**阻塞读** ——
+    模型不吐字的时候一个字节都不来，把轮询塞进循环里就等于"有输出才轮询"，
+    子代理的状态恰恰是在模型安静时才最需要更新 ✗。
+    【为什么停完还要再拉一次】`stop.wait(1.0)` 返回 True（收到停止信号）时也先把
+    这一轮拉完再退出 —— 否则最后一次状态变化可能停在 1s 前，界面留个旧状态 ✗。
+    """
+    prev: dict[str, str] = {}
+    while True:
+        done = stop.wait(1.0)
+        try:
+            _actor_poll_once(sid, prev)
+        except Exception as e:                            # noqa: BLE001
+            # 轮询挂了不许影响流本身（子代理状态少刷一次而已）
+            print(f"[actors] 轮询失败（不影响对话）: {type(e).__name__}: {e}", flush=True)
+        if done:
+            break
+
+
 def new_workspace_root() -> str:
     r"""新建工作区的落地根目录（`/new` 和 `/workspaces` 里"新建"的落点）。
 
@@ -1029,6 +1236,11 @@ def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> No
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     acc = ""
+    # 【流式期间轮询子代理状态】方案 (a)：独立线程每 1s 拉一次 /api/agents 做 diff，
+    # 广播 actor.registered / actor.status（见 _actor_poller 的说明 —— 主循环是阻塞读，
+    # 塞进循环里就变成"模型有输出才刷新"，而子代理状态恰恰在模型安静时才最需要更新）。
+    _actor_stop = threading.Event()
+    threading.Thread(target=_actor_poller, args=(sid, _actor_stop), daemon=True).start()
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             for raw in r:
@@ -1093,6 +1305,9 @@ def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> No
                    "properties": {"sessionID": sid,
                                   "error": {"name": "UnknownError",
                                             "data": {"message": f"{type(e).__name__}: {e}"}}}})
+    finally:
+        # 收工前让 poller 再拉最后一次（它收到信号后会把这一轮拉完再退出）
+        _actor_stop.set()
     _finish_message(sid, mid)
     broadcast({"type": "session.idle", "properties": {"sessionID": sid}})
 
@@ -1384,7 +1599,14 @@ class Handler(BaseHTTPRequestHandler):
                             "parts": hist_parts.get(msg["id"]) or _PARTS.get(msg["id"], [])})
             return self._json(out)
 
-        if re.match(r"^/session/([^/]+)/(todo|children|diff|task|actors|recovery)$", p):
+        # 【/actors 单独一条】原来是和 todo|children|diff|task|recovery 一起恒回 []
+        # ⇒ 界面的子代理列表**永远是空的**，agent 状态一个都显示不出来 ✗✗。
+        # 现在向后端要真行（`GET /api/agents?sessionId=`），行形状对齐
+        # `sync.tsx:1049-1061`，见 map_actor_row。
+        m = re.match(r"^/session/([^/]+)/actors$", p)
+        if m:
+            return self._json(actor_rows_for(m.group(1)))
+        if re.match(r"^/session/([^/]+)/(todo|children|diff|task|recovery)$", p):
             return self._json([])
         if re.match(r"^/session/([^/]+)/message/([^/]+)$", p):
             mid = p.rsplit("/", 1)[1]

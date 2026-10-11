@@ -4505,6 +4505,274 @@ import time
 MAX_ANSWER_CHARS = 4000
 
 
+# ─────────────────────────────────────────── 子代理状态注册表
+r"""正在跑的子代理 / 团队成员，一行一条状态 —— 界面「agent 状态」的数据源。
+
+【为什么要有这份表】界面要回答两件事：**谁在跑、跑到哪一步了**，以及**点停止要能
+落到具体那一个**。原生 MiMo 有 `ActorRegistry`（`GET /session/:id/actors` +
+`actor.registered` / `actor.status` 两条事件，见
+`MiMo-Code-main\packages\cli\src\actor\registry.ts:193,252`），我们后端没有等价物
+⇒ 用一份**进程内**注册表补上，字段名与原生**逐字对齐**（对齐到谁，见 `_ACTOR_ROW_STATE`
+的注释与 `mimo适配.py` 的 `map_actor_row`）。
+
+消费方（改这里的字段，下面几处必须一起改）：
+  · `main.py`  `GET  /api/agents?sessionId=`            —— 读 `actor_rows()`
+  · `main.py`  `POST /api/chat/control/stop`            —— `actor_running_children()`
+              + `actor_note_stop_requested()` 做**级联停止**（原生
+              `session/prompt.ts:768-826` 停父会顺手停掉所有非 main actor，
+              我们原来只停父 ✗ ⇒ 子代理继续跑）
+  · `mimo适配.py` `GET /session/{id}/actors`            —— `map_actor_row` 出原生行
+  · `mimo适配.py` `_stream_backend` 的 1s 轮询           —— diff 出两条事件
+
+【热路径：注册绝不许把 spawn 带崩】`SubAgentTool.execute` / `AgentTeamTool.execute`
+是派发的必经之路，注册表写失败**只许少显示一行**，绝不许让工具本身抛出去 ✗✗
+⇒ 下面每个公开函数都自己兜异常，失败回 None / 空表 / False。
+"""
+_ACTORS_LOCK = threading.RLock()
+#: actorID → 行（只增不删：进程内注册表，进程退出即清）
+_SUBAGENT_ACTORS: dict[str, dict] = {}
+
+#: 内部状态 → 原生行上那四个展示字段。
+#:
+#: 【为什么是四个、且必须给全】`sync.tsx:1053` 对**每一行**调
+#: `actorStatusFromEvent(row)`（规则在 `sync.tsx:142-160`），它只认 `status` /
+#: `lastOutcome` / `executionState` / `executionActive`；原生行是
+#: `Actor & {executionActive, executionState}`（`actor/waiter.ts:82-94`）。
+#: 只回一个内部状态名（如 `completed`）会一路落到 `return "unknown"` ✗ ——
+#: 对话框里就显示 `unknown`。逐个状态怎么落到显示值：
+#:   pending        → 不给 executionActive/executionState → 走 status 分支 → "pending"
+#:   running        → executionActive=true                → "running"
+#:   completed      → executionState="completed"          → "completed"
+#:   failed         → executionState="failed"             → "failed"
+#:   stopped / stop_requested → executionState="stopped"  → "stopped"
+_ACTOR_ROW_STATE: dict[str, dict] = {
+    "pending":        {"status": "pending"},
+    "running":        {"status": "running", "executionActive": True,
+                       "executionState": "running"},
+    "stop_requested": {"status": "idle", "executionActive": False,
+                       "executionState": "stopped"},
+    "stopped":        {"status": "idle", "executionActive": False,
+                       "executionState": "stopped"},
+    "completed":      {"status": "idle", "executionActive": False,
+                       "executionState": "completed", "lastOutcome": "success"},
+    "failed":         {"status": "idle", "executionActive": False,
+                       "executionState": "failed", "lastOutcome": "failure"},
+}
+
+#: 已经有最终结论的状态：既不再改写，也不算"还在跑"
+#:
+#: 【`stop_requested` 为什么**不在**这里】它是"用户点了停止、但这还没真停下来"的
+#: 中间态 —— 只有 `actor_take_stop_request`（execute 的开跑前预检）能把它推到
+#: `stopped`；除此之外任何 completed/failed 都不许覆盖它（用户点过停止，
+#: 界面上就不能再显示"跑完了"）。
+_ACTOR_TERMINAL = frozenset(("stopped", "completed", "failed"))
+
+
+def actor_register(parent_session_id: str | None, child_session_id: str | None,
+                   agent: str, description: str, mode: str = "peer") -> str | None:
+    """登记一个**还没开跑**的子代理，返回 `act_xxxxxxxx`；失败回 None（绝不抛）。
+
+    `parentSessionID` 取 `SessionContext.get()`（调用点在 `execute` 里，那时线程上下文
+    还是**发起方**会话 —— 子代理自己的 `process_message` 还没进去改它）。
+    初始状态是 `pending` 而不是 `running`：`running` 要等到真的调用
+    `agent_loop.process_message` 之前才置（见 execute 里的预检），
+    这样级联停止能分辨"已开跑"与"建了会话还没开跑"两种情况。
+    """
+    try:
+        if not parent_session_id or not child_session_id:
+            return None
+        actor_id = "act_" + uuid.uuid4().hex[:8]
+        now = int(time.time() * 1000)
+        row: dict = {
+            "actorID": actor_id,
+            "parentSessionID": str(parent_session_id),
+            "sessionID": str(child_session_id),
+            # 我们只派一层，没有"父 actor"（原生的 parentActorID 是 actor 不是 session）
+            "parentActorID": None,
+            "mode": mode,
+            "agent": str(agent or "subagent"),
+            "description": str(description or ""),
+            "background": False,
+            # 内部状态单独留一份：四个展示字段是"给界面看的"，这个是"给我们自己判断"的
+            "registryStatus": "pending",
+            "turnCount": 0,
+            "lastTurnTime": now,
+            "time": {"created": now, "updated": now},
+        }
+        row.update(_ACTOR_ROW_STATE["pending"])
+        with _ACTORS_LOCK:
+            _SUBAGENT_ACTORS[actor_id] = row
+        return actor_id
+    except Exception as e:                                # noqa: BLE001
+        # 注册失败只许少显示一行，绝不许把 spawn 带崩（见模块头）
+        print(f"[子代理状态] 登记失败（不影响派发）: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def actor_set_status(actor_id: str | None, status: str) -> bool:
+    """改状态；失败回 False（绝不抛）。**终态不回退**：已 stopped/stop_requested 的行
+    不许被随后到达的 completed/failed 覆盖 —— 用户点过停止，看到的就得是"停了"。"""
+    try:
+        if not actor_id or status not in _ACTOR_ROW_STATE:
+            return False
+        with _ACTORS_LOCK:
+            row = _SUBAGENT_ACTORS.get(actor_id)
+            if row is None:
+                return False
+            cur = str(row.get("registryStatus") or "")
+            # 终态不回退：已 stopped/completed/failed 的行谁也不许改
+            if cur in _ACTOR_TERMINAL:
+                return False
+            # stop_requested 只能被推到 stopped（开跑前预检那条路），
+            # 不许被 completed/failed 覆盖（见 _ACTOR_TERMINAL 的注释）
+            if cur == "stop_requested" and status not in ("stop_requested", "stopped"):
+                return False
+            _apply_status(row, status)
+        return True
+    except Exception as e:                                # noqa: BLE001
+        print(f"[子代理状态] 状态更新失败: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def actor_status(actor_id: str | None) -> str | None:
+    """当前内部状态（排障/测试用）；认不出的 actorID 回 None。"""
+    try:
+        with _ACTORS_LOCK:
+            row = _SUBAGENT_ACTORS.get(str(actor_id or ""))
+            return None if row is None else str(row.get("registryStatus") or "")
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def actor_take_stop_request(actor_id: str | None) -> bool:
+    """`execute` 在**真开跑之前**调：这条子代理被请求过停止吗？
+
+    【为什么需要它，光靠 `control().stop(child)` 不够】子代理一进
+    `agent_loop.process_message` 就会 `self.control.reset(session_id)`
+    （`main.py:13730` / `main.py:13903`），把"还没开始就收到的 stop"**抹掉** ——
+    于是级联停止对"会话已建、还没开跑"的子代理完全失效 ✗✗（它照样跑完）。
+    所以注册表另记一份 `stop_requested`，这里在调用 process_message **之前**拦一道。
+    （残留窗口：从这行预检到 process_message 内部那次 reset 之间 —— 毫秒级，
+     极窄；如实记在这里，没有更彻底地关掉它。）
+    """
+    try:
+        if not actor_id:
+            return False
+        with _ACTORS_LOCK:
+            row = _SUBAGENT_ACTORS.get(actor_id)
+            if row is None or row.get("registryStatus") != "stop_requested":
+                return False
+            _apply_status(row, "stopped")
+        return True
+    except Exception as e:                                # noqa: BLE001
+        print(f"[子代理状态] 读停止请求失败: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def actor_note_stop_requested(actor_id: str | None) -> str | None:
+    """级联停止时打标：还没开跑的记 `stop_requested`（要拦），已在跑的记 `stopped`。
+
+    一次锁内读+写（`_ACTORS_LOCK` 是 RLock）：先读后写会留缝 ——
+    `pending` 刚好在两次取值之间变成 `running` 时，会被错标成拦不住的那个状态。
+    """
+    try:
+        if not actor_id:
+            return None
+        with _ACTORS_LOCK:
+            row = _SUBAGENT_ACTORS.get(actor_id)
+            if row is None:
+                return None
+            cur = str(row.get("registryStatus") or "")
+            if cur in _ACTOR_TERMINAL:
+                return cur                     # 已有结论，别改
+            want = "stop_requested" if cur in ("pending", "stop_requested") else "stopped"
+            _apply_status(row, want)
+        return want
+    except Exception as e:                                # noqa: BLE001
+        print(f"[子代理状态] 打停止标失败: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def actor_running_children(parent_session_id: str | None) -> list[tuple[str, str]]:
+    """`[(actorID, 子会话ID), …]` —— 该会话下**还没到终态**的子代理（级联停止用）。"""
+    out: list[tuple[str, str]] = []
+    try:
+        if not parent_session_id:
+            return out
+        with _ACTORS_LOCK:
+            for row in _SUBAGENT_ACTORS.values():
+                if row.get("parentSessionID") != parent_session_id:
+                    continue
+                if str(row.get("registryStatus") or "") in _ACTOR_TERMINAL:
+                    continue
+                out.append((str(row.get("actorID") or ""),
+                            str(row.get("sessionID") or "")))
+    except Exception as e:                                # noqa: BLE001
+        print(f"[子代理状态] 列举运行中子代理失败: {type(e).__name__}: {e}", flush=True)
+        return []
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def actor_rows(session_id: str | None) -> list[dict]:
+    r"""给 `GET /api/agents?sessionId=` 的行：该会话下的全部子代理。
+
+    【为什么"指向自己的行"也要回】查的会话可能**本身就是一个子代理会话**（界面点开
+    peer 行回放时就是）。原生那边 `session_id === id` 的自指行一直都在
+    （`spawn.ts:715-717`），而 `routes\session\index.tsx:281-292` 的
+    `verifySessionRenderable` 拿这份行做**能不能打开这个会话**的裁决 ——
+    读不到就走 `classifyUnreadableActors`（`visibility.ts:169`）**fail closed** ✗
+    ⇒ 子会话会被"Cannot open session"拒之门外。所以自己那行必须在。
+    """
+    out: list[dict] = []
+    try:
+        if not session_id:
+            return out
+        with _ACTORS_LOCK:
+            for row in _SUBAGENT_ACTORS.values():
+                if row.get("parentSessionID") != session_id and row.get("sessionID") != session_id:
+                    continue
+                copy = dict(row)
+                copy["time"] = dict(row.get("time") or {})
+                out.append(copy)
+    except Exception as e:                                # noqa: BLE001
+        print(f"[子代理状态] 列举失败: {type(e).__name__}: {e}", flush=True)
+        return []
+    out.sort(key=lambda r: int((r.get("time") or {}).get("created") or 0))
+    return out
+
+
+def _apply_status(row: dict, status: str) -> None:
+    """在**已持锁**的前提下把状态写进这一行（调用方负责拿锁）。"""
+    row["registryStatus"] = status
+    row.update(_ACTOR_ROW_STATE[status])
+    now = int(time.time() * 1000)
+    row.setdefault("time", {})["updated"] = now
+    row["lastTurnTime"] = now
+    if status == "running":
+        # 一轮已经在路上（原生 turnCount 是每步心跳 +1，我们一次 spawn 就是一轮）
+        row["turnCount"] = max(1, int(row.get("turnCount") or 0))
+    if status in _ACTOR_TERMINAL:
+        row["turnCount"] = max(1, int(row.get("turnCount") or 0))
+        row["time"]["completed"] = now
+
+
+def _control_state(agent_loop, session_id: str | None) -> str:
+    """这条会话现在的运行控制状态（`AgentControlManager.get_state`）；读不到回 ""。
+
+    【为什么要它】子代理被**单独**停掉时（用户点它那一行的 Stop，或直接在它的会话里
+    按停止），`process_message` 是正常返回的、不抛异常 —— 光看"有没有异常"会把一条
+    明明被停掉的子代理标成 `completed` ✗。收尾时看一眼控制状态才诚实。
+    """
+    try:
+        mgr = getattr(agent_loop, "control", None)
+        if mgr is None or not session_id:
+            return ""
+        return str(mgr.get_state(session_id) or "")
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
 class AgentTeamTool(ToolPlugin):
     """`agent_team_run`：把任务交给配置好的智能体团队，各成员分头做完再汇总。"""
 
@@ -4587,10 +4855,32 @@ class AgentTeamTool(ToolPlugin):
                   "按顺序执行（本机模型是单通道，串行更稳）\n"]
         ok = 0
         fail = 0
+        # 【先把全部成员登记好，再一个一个跑】一个个边跑边登记的话，级联停止时
+        # "还没轮到"的成员在注册表里**根本不存在** ⇒ 拦不住，会照跑不误
+        # （用户点了停止，界面却还在派活 ✗）。会话也在这里一并建好：
+        # 登记要 sessionID，而 create_session 是本地持久化动作，先做没有副作用。
+        plan = []
         for m in members:
             mode = AgentMode.MINIMAL if m.mode.lower() == "minimal" else AgentMode.STANDARD
             child = self.session_manager.create_session(workspace_id, mode)
             self.session_manager.rename_session(child.session_id, "团队/" + m.name)
+            aid = actor_register(parent_session_id, child.session_id,
+                                 agent=m.name,
+                                 description=(m.role or "").strip() or first_line(task, 60))
+            plan.append((m, mode, child, aid))
+        for m, mode, child, actor_id in plan:
+            # 【开跑前先问一句"被要求停过吗"】级联停止可能发生在 control.reset 之前，
+            # 那次 reset 会把 stop 抹掉 —— 详见 actor_take_stop_request 的说明。
+            if actor_id and actor_take_stop_request(actor_id):
+                report.append(f"\n### {m.name} ⏹ 已被停止（还没轮到它，未执行）\n")
+                fail += 1
+                continue
+            # 只有"成功切到 running"才真开跑（竞态下 set_status 会拒绝改写，
+            # 回 False 就是别跑 ✗）；actor_id 为 None 不拦 spawn ✓
+            if actor_id and not actor_set_status(actor_id, "running"):
+                report.append(f"\n### {m.name} ⏹ 已被停止（还没轮到它，未执行）\n")
+                fail += 1
+                continue
             prompt = (f"你是团队里的【{m.name}】。\n"
                       f"你的职责：{m.role.strip() if m.role and m.role.strip() else '（未填写，按名字理解）'}\n\n"
                       f"【团队要完成的任务】\n{task}\n\n"
@@ -4601,6 +4891,11 @@ class AgentTeamTool(ToolPlugin):
                 model = m.model if (m.model or "").strip() else None
                 answer = self.agent_loop.process_message(child.session_id, prompt, mode,
                                                         ThinkingLevel.LOW, model)
+                # 【正常返回 ≠ 跑完】被单独停掉时 process_message 也是正常返回的，
+                # 得看控制状态才不会把"停了"标成"成功"（见 _control_state）
+                actor_set_status(actor_id, "stopped" if _control_state(self.agent_loop,
+                                                                      child.session_id) == "STOPPED"
+                                 else "completed")
                 body = answer if answer is not None and str(answer).strip() else "（没有给出结论）"
                 body = str(body)
                 if len(body) > MAX_ANSWER_CHARS:
@@ -4610,6 +4905,7 @@ class AgentTeamTool(ToolPlugin):
                 ok += 1
             except Exception as e:
                 print(f"[团队] 团队成员 {m.name} 执行异常: {e}", flush=True)
+                actor_set_status(actor_id, "failed")
                 report.append(f"\n### {m.name} ❌ 执行异常\n{e}\n")
                 fail += 1
         report.append(f"\n（成功 {ok} 个，失败 {fail} 个）")
@@ -4935,6 +5231,10 @@ class SubAgentTool(ToolPlugin):
             return self.error(blocked)
 
         # 2) 并发闸门：先占坑再判断，判断不过立刻还回去
+        # 【actor_id 先给个 None】注册表是热路径，create_session 之前就可能抛 ——
+        # 下面 except 里要用它，不留初值就是 NameError，把"子智能体炸了不能带崩主任务"
+        # 这条兜底自己给炸了 ✗。
+        actor_id: str | None = None
         running = self._RUNNING.increment()
         try:
             too_many = self.plugin.check_concurrency(running)
@@ -4954,12 +5254,29 @@ class SubAgentTool(ToolPlugin):
             child = self.session_manager.create_session(workspace_id, child_mode)
             self.session_manager.rename_session(child.session_id,
                                                 "子智能体：" + first_line(task, 24))
+            # 【登记在 create_session 之后、process_message 之前】"会话已建、还没开跑"
+            # 这段窗口界面也要看得到它、点得动停止（级联停止正是靠这一段的
+            # stop_requested 才拦得住，见 actor_take_stop_request）。
+            actor_id = actor_register(parent_session_id, child.session_id,
+                                      agent="subagent",
+                                      description=first_line(task, 60))
 
             prompt = ("你是被主 Agent 派来做一件具体事情的子智能体，做完就把结论说清楚。\n"
                       f"【任务】\n{task}\n\n"
                       "要求：动手时用工具，别只给建议；做完用一段话给结论（做了什么、结果是什么、"
                       "有什么没做完）。不要反问，除非缺的信息确实无法从工作区推断。")
 
+            # 【开跑前的停止预检】级联 stop 可能赶在 process_message 内部那次
+            # control.reset（main.py:13730）之前 —— reset 会把它抹掉 ⇒ 这里必须再问一次
+            # 注册表，命中就直接收工，绝不把用户已经点过停止的子代理再跑起来。
+            if actor_id and actor_take_stop_request(actor_id):
+                return self.success("⏹ 子智能体在开始前已被用户停止，未执行。")
+
+            # 只有"成功切到 running"才真开跑：预检到这行之间再被要求停止（竞态）、
+            # 或状态已被标终态时，set_status 会拒绝改写 ⇒ 这里回 False 就是别跑 ✗
+            # （actor_id 为 None = 注册压根没成功，那条路不许因此拦住 spawn ✓）
+            if actor_id and not actor_set_status(actor_id, "running"):
+                return self.success("⏹ 子智能体在开始前已被用户停止，未执行。")
             previous_depth = self.current_depth()
             self._set_depth(child_depth)
             started = _now_ms__team_subagent_tool()
@@ -4973,6 +5290,12 @@ class SubAgentTool(ToolPlugin):
                 body = str(body)
                 if len(body) > MAX_ANSWER_CHARS__team_subagent_tool:
                     body = body[:MAX_ANSWER_CHARS__team_subagent_tool] + "\n…（结论过长已截断）"
+                # 【正常返回 ≠ 跑完】子代理被**单独**停掉时 process_message 也是正常返回
+                # 的（它内部捕获 AgentStoppedException 后回一句"已停止"），光看有没有异常
+                # 会把"停了"标成"跑完了" ✗ —— 看一眼控制状态才诚实。
+                actor_set_status(actor_id, "stopped"
+                                 if _control_state(self.agent_loop, child.session_id) == "STOPPED"
+                                 else "completed")
                 return self.success(
                     f"【子智能体结论】（层级 {child_depth}，模式 {child_mode}，"
                     f"耗时 {cost // 1000} 秒，会话 {child.session_id}）\n{body}")
@@ -4981,6 +5304,8 @@ class SubAgentTool(ToolPlugin):
         except Exception as e:
             # 子智能体炸了不能把主任务带崩：回一句错误让模型自己决定是重试还是自己干
             print(f"[子智能体] 子智能体执行异常: {e}", flush=True)
+            # 里头自己兜异常：已 stopped/stop_requested 的行不会被这条 failed 覆盖
+            actor_set_status(actor_id, "failed")
             return self.error(f"子智能体执行异常：{e}（可以自己直接做，或换个说法再派一次）")
         finally:
             self._RUNNING.decrement()

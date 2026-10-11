@@ -64,6 +64,25 @@ index 938e7b3..3b33601 100644
          // We convert these back to ACP blocks based on the URL scheme and MIME type:
          // - file:// URLs → resource_link
          // - data: URLs with image/* → image block
+diff --git a/MiMo-Code-main/packages/cli/src/actor/events.ts b/MiMo-Code-main/packages/cli/src/actor/events.ts
+index adb7af0..008af48 100644
+--- a/MiMo-Code-main/packages/cli/src/actor/events.ts
++++ b/MiMo-Code-main/packages/cli/src/actor/events.ts
+@@ -6,7 +6,14 @@ import z from "zod"
+ export const ActorRegistered = BusEvent.define(
+   "actor.registered",
+   z.object({
++    // sessionID is the row's REGISTRY KEY: the session the entry is listed under,
++    // which is what sync.tsx uses as the store bucket (`store.actor[sid]`).
+     sessionID: SessionID.zod,
++    // Optional: the actor's OWN session when it is NOT the session it is listed
++    // under (a peer actor lives in its own child session). Absent for native
++    // emitters, where the two are always the same — the adapter that re-hosts
++    // this TUI lists peer rows under the PARENT session, so it needs both.
++    ownSessionID: SessionID.zod.optional(),
+     actorID: z.string(),
+     mode: SpawnMode,
+     parentActorID: z.string().optional(),
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/providers.ts b/MiMo-Code-main/packages/cli/src/cli/cmd/providers.ts
 index e3c30d1..fbe8dd5 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/providers.ts
@@ -626,10 +645,10 @@ index db1905c..f11c210 100644
      />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx
 new file mode 100644
-index 0000000..2648fee
+index 0000000..94c6904
 --- /dev/null
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,144 @@
 +import { DialogSelect } from "@tui/ui/dialog-select"
 +import { useDialog } from "@tui/ui/dialog"
 +import { useSDK } from "@tui/context/sdk"
@@ -674,6 +693,9 @@ index 0000000..2648fee
 +        onSelect={async (workspaceID) => {
 +          // 新建的工作区立刻进列表，这样返回选择器时能看到它
 +          await project.workspace.sync().catch(() => undefined)
++          // 同上：新建完要**切过去** ✗ —— 不 set current 的话
++          // 界面仍显示上一个工作区（与选择分支是同一个坑）。
++          project.workspace.set(workspaceID)
 +          await open(workspaceID)
 +        }}
 +      />
@@ -739,7 +761,15 @@ index 0000000..2648fee
 +              .filter(Boolean)
 +              .join("   "),
 +            keywords: [workspace.id, workspace.directory].filter(Boolean) as string[],
-+            onSelect: () => void open(workspace.id),
++            onSelect: () => {
++              // 【必须先 set current，否则界面永远显示旧工作区】
++              // 选中一行只是"在这边开个会话"（openWorkspaceSession 不碰 store），
++              // 而侧栏/状态栏读的是 `project.workspace.current()`（context/project.tsx）。
++              // 全仓此前**没有任何地方调过 `workspace.set`** ⇒ current 恒为初值 ⇒
++              // 用户切完工作区"显示不变"。先 set 再开，后续 sync/sessions 才落在新工作区。
++              project.workspace.set(workspace.id)
++              void open(workspace.id)
++            },
 +          },
 +          // 【删除入口】每个工作区后面跟一条删除项（挂在列表项上，不新造命令）。
 +          // 会话列表的删除是 ctrl+d + 按两次确认；这里直接选就行 —— 语义是"注销"，
@@ -788,6 +818,23 @@ index 1768b1e..4a85398 100644
      const intl = createMemo(() => INTL[effective()])
      const label = (locale: Locale) => t(LABEL_KEY[locale])
  
+diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx
+index 521c2d3..3ab4d14 100644
+--- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx
++++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx
+@@ -753,7 +753,11 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
+           if (list.find((a) => a.actor_id === event.properties.actorID)) break
+           const entry: ActorEntry = {
+             actor_id: event.properties.actorID,
+-            session_id: event.properties.sessionID,
++            // ownSessionID wins when present: the store bucket above is the
++            // session the row is LISTED under (props.sessionID of the dialog),
++            // but peer actors navigate to their OWN session on select, so the
++            // two differ for adapter-hosted peer rows. Native emitters omit it.
++            session_id: event.properties.ownSessionID ?? event.properties.sessionID,
+             mode: event.properties.mode as ActorEntry["mode"],
+             status: "pending",
+             agent: event.properties.agent,
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/theme.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/theme.tsx
 index 70b785d..aa06e1d 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/theme.tsx
@@ -1964,6 +2011,113 @@ index 7f93ca8..46e6a98 100644
    if (!("error" in data)) {
      log.error(message, data)
      console.error(`[tui.plugin] ${message}`, data)
+diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/dialog-subagent.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/dialog-subagent.tsx
+index d2c42d0..2205daa 100644
+--- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/dialog-subagent.tsx
++++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/dialog-subagent.tsx
+@@ -1,11 +1,13 @@
+ import { DialogSelect } from "@tui/ui/dialog-select"
+ import { useRoute } from "@tui/context/route"
+ import { useSync } from "@tui/context/sync"
++import { useSDK } from "@tui/context/sdk"
+ import { createMemo } from "solid-js"
+ 
+ export function DialogSubagent(props: { sessionID: string }) {
+   const route = useRoute()
+   const sync = useSync()
++  const sdk = useSDK()
+ 
+   const actors = createMemo(() =>
+     (sync.data.actor[props.sessionID] ?? [])
+@@ -13,6 +15,17 @@ export function DialogSubagent(props: { sessionID: string }) {
+       .toSorted((a, b) => a.time_created - b.time_created),
+   )
+ 
++  // Terminal rows get no Stop entry: asking to stop something already finished
++  // would silently do nothing, and the button would lie about being clickable.
++  const live = createMemo(() => actors().filter((a) => a.status === "running" || a.status === "pending"))
++
++  // Reuses the existing abort route — `session.abort` → `POST /session/:id/abort`
++  // → the adapter's `POST /api/chat/control/stop`, which cascades to this
++  // session's subagents. No new route, no SDK regeneration.
++  const stop = (sessionID: string) => {
++    void sdk.client.session.abort({ sessionID }).catch(() => {})
++  }
++
+   const options = createMemo(() => {
+     const list = actors()
+     if (list.length === 0) {
+@@ -25,23 +38,54 @@ export function DialogSubagent(props: { sessionID: string }) {
+         },
+       ]
+     }
+-    return list.map((a) => ({
+-      title: `${a.actor_id}  ${a.agent}  ${a.status}`,
+-      value: a.actor_id,
+-      description: a.description,
+-      onSelect: (dialog: { clear: () => void }) => {
+-        if (a.mode === "subagent") {
+-          if (route.data.type === "session") {
+-            route.navigate({ ...route.data, agentID: a.actor_id })
++    const head = live().length
++      ? [
++          {
++            title: "⏹ Stop all in this session",
++            value: "stop-all",
++            description: "stop this session and cascade to every running subagent",
++            keywords: ["stop", "abort", "cancel", "all"],
++            onSelect: (dialog: { clear: () => void }) => {
++              stop(props.sessionID)
++              dialog.clear()
++            },
++          },
++        ]
++      : []
++    const rows = list.flatMap((a) => {
++      const open = {
++        title: `${a.actor_id}  ${a.agent}  ${a.status}`,
++        value: a.actor_id,
++        description: a.description,
++        onSelect: (dialog: { clear: () => void }) => {
++          if (a.mode === "subagent") {
++            if (route.data.type === "session") {
++              route.navigate({ ...route.data, agentID: a.actor_id })
++            }
++          } else {
++            // peer mode: attach to the child's OWN session as a full writable session
++            // (no agentID → its own `main` view, like `mimo -c <id>`), not a read-only slice.
++            route.navigate({ type: "session", sessionID: a.session_id })
+           }
+-        } else {
+-          // peer mode: attach to the child's OWN session as a full writable session
+-          // (no agentID → its own `main` view, like `mimo -c <id>`), not a read-only slice.
+-          route.navigate({ type: "session", sessionID: a.session_id })
+-        }
+-        dialog.clear()
+-      },
+-    }))
++          dialog.clear()
++        },
++      }
++      if (a.status !== "running" && a.status !== "pending") return [open]
++      return [
++        open,
++        {
++          title: `⏹ Stop ${a.actor_id}`,
++          value: `stop:${a.actor_id}`,
++          description: `stop this agent only — ${a.description}`,
++          keywords: ["stop", "abort", "cancel", "停止"],
++          onSelect: (dialog: { clear: () => void }) => {
++            stop(a.session_id)
++            dialog.clear()
++          },
++        },
++      ]
++    })
++    return [...head, ...rows]
+   })
+ 
+   return <DialogSelect title="Subagents" options={options()} />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 index e7c9c35..32ef3fe 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
@@ -4019,3 +4173,18 @@ index 614d658..6d6580e 100644
     */
    public list<ThrowOnError extends boolean = false>(
      parameters?: {
+diff --git a/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts b/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
+index 4760baa..2b9b8bf 100644
+--- a/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
++++ b/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
+@@ -22,6 +22,10 @@ export type EventActorRegistered = {
+   type: "actor.registered"
+   properties: {
+     sessionID: string
++    // The actor's OWN session when it is not the session the row is listed
++    // under (peer actors live in their own child session). Optional because
++    // native emitters omit it; generated from the `actor.registered` schema.
++    ownSessionID?: string
+     actorID: string
+     mode: "peer" | "subagent" | "main"
+     parentActorID?: string
