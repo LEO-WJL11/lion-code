@@ -657,6 +657,38 @@ def workspace_directory(mimo_workspace_id: str) -> str:
     return _DIRECTORY
 
 
+_MODEL_CACHE: dict = {"value": "", "at": 0.0}
+
+
+def current_model() -> str:
+    """当前真实在用的云端模型名（10 秒缓存）。
+
+    【为什么需要】`/config`、会话消息的 `model.modelID` 原来写死 `MODEL_ID`
+    （= 本地权重名 `lion-merged` ✗✗）—— 云端-only 之后**状态栏显示的模型与实际跑的
+    不是同一个** ✗✗（用户截图："Build · lion-merged" 而实际是 mimo-v2.6-flash ✗✗）。
+    取值与 `_model_ids()` 同源（`GET /api/runtime/mode` 的 `customApi.model`/`model` ✓）。
+    【为什么缓存】`/config` 在 bootstrap 与模型对话框里被反复读 ✗ 每次打后端太贵 ✗。
+    10 秒自愈：切模型后最多 10 秒就显示新的（界面本来就会重拉 ✓），比手动失效标记省事 ✓。
+    取不到时退回 `MODEL_ID`（不崩、也不显示空 ✗）。
+    """
+    now = time.time()
+    cached = _MODEL_CACHE.get("value") or ""
+    if cached and (now - float(_MODEL_CACHE.get("at") or 0)) < 10.0:
+        return cached
+    value = MODEL_ID
+    try:
+        r = _req("/api/runtime/mode") or {}
+        d = r.get("data") if isinstance(r, dict) else None
+        d = d if isinstance(d, dict) else {}
+        custom = d.get("customApi") if isinstance(d.get("customApi"), dict) else {}
+        value = str(custom.get("model") or d.get("model") or MODEL_ID)
+    except Exception:                                     # noqa: BLE001 取不到就退回，不许崩
+        value = MODEL_ID
+    _MODEL_CACHE["value"] = value
+    _MODEL_CACHE["at"] = now
+    return value
+
+
 def workspace_id(directory: str) -> str:
     """**由目录推导的稳定 id**（同目录永远同一个 id）。
 
@@ -1178,7 +1210,14 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/config":
             # 同上：sync.tsx:864 的 bootstrap 读的是 GET /config（sync.data.config
             # 就是它），compaction 的回显必须挂在这条上才有人看到
-            return self._json({"model": f"{PROVIDER_ID}/{MODEL_ID}",
+            #
+            # 【model 必须是真实云端模型】原来写死 `MODEL_ID`（= "lion-merged"，**本地权重名**
+            # ✗✗）—— 本产品已云端-only，状态栏却显示 "Build · lion-merged"，而实际跑的是
+            # mimo-v2.6-flash ✗✗ **显示与实际不符**（用户截图抓到的 ✗）。改成从
+            # `/api/runtime/mode` 取真实值（与 `_model_ids()` 同源 ✓），带 10 秒缓存 ——
+            # 这个端点在 bootstrap 与模型对话框里被反复读，每次打后端太贵 ✗。
+            # 取不到退回 MODEL_ID（不崩 ✓ 也不显示空 ✗）。
+            return self._json({"model": f"{PROVIDER_ID}/{current_model()}",
                                "theme": "mimocode", "autoupdate": False,
                                **config_snapshot()})
         if p in ("/config/providers", "/provider"):
