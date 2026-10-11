@@ -111,6 +111,61 @@ def _slug(n: int = 8) -> str:
     return uuid.uuid4().hex[:n]
 
 
+# ── 消息/part 的 id：字典序必须 == 产生顺序（ULID 语义）────────────────────
+#: 【前端怎么消费的 —— 顺序契约全压在 id 上】
+#:   `MiMo-Code-main\packages\cli\src\cli\cmd\tui\context\sync.tsx`
+#:     L625  Binary.search(messages, info.id, m => m.id)   ← 按 id **二分**查找
+#:     L635  draft.splice(result.index, 0, info)           ← 找不到就按二分位插入
+#:     L666/L687/L705/L722  message.removed / part 的增删同理（也是 Binary.search）
+#:   `...\tui\routes\session\index.tsx`
+#:     L707  `x.id > messageID`、L1160 `x.id >= messageID`、L1339 同款 —— 直接比大小
+#:   `...\session\checkpoint.ts` L1553 `m.info.id > boundaryID && … <= digestUpTo`
+#:   历史加载是一次性**整体替换**：sync.tsx:1042-1044
+#:     `draft.message[sessionID] = bucketMessages(flat)`，其注释原文：
+#:     "Server returns messages id-ordered and message.updated keeps that order"
+#:   ⇒ 「服务端数组按 id 有序 + 后续事件 id 更大」就是必须守住的契约 ✗。
+#:   原生自证（MiMo 自己的假设）：`...\tui\component\dialog-workflows.tsx:31`
+#:     "descending ULID: newest = smallest string" ⇒ **MiMo 假设 id 是 ULID，
+#:     字典序 == 时间序** ✓。
+#: 【老 id 为什么必错】`_slug(12)` = uuid4 的随机 hex —— 字典序与时间无关 ⇒ 二分
+#: 在乱序数组上算出的下标是垃圾 ⇒ 回答被插到下一条提问后面（用户叫它"字错位"）✗✗。
+#: 【新 id 形态】`msg_/prt_` + 13 位毫秒 + 4 位同毫秒序号 + 6 位尾巴
+#:   ① 毫秒、序号都零填充到**定长纯数字** ⇒ 字典序 == 数值序（ULID 的核心性质）；
+#:   ② 同一毫秒 timestamp 会平局（实测 #0/#1 同毫秒）⇒ 毫秒后必须跟**进程内递增
+#:      序号**（`_LOCK` 内递增），否则同毫秒仍乱 ✗；
+#:   ③ 随机/哈希尾巴只用于跨会话、跨进程防碰撞，**必须排在时序段之后**（放前面会
+#:      打乱字典序 ✗）—— 同数组内 (毫秒, 序号) 唯一 ⇒ 尾巴永不参与先后比较。
+_ID_STATE = {"ms": 0, "seq": 0}
+
+
+def _ordered_id(prefix: str, ts_ms, state: dict, tail: str = "") -> str:
+    """在调用方给定的 `state`（{ms, seq}）上生成时序 id。
+
+    `state` 由调用方持有：写侧/事件侧用进程级 `_ID_STATE`（见 new_time_id），
+    历史回放用**每次读取独立**的局部状态（保证同一条老记录每次读出同一个 id）。
+    毫秒只增不减：`ts_ms` 更小（时钟回拨 / 回放老记录）一律沿用当前毫秒、序号 +1。
+    """
+    ms = int(ts_ms)
+    if ms <= state["ms"]:
+        ms, seq = state["ms"], state["seq"] + 1
+    else:
+        seq = 0
+    if seq > 9999:                       # 一毫秒 1 万条：顶前一位，保住 4 位定宽
+        ms, seq = ms + 1, 0
+    state["ms"], state["seq"] = ms, seq
+    return f"{prefix}{ms:013d}{seq:04d}{tail or _slug(6)}"
+
+
+def new_time_id(prefix: str, ts_ms=None) -> str:
+    """**写侧 / 事件侧**的 id：进程内单调（毫秒不回退，同毫秒序号递增）。
+
+    用 `_LOCK`（RLock，可重入）保证「同毫秒内序号与到达顺序一致」——
+    `new_message` / `new_part_text` / 工具 part 三处并发创建也不会同号 ✗。
+    """
+    with _LOCK:
+        return _ordered_id(prefix, now_ms() if ts_ms is None else int(ts_ms), _ID_STATE)
+
+
 def _parse_tokens(v) -> int | None:
     """token 数解析：数字直接用；`"300K"` / `"1M"` 按前端 Token 的 K/M 后缀
     （MiMo-Code-main 的 dialog-context-limit.tsx:165 用 Token.parseQuantity）。
@@ -396,18 +451,29 @@ def to_backend_id(mimo_sid: str) -> str:
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-def _iso_ms(v) -> int:
-    """ISO 时间串 → 毫秒；解析不了退回当前时间。"""
-    if isinstance(v, (int, float)):
-        return int(v * 1000) if v < 10_000_000_000 else int(v)
+def _iso_ms(v, fallback: int | None = None) -> int:
+    """ISO 时间串 / epoch 秒 / epoch 毫秒 → 毫秒；解析不了退回 `fallback`。
+
+    【`fallback` 是干什么的】缺省 None 保持老语义（退回当前时间，会话列表用它）；
+    历史消息回放（session_messages）显式传"上一条的毫秒"——那边**不能退回 now**：
+    时间戳坏一条就把该条顶到当前时间，后面所有 id 的先后全乱 ✗（见 `_ID_STATE`）。
+    【为什么 bool 要挡掉】`isinstance(True, int)` 为真 → `True*1000 = 1000ms`
+    （1970 年）会被当成有效时间；NaN/Inf 则会让 `int()` 抛 ValueError/OverflowError
+    （json 能写出 `NaN`，同 `_parse_tokens` 上的教训）——一律当"没有时间"。
+    """
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            return int(v * 1000) if v < 10_000_000_000 else int(v)
+        except (ValueError, OverflowError):
+            return now_ms() if fallback is None else fallback
     s = str(v or "").strip()
     if not s:
-        return now_ms()
+        return now_ms() if fallback is None else fallback
     try:
         from datetime import datetime
         return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
     except Exception:                                     # noqa: BLE001
-        return now_ms()
+        return now_ms() if fallback is None else fallback
 
 
 def _conv_roots(extra: str = "") -> list:
@@ -563,22 +629,46 @@ def session_messages(sid: str) -> tuple:
     if not bid:
         return [], {}
 
+    recs = _read_conv(bid)
+    # model.modelID 用真实云端模型（原来写死 MODEL_ID = 本地权重名 ✗，见 current_model）
+    cur_model = current_model() if recs else MODEL_ID
+    # 【回放时钟必须是局部的】老消息的 id 只由**记录本身**（timestamp + 数组到达
+    # 顺序）决定 ⇒ 同一个老会话读多少次都得到同一批 id（前端 sync.tsx:1042-1044
+    # 虽是整体替换、id 漂移不至于串位，但两次读对不上就没法排查 ✗）。
+    # 也不能用全局 `_ID_STATE`：那个毫秒被写侧的"当前时间"顶着，回放结果会随
+    # 读取时机变 ✗。
+    hstate = {"ms": 0, "seq": 0}          # 消息 id 的本回放时钟
+    pstate = {"ms": 0, "seq": 0}          # part id 的本回放时钟（全回放递增 ⇒ 每条消息内也递增）
     msgs, parts, parent = [], {}, ""
-    for rec in _read_conv(bid):
+    for rec in recs:
         if not isinstance(rec, dict):
             continue
         role = str(rec.get("role") or "assistant")
         if role not in ("user", "assistant"):
             continue
-        mid = str(rec.get("messageId") or ("msg_" + _slug(12)))
+        # 【老 id 一律规范化 —— 这就是"历史迁移"】记录里的 `messageId` 是后端的
+        # **UUID（无时间信息）**，直接当 MiMo 消息 id 用 ⇒ 字典序与先后无关 ⇒
+        # 前端二分插错位（"字错位"的老会话形态）✗。这里按 timestamp（实测是
+        # epoch 秒 float 如 1791706252.515319；坏/缺 → 沿用上一条，绝不用 now）
+        # + 数组到达顺序重算时序 id。改写是**读时改写、不落盘**：全仓核对过
+        # `messageId` 的消费方只有这一处（main.py 侧的是它自己的落盘主键，与
+        # MiMo 侧 id 无关），parentID 全空、tool 引用走 `toolCallId` 字段 ⇒ 无处
+        # 按老 id 硬引用 ✓ 安全。
+        ts_ms = _iso_ms(rec.get("timestamp"), hstate["ms"])
+        raw = str(rec.get("messageId") or "")
+        # 尾巴取老 id 的稳定哈希 ⇒ 每次读出同一个 id；跨会话撞车兜底靠它
+        # （sha1 前 6 位）。没有 messageId 才随机——顺序永远由 (毫秒,序号) 决定。
+        mid = _ordered_id(
+            "msg_", ts_ms, hstate,
+            tail=(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6] if raw else _slug(6)))
         base = {"id": mid, "sessionID": sid, "agentID": AGENT, "role": role,
                 "time": {"created": now_ms(), "completed": now_ms()}}
         if role == "user":
             base.update({"agent": AGENT,
-                         "model": {"providerID": PROVIDER_ID, "modelID": MODEL_ID}})
+                         "model": {"providerID": PROVIDER_ID, "modelID": cur_model}})
             parent = mid
         else:
-            base.update({"parentID": parent, "modelID": MODEL_ID,
+            base.update({"parentID": parent, "modelID": cur_model,
                          "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT})
             # 历史消息同样必填 path/cost/tokens —— 重开/刷新会话读的就是这一条路径
             # （对话框崩不崩只看数据形状，历史与流式一视同仁 ✓）
@@ -587,12 +677,18 @@ def session_messages(sid: str) -> tuple:
         mid_parts = []
         text = str(rec.get("content") or "")
         if text:
-            mid_parts.append({"id": "prt_" + _slug(12), "sessionID": sid,
+            mid_parts.append({"id": _ordered_id(
+                                  "prt_", ts_ms, pstate,
+                                  tail=hashlib.sha1((mid + ":text").encode("utf-8")).hexdigest()[:6]),
+                              "sessionID": sid,
                               "messageID": mid, "type": "text", "text": text,
                               "time": {"start": now_ms(), "end": now_ms()}})
         reasoning = str(rec.get("reasoningContent") or "")
         if reasoning:
-            mid_parts.append({"id": "prt_" + _slug(12), "sessionID": sid,
+            mid_parts.append({"id": _ordered_id(
+                                  "prt_", ts_ms, pstate,
+                                  tail=hashlib.sha1((mid + ":reasoning").encode("utf-8")).hexdigest()[:6]),
+                              "sessionID": sid,
                               "messageID": mid, "type": "reasoning", "text": reasoning,
                               "time": {"start": now_ms(), "end": now_ms()}})
         parts[mid] = mid_parts
@@ -853,20 +949,33 @@ def assistant_shape(directory: str = "") -> dict:
 
 def new_message(sid: str, role: str, parent: str = "", text: str = ""):
     """建一条消息（可选带一个文本 part），并按 MiMo 的事件协议广播出去。"""
-    mid = ("msg_" if role == "user" else "msg_") + _slug(12)
-    base = {"id": mid, "sessionID": sid, "agentID": AGENT, "role": role,
-            "time": {"created": now_ms()}}
-    if role == "user":
-        base.update({"agent": AGENT,
-                     "model": {"providerID": PROVIDER_ID, "modelID": MODEL_ID},
-                     "time": {"created": now_ms()}})
-    else:
-        base.update({"parentID": parent, "modelID": MODEL_ID,
-                     "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT,
-                     "time": {"created": now_ms()}})
-        # 必填三项（path/cost/tokens）—— 缺了 status 对话框一开就崩，见 assistant_shape()
-        base.update(assistant_shape(session_directory(sid)))
+    # 【时序 id，废三元式已清】原来 `("msg_" if role == "user" else "msg_") + _slug(12)`
+    # —— 三元两边同值（纯废代码），且随机 hex 与时间无关 ⇒ 前端 sync.tsx:625 的
+    # 二分插错位（"字错位"根因）✗。统一走 new_time_id（形态见 `_ID_STATE`）。
+    # modelID 用 current_model()：写死 MODEL_ID 会让完成页脚
+    # （index.tsx:1677 `Model.name(..., message.providerID, message.modelID)`、
+    # dialog-status.tsx:33、prompt/index.tsx:529）显示成本地权重名 lion-merged ✗。
+    # 【可能打后端的活必须在锁外干】current_model() 冷缓存要发一次 HTTP（30s 超时），
+    # 挂在 _LOCK 里会把整个适配层的所有请求一起摁住 ✗。
+    cur_model = current_model()
+    shape = {} if role == "user" else assistant_shape(session_directory(sid))
     with _LOCK:
+        # 【取 id 与 append 必须同一个临界区】否则并发 _chat（ThreadingHTTPServer
+        # 一请求一线程）里，先取到 id 的线程可能**后**落数组 ⇒ 数组序 ≠ id 序 ⇒
+        # 前端二分照样插错 ✗。要守住的等式：id 序 == 数组序 == 事件序。
+        mid = new_time_id("msg_")                     # 内部复用同一把 RLock（可重入 ✓）
+        base = {"id": mid, "sessionID": sid, "agentID": AGENT, "role": role,
+                "time": {"created": now_ms()}}
+        if role == "user":
+            base.update({"agent": AGENT,
+                         "model": {"providerID": PROVIDER_ID, "modelID": cur_model},
+                         "time": {"created": now_ms()}})
+        else:
+            base.update({"parentID": parent, "modelID": cur_model,
+                         "providerID": PROVIDER_ID, "mode": "build", "agent": AGENT,
+                         "time": {"created": now_ms()}})
+            # 必填三项（path/cost/tokens）—— 缺了 status 对话框一开就崩，见 assistant_shape()
+            base.update(shape)
         _MESSAGES.setdefault(sid, []).append(base)
         _PARTS[mid] = []
     broadcast({"type": "message.updated", "properties": {"sessionID": sid, "info": base}})
@@ -880,7 +989,9 @@ def new_part_text(sid: str, mid: str, text: str, start: bool = False, end: bool 
         parts = _PARTS.setdefault(mid, [])
         p = next((x for x in parts if x.get("type") == "text"), None)
         if p is None or start:
-            p = {"id": "prt_" + _slug(12), "sessionID": sid, "messageID": mid,
+            # part id 同样必须时序 —— 前端 sync.tsx:687 对 part 也是 Binary.search：
+            # 数组乱序时二分**找不到已存在的 part** ⇒ 重复插入 ⇒ 文本整段重复 ✗
+            p = {"id": new_time_id("prt_"), "sessionID": sid, "messageID": mid,
                  "type": "text", "text": text, "time": {"start": now_ms()}}
             parts.append(p)
         else:
@@ -958,14 +1069,16 @@ def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH") -> No
                     #   · callID —— index.tsx:2146 用它对权限请求 ✓（缺了权限关联不上 ✓）
                     # 我原来这三样**一个都没给** ✗（只给了 status/input/output/title ✓）
                     _t = now_ms()
-                    part = {"id": "prt_" + _slug(12), "sessionID": sid, "messageID": mid,
-                            "type": "tool", "callID": "call_" + _slug(12), "tool": tool,
-                            "state": {"status": "completed", "input": {}, "output": content,
-                                      "title": tool, "metadata": {},
-                                      "time": {"start": _t, "end": _t}}}
-                    # 【存进消息里】原来只广播不存 ✗ → 刷新/重开这个会话时工具调用整段消失 ✓
-                    # （前端的会话正文是 GET /session/{id}/message 拿的 ✓）
+                    # 【取 id 与 append 同一临界区】与 new_message 同理：id 序必须
+                    # == 数组序（同消息内有并发写入方时也才守得住）。
                     with _LOCK:
+                        part = {"id": new_time_id("prt_"), "sessionID": sid, "messageID": mid,
+                                "type": "tool", "callID": "call_" + _slug(12), "tool": tool,
+                                "state": {"status": "completed", "input": {}, "output": content,
+                                          "title": tool, "metadata": {},
+                                          "time": {"start": _t, "end": _t}}}
+                        # 【存进消息里】原来只广播不存 ✗ → 刷新/重开这个会话时工具调用整段消失 ✓
+                        # （前端的会话正文是 GET /session/{id}/message 拿的 ✓）
                         _PARTS.setdefault(mid, []).append(part)
                     broadcast({"type": "message.part.updated",
                                "properties": {"sessionID": sid, "time": now_ms(),
@@ -1718,7 +1831,7 @@ class Handler(BaseHTTPRequestHandler):
         # 就是撒谎（真实完成时间由 _finish_message 写，types 里 completed 也是可选）。
         n = now_ms()
         info = {"id": amid, "sessionID": sid, "agentID": AGENT, "role": "assistant",
-                "parentID": umid, "modelID": MODEL_ID, "providerID": PROVIDER_ID,
+                "parentID": umid, "modelID": current_model(), "providerID": PROVIDER_ID,
                 "mode": "build", "agent": AGENT, "time": {"created": n}}
         info.update(assistant_shape(session_directory(sid)))  # path/cost/tokens（475-479 同款）
         with _LOCK:
