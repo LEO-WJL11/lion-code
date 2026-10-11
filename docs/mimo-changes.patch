@@ -794,6 +794,22 @@ index 0000000..94c6904
 +  )
 +}
 \ No newline at end of file
+diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/prompt/index.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/prompt/index.tsx
+index afb0211..78a43ca 100644
+--- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/prompt/index.tsx
++++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/prompt/index.tsx
+@@ -1242,6 +1242,11 @@ export function Prompt(props: PromptProps) {
+           model: selectedModel,
+           titleLocale: language.intl(),
+           variant,
++          // Queue-jump: the backend only honours this while the session is busy,
++          // where it interrupts the running turn and lets this message take over;
++          // an idle session ignores it. Before this, submitting while busy just
++          // came back as "session is busy, wait for the current task".
++          isSteer: true,
+           parts: [
+             {
+               id: PartID.ascending(),
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/language.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/language.tsx
 index 1768b1e..4a85398 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/language.tsx
@@ -3976,6 +3992,36 @@ index 5a3eb7e..9148e82 100644
      "doc": "https://opencode.ai/docs/zen",
      "models": {
        "kimi-k2.5": {
+diff --git a/MiMo-Code-main/packages/sdk/src/gen/types.gen.ts b/MiMo-Code-main/packages/sdk/src/gen/types.gen.ts
+index ca2f726..58e7365 100644
+--- a/MiMo-Code-main/packages/sdk/src/gen/types.gen.ts
++++ b/MiMo-Code-main/packages/sdk/src/gen/types.gen.ts
+@@ -2598,6 +2598,12 @@ export type SessionPromptData = {
+     tools?: {
+       [key: string]: boolean
+     }
++    /**
++     * Queue-jump: interrupt whatever this session is running right now and let
++     * this message take over. Mirrors the backend's `isSteer` flag; honoured
++     * only when the session is busy.
++     */
++    isSteer?: boolean
+     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+   }
+   path: {
+@@ -2695,6 +2701,12 @@ export type SessionPromptAsyncData = {
+     tools?: {
+       [key: string]: boolean
+     }
++    /**
++     * Queue-jump: interrupt whatever this session is running right now and let
++     * this message take over. Mirrors the backend's `isSteer` flag; honoured
++     * only when the session is busy.
++     */
++    isSteer?: boolean
+     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+   }
+   path: {
 diff --git a/MiMo-Code-main/packages/sdk/src/v2/client.ts b/MiMo-Code-main/packages/sdk/src/v2/client.ts
 index 0299fdf..d7e7a99 100644
 --- a/MiMo-Code-main/packages/sdk/src/v2/client.ts
@@ -3990,7 +4036,7 @@ index 0299fdf..d7e7a99 100644
      return response
    })
 diff --git a/MiMo-Code-main/packages/sdk/src/v2/gen/sdk.gen.ts b/MiMo-Code-main/packages/sdk/src/v2/gen/sdk.gen.ts
-index 614d658..6d6580e 100644
+index 614d658..70e30c1 100644
 --- a/MiMo-Code-main/packages/sdk/src/v2/gen/sdk.gen.ts
 +++ b/MiMo-Code-main/packages/sdk/src/v2/gen/sdk.gen.ts
 @@ -290,7 +290,7 @@ export class Config extends HeyApiClient {
@@ -4146,7 +4192,39 @@ index 614d658..6d6580e 100644
     */
    public get<ThrowOnError extends boolean = false>(
      parameters: {
-@@ -5150,7 +5150,7 @@ export class Instance extends HeyApiClient {
+@@ -2507,6 +2507,7 @@ export class Session2 extends HeyApiClient {
+       systemMode?: "append" | "replace-agent"
+       harness?: "auto" | "codex" | "default"
+       variant?: string
++      isSteer?: boolean
+       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+     },
+     options?: Options<never, ThrowOnError>,
+@@ -2535,6 +2536,7 @@ export class Session2 extends HeyApiClient {
+             { in: "body", key: "systemMode" },
+             { in: "body", key: "harness" },
+             { in: "body", key: "variant" },
++            { in: "body", key: "isSteer" },
+             { in: "body", key: "parts" },
+           ],
+         },
+@@ -2782,6 +2784,7 @@ export class Session2 extends HeyApiClient {
+       systemMode?: "append" | "replace-agent"
+       harness?: "auto" | "codex" | "default"
+       variant?: string
++      isSteer?: boolean
+       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+     },
+     options?: Options<never, ThrowOnError>,
+@@ -2810,6 +2813,7 @@ export class Session2 extends HeyApiClient {
+             { in: "body", key: "systemMode" },
+             { in: "body", key: "harness" },
+             { in: "body", key: "variant" },
++            { in: "body", key: "isSteer" },
+             { in: "body", key: "parts" },
+           ],
+         },
+@@ -5150,7 +5154,7 @@ export class Instance extends HeyApiClient {
    /**
     * Dispose instance
     *
@@ -4155,7 +4233,7 @@ index 614d658..6d6580e 100644
     */
    public dispose<ThrowOnError extends boolean = false>(
      parameters?: {
-@@ -5182,7 +5182,7 @@ export class Path extends HeyApiClient {
+@@ -5182,7 +5186,7 @@ export class Path extends HeyApiClient {
    /**
     * Get paths
     *
@@ -4164,7 +4242,7 @@ index 614d658..6d6580e 100644
     */
    public get<ThrowOnError extends boolean = false>(
      parameters?: {
-@@ -5278,7 +5278,7 @@ export class Command extends HeyApiClient {
+@@ -5278,7 +5282,7 @@ export class Command extends HeyApiClient {
    /**
     * List commands
     *
@@ -4174,7 +4252,7 @@ index 614d658..6d6580e 100644
    public list<ThrowOnError extends boolean = false>(
      parameters?: {
 diff --git a/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts b/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
-index 4760baa..2b9b8bf 100644
+index 4760baa..2bdea0c 100644
 --- a/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
 +++ b/MiMo-Code-main/packages/sdk/src/v2/gen/types.gen.ts
 @@ -22,6 +22,10 @@ export type EventActorRegistered = {
@@ -4188,3 +4266,29 @@ index 4760baa..2b9b8bf 100644
      actorID: string
      mode: "peer" | "subagent" | "main"
      parentActorID?: string
+@@ -5326,6 +5330,12 @@ export type SessionPromptData = {
+      */
+     harness?: "auto" | "codex" | "default"
+     variant?: string
++    /**
++     * Queue-jump: interrupt whatever this session is running right now and let
++     * this message take over. Mirrors the backend's `isSteer` flag; honoured
++     * only when the session is busy.
++     */
++    isSteer?: boolean
+     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+   }
+   path: {
+@@ -5688,6 +5698,12 @@ export type SessionPromptAsyncData = {
+      */
+     harness?: "auto" | "codex" | "default"
+     variant?: string
++    /**
++     * Queue-jump: interrupt whatever this session is running right now and let
++     * this message take over. Mirrors the backend's `isSteer` flag; honoured
++     * only when the session is busy.
++     */
++    isSteer?: boolean
+     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+   }
+   path: {
