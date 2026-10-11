@@ -1594,8 +1594,10 @@ def _file_time(mtime_ns: int) -> str:
     （NTFS 的 100ns 精度 → 去掉末尾的 0 之后经常是 5 位或 7 位）。
     所以这里也按"原样、去尾零"输出，两边才对得上。
     """
+    # 名字 datetime 会被模块级 `import datetime`（后半文件）覆盖成模块 ⇒ 局部绑回类
+    from datetime import datetime as _dt_cls
     seconds, nanos = divmod(mtime_ns, 1_000_000_000)
-    stamp = datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    stamp = _dt_cls.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     if nanos == 0:
         return stamp + "Z"
     return f"{stamp}.{nanos:09d}".rstrip("0") + "Z"
@@ -3781,6 +3783,7 @@ class TimestampTool(ToolPlugin):
         }
 
     def execute(self, args: dict[str, Any]) -> ToolResult:
+        from datetime import datetime as _dt_cls  # noqa: F401  局部绑回类
         raw = self.get_string_arg(args, "format", DEFAULT_FORMAT)
 
         tz_raw = str(args.get("timezone") or args.get("tz") or "").strip()
@@ -3796,7 +3799,7 @@ class TimestampTool(ToolPlugin):
             except ValueError as e:
                 return self.error(str(e))
         else:
-            moment = datetime.now(timezone.utc).astimezone(zone)
+            moment = _dt_cls.now(timezone.utc).astimezone(zone)
 
         epoch = int(moment.timestamp())
         local = moment.astimezone(zone)
@@ -3966,8 +3969,10 @@ def _locale_text(moment: datetime, fmt: str, fallback: str) -> str:
 
 
 def _resolve_zone(raw: str) -> tzinfo:
+    # 名字 datetime 会被模块级 `import datetime`（后半文件）覆盖成模块 ⇒ 局部绑回类
+    from datetime import datetime as _dt_cls
     if raw == "" or raw.lower() in ("local", "system", "default"):
-        return datetime.now().astimezone().tzinfo or timezone.utc
+        return _dt_cls.now().astimezone().tzinfo or timezone.utc
     text = raw.strip()
     offset = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?", text)
     if offset:
@@ -3989,24 +3994,26 @@ def _resolve_zone(raw: str) -> tzinfo:
 
 def _parse_moment(raw: str, zone: tzinfo) -> datetime:
     """支持 unix 秒/毫秒、ISO 8601、常见的 "YYYY-MM-DD HH:MM:SS" 写法。"""
+    # 名字 datetime 会被模块级 `import datetime`（后半文件）覆盖成模块 ⇒ 局部绑回类
+    from datetime import datetime as _dt_cls
     text = raw.strip()
     if re.fullmatch(r"-?\d{10}", text):
-        return datetime.fromtimestamp(int(text), tz=timezone.utc)
+        return _dt_cls.fromtimestamp(int(text), tz=timezone.utc)
     if re.fullmatch(r"-?\d{13}", text):
-        return datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
+        return _dt_cls.fromtimestamp(int(text) / 1000, tz=timezone.utc)
     if re.fullmatch(r"-?\d+(\.\d+)?", text):
-        return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        return _dt_cls.fromtimestamp(float(text), tz=timezone.utc)
 
     iso = text.replace("Z", "+00:00").replace("z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(iso)
+        parsed = _dt_cls.fromisoformat(iso)
         return parsed.replace(tzinfo=zone) if parsed.tzinfo is None else parsed
     except ValueError:
         pass
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%Y/%m/%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d", "%Y%m%d%H%M%S", "%Y%m%d"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=zone)
+            return _dt_cls.strptime(text, fmt).replace(tzinfo=zone)
         except ValueError:
             continue
     raise ValueError("时间戳无法解析: " + raw + "（支持 unix 秒/毫秒、ISO 8601、"
