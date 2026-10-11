@@ -282,6 +282,23 @@ class Watchdog(threading.Thread):
                     log(f"「看门狗」{which} 未能回收（pid={p.pid}），可能残留")
 
 
+def _frontend_crashed(logdir: str) -> bool:
+    """前端是不是**崩**了（而不是用户正常退出）✗ —— 读 frontend.log 尾部找 Bun 的崩溃签名。
+
+    【为什么值得专门判】本机已积累 17 份崩溃报告，全在 **opentui.dll** 原生层
+    （`panic(main thread): Segmentation fault` …）—— 那是上游 bug，我们治不了 ✗。
+    但"崩了还静默把整套收掉、控制台停在崩溃前最后一帧"是**我们的锅** ✗✗：
+    用户只会盯着一块冻结的黑屏等，永远不知道**该重开一次**。让失败出声是底线 ✓。
+    """
+    try:
+        with open(os.path.join(logdir, "frontend.log"), "r",
+                  encoding="utf-8", errors="replace") as f:
+            tail = f.read()[-8000:]
+        return "Bun has crashed" in tail or "Segmentation fault" in tail
+    except OSError:
+        return False
+
+
 def main() -> int:
     # 日志目录：后端的 stdout **不能留给控制台** —— 它会直接盖在 TUI 上
     # （实测：`[会话] 保存会话元数据失败…` 那几行糊在输入框上）。
@@ -420,6 +437,17 @@ def main() -> int:
             print(f"✗ 前端启动失败: {type(e).__name__}: {e}", flush=True)
             rc = 1
     print(f"前端已退出（{rc}），收尾。", flush=True)
+    # 【崩溃必须出声】TUI 崩掉时控制台会停在**崩溃前最后一帧**（用户看到的就是一块
+    # 冻结的黑屏 ✗✗）—— 而收尾一跑，后端/适配层也一起没了，看起来像"整套死掉"。
+    # opentui.dll 段错误是上游 bug（本机 17 份报告），治不了 ✗；但"静默"是我们的锅 ✓。
+    if rc != 0 and _frontend_crashed(logdir):
+        bar = "=" * 62
+        print(bar, flush=True)
+        print("✗ 界面进程崩溃了（不是你的操作有问题）", flush=True)
+        print("  症状: OpenTUI 原生库段错误（opentui.dll）—— 上游渲染层 bug", flush=True)
+        print("  处理: 直接重新打开本程序即可 ✓ 数据没有损坏", flush=True)
+        print(f"  日志: {os.path.join(logdir, 'frontend.log')}", flush=True)
+        print(bar, flush=True)
     # 【收尾顺序】先停看门狗 ✗ —— 否则收尾期间它会把刚 terminate 的服务又拉起来 ✓
     log("「看门狗」停止（前端已退出）")
     wd.shutdown()
