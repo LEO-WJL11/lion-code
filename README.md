@@ -72,13 +72,15 @@ python _setup_runtime.py       # 从 llama.cpp 官方 Releases 拉 Vulkan 版
 > **Windows Terminal + `cmd /k`**，并且退出后会主动复位终端模式
 > （关鼠标上报、退备用屏、显示光标）。
 
-缺 node 或没装依赖时，程序会直接告诉你去 `tui/` 跑一次 `npm install` ——
-**界面只有 Ink 这一个实现**（不做第二套，免得两套界面两套行为）。
+缺 node 或没装依赖时，程序会直接告诉你去 `MiMo-Code-main/` 跑一次
+`bun install --ignore-scripts`。界面有两套：**默认是 MiMo 原版 TUI**（上面这条路），
+`启动LionCode.cmd` / `python main.py` 是自带的 **Ink** 界面 —— 只为少一层依赖，
+命令集不完全相同，下面列的是 Ink 这套的命令。
 
 CLI 里能用 `/help` 看全部命令。常用几个：
 
 ```
-/new [名字]          开新会话          /mode local|custom   本地模型 / 云端
+/new [名字]          开新会话          /mode custom          切到云端（本地已停用）
 /key <APIKey>        填云端 Key（走小米 MiMo）
 /endpoint <URL> [模型]  任意 OpenAI 兼容端点
 /tools               按分组看全部工具   /approvals auto      全部工具免确认
