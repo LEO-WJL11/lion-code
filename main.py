@@ -22179,7 +22179,15 @@ class ChatApi:
             if dispatcher.is_busy(session_id):
                 if steer is not True:
                     return _error_response("会话正忙，请等待当前任务完成")
-                api.control().stop(session_id)
+                # 【用 dispatcher 的 agent_control，别用 api.control()】我第一版写的
+                # `api.control()` 让 ChatApi 直接 AttributeError: 'ChatApi' object has
+                # no attribute 'control' → 500（日志实录 ✗）。同步路径停任务用的正是
+                # SessionDispatcher.agent_control（__init__ 里 self.agent_control，
+                # submit() 的 steer 分支调它）⇒ 与它同源才不会踩不存在的属性。
+                # getattr 兜 None：agent_control 本身在构造上就是可选的。
+                ctrl = getattr(dispatcher, "agent_control", None)
+                if ctrl is not None:
+                    ctrl.stop(session_id)
                 log__queue_dispatcher.info(
                     "Steer插队(流式): 已请求停止会话 %s 当前任务，等待占用释放", session_id)
                 for _i in range(60):                     # 30s 上限（60 × 0.5s）
