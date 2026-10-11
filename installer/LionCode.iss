@@ -85,10 +85,26 @@ Source: "..\.lbcheck\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; Plan B - no network needed: node_modules ships pre-packed (7za -snh -snl)
 ; and install_deps.cmd extracts it + recreates the junctions. Output goes to
 ; {app}\install-deps.log, ok marker {app}\install-deps.ok (test_install.ps1
-; asserts both). ~60k files to unpack: roughly 30-90 s.
+; asserts both).
+;
+; TWO steps on purpose so the wizard can report one honest status line per
+; phase. Times MEASURED on this machine (16 logical cores) with node_modules
+;   step 1 extract : 132008 files / 1.46 GB  -> about 3-4 minutes
+;                    (7 measured runs of this archive: 174 s ... 252 s.
+;                     Interleaved A/B on the same machine: -mmt=1 avg 244.6 s
+;                     vs -mmt=16 avg 234.5 s = -4%, while run-to-run noise is
+;                     +-15 s. The 132k file creations are what costs the time,
+;                     not the LZMA2 decode, so no thread count fixes it.
+;                     Say a MAGNITUDE plus the two variables, never a promise.)
+;   step 2 relink  : 3435 junctions via 16 parallel slices -> ~8 s
+;                    (the old serial one-by-one script measured 23.5 s)
+; The previous wording promised "about 30-90 seconds" for the whole thing
+; while the real install took 4 min 11 s - that gap is what users felt as
+; "stuck". Never write a number here that was not measured.
 ; NOTE the doubled quotes: Inno's own docs use Parameters: "/C ""{app}\x.cmd"""
 ; - a single quote pair gave "Mismatched or misplaced quotes" at compile time.
-Filename: "{cmd}"; Parameters: "/C ""{app}\install_deps.cmd"""; Flags: runhidden waituntilterminated; StatusMsg: "Extracting MiMo TUI dependencies (offline, about 30-90 seconds)..."
+Filename: "{cmd}"; Parameters: "/C ""{app}\install_deps.cmd"" extract"; Flags: runhidden waituntilterminated; StatusMsg: "Extracting MiMo TUI dependencies (offline; typically 3-4 minutes, depends on disk speed and antivirus scanning)..."
+Filename: "{cmd}"; Parameters: "/C ""{app}\install_deps.cmd"" relink"; Flags: runhidden waituntilterminated; StatusMsg: "Rebuilding directory links (typically a few seconds)..."
 
 [UninstallRun]
 ; ---------------------------------------------------------------------------
@@ -148,7 +164,13 @@ Type: filesandordirs; Name: "{app}\.lbcheck"
 Type: filesandordirs; Name: "{app}\tmp"
 Type: files; Name: "{app}\install-deps.log"
 Type: files; Name: "{app}\install-deps.ok"
+; install_deps.cmd extract writes this marker before install_deps.cmd relink
+; runs - both phases must agree it is gone after uninstall, otherwise the
+; "install directory removed after uninstall" assertion fails on a leftover.
+Type: files; Name: "{app}\install-deps.extracted"
 Type: files; Name: "{app}\relink-nm.done"
+; per-slice markers of the parallel relink dispatcher (relink-nm.pNN.done)
+Type: files; Name: "{app}\relink-nm.p*.done"
 ; NOTE: runtime junk lives under {app} on purpose - a Low-IL process cannot
 ; create %LOCALAPPDATA%\LionCode\* (measured Error 5), and keeping it in
 ; {app} also makes the uninstaller self-contained.

@@ -11,14 +11,26 @@ rem 01:51 on. So the installer ships the PROVEN dev tree instead: node_modules
 rem packed with 7za (-snh hardlink dedup, -snl junctions kept as links), plus
 rem relink-nm.cmd which re-creates the junctions 7z leaves as empty folders.
 rem
+rem PHASE ARGUMENT - the Inno script runs this twice so the wizard can show an
+rem honest status line per phase (times measured on this machine):
+rem   install_deps.cmd extract  extraction only -> writes install-deps.extracted
+rem   install_deps.cmd relink   relink + gates + install-deps.ok, needs the
+rem                             extract phase first (checks the marker above)
+rem   install_deps.cmd          the classic all-in-one run (this is what the
+rem                             retry dialog in the installer tells you to run)
+rem
 rem Exit codes: 3=no 7za.exe  4=no archive or no MiMo dir  5=extract failed
-rem             6=relink marker missing
+rem             6=relink marker missing or sanity gate failed
 setlocal
 set "APP=%~dp0"
 set "LOG=%APP%install-deps.log"
 set "OK=%APP%install-deps.ok"
+set "EXT=%APP%install-deps.extracted"
 set "MIMO=%APP%MiMo-Code-main"
+rem relink phase APPENDS to the log - it must not wipe the extract evidence
+if /i "%~1"=="relink" goto relink
 del "%OK%" >nul 2>&1
+del "%EXT%" >nul 2>&1
 del "%APP%relink-nm.done" >nul 2>&1
 echo === install deps start %DATE% %TIME% === > "%LOG%"
 if not exist "%APP%7za.exe" (
@@ -36,14 +48,28 @@ if not exist "%MIMO%" (
     echo === rc=4 === >> "%LOG%"
     exit /b 4
 )
-"%APP%7za.exe" x "%APP%node_modules.7z" "-o%MIMO%" -y >> "%LOG%" 2>&1
+rem -mmt=16: the pack side used -mmt=16, so the LZMA2 stream is block-parallel
+rem and the unpacker may use every logical core instead of one.
+echo === extract start %TIME% === >> "%LOG%"
+"%APP%7za.exe" x "%APP%node_modules.7z" "-o%MIMO%" -y -mmt=16 >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo extract failed rc=%RC% >> "%LOG%"
     echo === rc=5 === >> "%LOG%"
     exit /b 5
 )
-echo === extract ok, recreating junctions === >> "%LOG%"
+echo === extract ok %TIME%, files written === >> "%LOG%"
+echo ok > "%EXT%"
+if /i "%~1"=="extract" exit /b 0
+:relink
+echo === relink phase start %DATE% %TIME% === >> "%LOG%"
+del "%OK%" >nul 2>&1
+del "%APP%relink-nm.done" >nul 2>&1
+if not exist "%EXT%" (
+    echo extraction marker missing - run install_deps.cmd extract first >> "%LOG%"
+    echo === rc=5 === >> "%LOG%"
+    exit /b 5
+)
 call "%APP%relink-nm.cmd" >> "%LOG%" 2>&1
 if not exist "%APP%relink-nm.done" (
     echo relink marker missing >> "%LOG%"

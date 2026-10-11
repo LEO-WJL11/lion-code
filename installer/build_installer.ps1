@@ -82,7 +82,8 @@ if (-not $SkipStage) {
     Copy-Item -LiteralPath 'C:\Users\Leo\AppData\Roaming\npm\node_modules\bun\bin\bun.exe' (Join-Path $stage 'bun.exe') -Force
     Copy-Item -LiteralPath (Join-Path $root 'installer\README-install.md') (Join-Path $stage 'README-install.md') -Force
     # Plan B payload: pre-packed node_modules + x64 7za + junction relink script
-    # (pack_nm.ps1 produced all three from the proven dev tree)
+    # (pack_nm.ps1 produced all of it from the proven dev tree; relink_split.ps1
+    #  turned relink-nm.cmd into a dispatcher + 16 parallel slices)
     $planB = @(
         @{ from = (Join-Path $root '.lbcheck\node_modules.7z'); to = (Join-Path $stage 'node_modules.7z') },
         @{ from = (Join-Path $root '.lbcheck\7zextra\x64\7za.exe');  to = (Join-Path $stage '7za.exe') },
@@ -94,6 +95,12 @@ if (-not $SkipStage) {
         if (Test-Path -LiteralPath $f.from) { Copy-Item -LiteralPath $f.from $f.to -Force }
         else { Bad ('plan B file missing: ' + $f.from) }
     }
+    # the parallel relink SLICES the dispatcher starts (relink-nm.p00.cmd ..
+    # relink-nm.p15.cmd). Missing slices are a hard error: the dispatcher would
+    # fall back to serial and install ~16 s slower without anyone noticing.
+    $slices = @(Get-ChildItem -LiteralPath (Join-Path $root '.lbcheck') -Filter 'relink-nm.p*.cmd' -File -ErrorAction SilentlyContinue)
+    if ($slices.Count -lt 16) { Bad ('only ' + $slices.Count + ' relink slice file(s) in .lbcheck, need 16') }
+    foreach ($pf in $slices) { Copy-Item -LiteralPath $pf.FullName (Join-Path $stage $pf.Name) -Force }
     $sw.Stop()
     Write-Host ('STAGE done in ' + [math]::Round($sw.Elapsed.TotalSeconds, 1) + ' s')
 }
@@ -111,12 +118,17 @@ $required = @(
 foreach ($r in $required) {
     if (-not (Test-Path (Join-Path $stage $r))) { Bad ('stage missing: ' + $r) }
 }
+$stageSlices = @(Get-ChildItem -LiteralPath $stage -Filter 'relink-nm.p*.cmd' -File -ErrorAction SilentlyContinue)
+if ($stageSlices.Count -lt 16) { Bad ('stage has ' + $stageSlices.Count + ' relink slice(s), need 16') }
+else { Write-Host ('  [OK] ' + $stageSlices.Count + ' relink slices staged') }
 # CLOUD-ONLY payload: no llama-server, no GGUF weights. Ship any of them and
 # the package is wrong (and 5 GB bigger) - fail loudly instead of shipping it.
 if (Test-Path (Join-Path $stage 'runtime-vulkan')) { Bad 'runtime-vulkan must NOT be staged (cloud-only build)' }
 $gguf = @(Get-ChildItem -LiteralPath $stage -Recurse -Filter '*.gguf' -File -ErrorAction SilentlyContinue)
 if ($gguf.Count -gt 0) { Bad ($gguf.Count + ' .gguf weight(s) staged: ' + ($gguf[0].FullName)) }
-foreach ($c in @('StartLionCode.cmd', '_run_mimo.cmd', 'install_deps.cmd', 'relink-nm.cmd', 'lion-code.cmd')) {
+$cmdFiles = @('StartLionCode.cmd', '_run_mimo.cmd', 'install_deps.cmd', 'relink-nm.cmd', 'lion-code.cmd') +
+            @($stageSlices | ForEach-Object { $_.Name })
+foreach ($c in $cmdFiles) {
     $bytes = [IO.File]::ReadAllBytes((Join-Path $stage $c))
     $nonAscii = ($bytes | Where-Object { $_ -gt 127 }).Count
     $lfOnly = 0
