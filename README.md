@@ -122,6 +122,70 @@ CLI 里能用 `/help` 看全部命令。常用几个：
 
 PyCharm 里把解释器指到 `.venv\Scripts\python.exe` 即可。
 
+## ⬇️ 安装与使用（两条路）
+
+### 路 A：开发版 —— 双击 `启动MiMo界面.cmd`
+
+仓库根目录双击它就行（Windows Terminal 里跑，见上面「关于终端」）：
+
+```
+启动MiMo界面.cmd  →  _run_mimo.cmd  →  _start_mimo.py 三段编排
+   ① main.py --backend-only :18080     ② mimo适配.py :8791     ③ MiMo 原版 TUI
+```
+
+只看后端用 `启动LionCode.cmd`（自带 Ink 界面，`/help` 里有全部命令）。
+
+### 路 B：安装版 —— 装完敲 `lion-code`
+
+安装包 `LionCode-Setup-1.0.0.exe`（**183.3 MB，云端版**：不带 `runtime-vulkan`、
+不带任何 `*.gguf`，由 `.lbcheck\rebuild_all.ps1` 现场构建，产物不入库）。
+
+1. 右键安装包 → **以管理员身份运行**（SmartScreen 拦截就「更多信息 → 仍要运行」）；
+2. 装完**新开一个 cmd 窗口**，敲：
+
+```bat
+lion-code
+```
+
+> ⚠️ **新窗口才认 PATH（这条踩过）**：安装器把安装目录追加进用户 PATH 后会广播
+> `WM_SETTINGCHANGE`，但**安装前就开着的 cmd 拿到的是安装前的环境快照** ——
+> 在旧窗口里敲 `lion-code` 会报「不是内部或外部命令」。**关掉重开一个窗口**即可；
+> 已经开着的窗口永远不会自己刷新。
+
+> ⚠️ **本机沙箱里装可能写不了 PATH**：未签名 exe 在本沙箱被降到 **Low 完整性级别**，
+> HKCU 写不进 → 安装器**跳过 PATH 写入并在日志里写明**（不整包回滚）。
+> 正常机器是 Medium 级别，PATH 由安装器**真实写入 ✓**。被跳过时手动把安装目录加进 PATH。
+
+### 云端模式怎么配
+
+出厂已内置 `https://api.xiaomimimo.com/v1` + `mimo-v2.6-flash`，**只差 API Key**：
+
+- **Ink 界面**里一条命令：`/key <你的 key>`（会自动完成「切云端 + 填 key + 推给适配器」三步）；
+  换别的 OpenAI 兼容端点用 `/endpoint <URL> [模型]`，手动切用 `/mode custom`；
+- **任何界面**都可以走后端两步（缺一不可 —— 只写配置不推适配器，请求照样打到旧端点）：
+
+```powershell
+POST http://127.0.0.1:18080/api/runtime/mode        {"mode":"custom","baseUrl":"https://api.xiaomimimo.com/v1","apiKey":"<你的 key>","model":"mimo-v2.6-flash"}
+POST http://127.0.0.1:18080/api/chat/adapter/config {"baseUrl":"https://api.xiaomimimo.com/v1","apiKey":"<你的 key>","model":"mimo-v2.6-flash"}
+```
+
+- 换模型：界面里 `/models`（或 `Ctrl+X M`）；看生效配置 `GET /api/runtime/mode`。
+- **key 不要写进文档 / 截图 / 仓库**，它存在 `%USERPROFILE%\.lioncode\app-config.json`。
+- 本地模式**已停用**（本产品是云端 API 版），`/mode local` 会被明确拒绝并说明原因。
+
+完整变更与**已知问题**（`opentui.dll` 段错误、`web_search` 引擎兜底、Inno 7 许可…）见
+[`CHANGELOG.md`](CHANGELOG.md)；发布/打包流程见 [`docs/RELEASE.md`](docs/RELEASE.md)。
+
+### 卸载与日志
+
+| 想干什么 | 去哪 |
+| --- | --- |
+| 卸载 | 设置 → 应用 → **Lion Code**（或 `<安装目录>\unins000.exe`；静默卸载 `/VERYSILENT /NORESTART`）。会先把安装目录从 PATH 摘掉，`node_modules`、运行日志一并删除 |
+| 运行日志（安装版） | `<安装目录>\.lbcheck\` —— `watchdog.log` / `backend.log` / `adapter.log` / `frontend.log`；安装目录不可写时回退 `%LOCALAPPDATA%\LionCode\data\` |
+| 运行日志（开发版） | 仓库根 `.lbcheck\` —— 同名 4 个 log + `mimo-home\data\log\`（MiMo 前端 `dev-main-*.log`） |
+| 打包 / 验收日志 | `.lbcheck\build_only.log`、`.lbcheck\inno_*.log`、`.lbcheck\selftest\` |
+| 会话与配置（真正持久化的） | `%USERPROFILE%\.lioncode\app-config.json`，与安装位置无关 |
+
 ## 📁 项目结构
 
 **后端 6 个 Python 文件 + 前端 1 个 Ink 应用**：
@@ -139,8 +203,10 @@ PyCharm 里把解释器指到 `.venv\Scripts\python.exe` 即可。
 另有 `skills/`（内置技能源，4 个）、`docs/_archive/`（重构前全量快照，回退用）。
 
 > **历史说明**：下面的安装包 / VS Code 扩展 / Spring Boot 章节是 **Java 版时期**的文档，
-> 对应的 `installer/`、`extensions/`、`dist/` 目录与 Java 源码已在纯 Python 移植后移除，
-> 保留在此仅供追溯。当前版本没有安装包，直接 `python main.py` 运行。
+> 对应的 `extensions/`、`dist/` 目录与 Java 源码已在纯 Python 移植后移除，
+> 保留在此仅供追溯 —— 里面的下载链接、大小、截图**都已过期** ✗。
+> 当前版本**有**安装包：Inno 6 打的 `LionCode-Setup-1.0.0.exe`，见上面
+> 「安装与使用（两条路）」与 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
 ---
 
@@ -192,9 +258,11 @@ VS Code 插件会一起卸掉；你的会话和工作区数据保留。
 | 模型权重 | 根目录 `lion-merged-IQ4_XS.gguf`（首次自动下；也可以只放 ModelScope 那份） |
 
 > **历史说明**：本文档下面的「安装包 / VS Code 插件 / 出包脚本」章节是 **Java 与桌面版时期**留下的，
-> 对应的 `installer/`、`extensions/`、`dist/`、`tools/checks/`、`python/lionbox/` 都已移除
-> （`tools/checks/` 与旧引擎在 `docs/_archive/重构前全量快照.zip` 里）。当前版本没有安装包，
-> `python main.py` 就是全部。
+> 对应的 `extensions/`、`dist/`、`tools/checks/`、`python/lionbox/` 都已移除
+> （`tools/checks/` 与旧引擎在 `docs/_archive/重构前全量快照.zip` 里）。
+> 当前的安装包由仓库里的 `installer/` **现做**（Inno 6 + `build_installer.ps1`），
+> 用法见上面「安装与使用（两条路）」；下面那段「`installer/release/` 里的
+> `LionBox-Setup-1.5.4.exe`（74 MB）」是旧链接，**已不存在** ✗。
 
 模型权重**不在这个仓库**（太大），在 ModelScope：
 **[lionnezha/lion-models](https://modelscope.cn/models/lionnezha/lion-models)**。
