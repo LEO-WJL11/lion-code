@@ -87,6 +87,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .lbcheck\rebuild_all.ps1
 ## 3. 发布前必查（逐条打勾）
 
 - [ ] **编译 0 错**：① 段 5 个 `py_compile` 全 0；Stage 1 `compile failures: 0`
+- [ ] **产物与源码同步**：每个 exe 的 `mtime` 必须**晚于**它对应源文件的 `mtime`
+      （本次快照后 `mimo适配.py` 又改过 ⇒ `adapter.exe` 已过期，必须重编再打包）
 - [ ] **225 全绿**：`python .lbcheck\run_tests.py` → `合计 225 用例，失败 0 → 全部通过 ✓`
       （7 套：parser 56 / alias 42 / main_loop 39 / guard 30 / context 20 / approval 8 / change_review 30）
 - [ ] **验收门 26/26**：`final_gate.py` `gate=0`
@@ -130,6 +132,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .lbcheck\rebuild_all.ps1
 ### 4.1 `git log --oneline -15`
 
 ```
+2c51045 docs(readme): 修正「界面只有 Ink 这一个实现」与 /mode local 两处过期说法
+8640a1e fix(adapter): 消息 id 改成「字典序==时序」(ULID 语义) —— 修"回答跑到下一条问题后面"(字错位)
+d4e150f docs(release): 发布准备 —— CHANGELOG / 安装与使用 / RELEASE 清单 / VERSION=1.5.46
 c784d15 perf(installer): 解压并行 + junction 并行重建 + 进度文案改成实测值
 0f2fba9 fix(launcher): 前端崩溃时出声 —— 别再让用户盯着冻结黑屏等
 16c722f fix(adapter): GlobalEvent 按事件主体带 directory+workspace，会话带 workspaceID（选完工作区后 useEvent 全丢事件/黑屏的配套修复）
@@ -142,13 +147,11 @@ bd16b91 refactor(tools): 工具从 57 个砍到 21 个 —— 注册表/提示�
 cdbd020 fix(workspace): 切换工作区后界面显示不变 —— 三层根因全修
 eec8054 fix(llm): 429 限流退避重试 + 消掉重复的"模型调用失败:"前缀
 8cad024 fix(llm): tools 被双重包装成 60 个 name:null —— 云端 400 "Param Incorrect" 致发消息无响应
-119e82f fix(launcher): 修我上一轮引入的回归 —— rc 初始 1 成功路径不置 0，导致 TUI 从未真正启动
-e94807f fix(adapter): 最后 2 片补审的 2 条 —— titleSource 枚举外值致侧栏标题永不更新 / 非有限 token 值掐断连接
-c6f990d fix(adapter): 清单外实证 fatal —— /provider 模型缺 limit/providerID/api，overflow.ts:81 裸读导致状态对话框修完 tokens 仍崩
 ```
 
-（`c784d15` 是本快照的 HEAD；`git status` 里 `mimo适配.py` 处于**已修改未提交**状态 ——
-那是另一个代理正在做的消息 id 修复，**别碰、别 add**。）
+（前 3 条是本次发布文档提交 + 与它并行的适配层修复；`d4e150f` 起到 `c784d15` 是盘点时的基线。
+`mimo适配.py` 的消息 id 修复已由另一个代理以 `8640a1e` 提交 —— **本文档的撰写者全程没有碰它** ✅。
+本机 `master` 领先 `origin/master` 3 个提交，**按要求未 push**。）
 
 ### 4.2 三个 exe + 安装包（实算，`Get-FileHash -Algorithm SHA256`）
 
@@ -161,6 +164,11 @@ c6f990d fix(adapter): 清单外实证 fatal —— /provider 模型缺 limit/pro
 
 配套数据（来自 `build_only.log`）：payload **296.5 MB / 2083 文件**，压缩比 **0.618**，
 ISCC **9.9 s**（`LZMANumBlockThreads=16`；单线程对比 36.5 s）。
+
+> ⚠️ **快照之后源码又动过**：`mimo适配.py` 在 **17:03** 被改（消息 id 修复 `8640a1e`），
+> 而 `adapter.exe` 停在 **16:18** ⇒ **上面的 `adapter.exe` 哈希对应的是旧源码**。
+> 发出去之前必须**重跑 Stage 1（至少重编 adapter）+ Stage 3 重打包**，
+> 否则发的包里没有那个修复。判据永远是 `mtime(exe) > mtime(源文件)`。
 
 ### 4.3 自带测试（`.lbcheck\run_tests.py`，本轮实跑）
 
