@@ -2344,7 +2344,10 @@ class FileTouchTool(ToolPlugin):
 
     @property
     def description(self) -> str:
-        return "创建空文件"
+        # 【为什么加 content】2026-10-11 的实测考题里，模型想写 5 个**有内容**的文件
+        # 却调了本工具（只 touch）⇒ 审核放行后落盘 5 个 0 字节废件 ✗✗✗。语义该由产品
+        # 兜底：传 content 就一次写入、不传仍是原行为（空文件），**"已存在不覆盖"不变**。
+        return "创建文件（可选 content：传了就一次写入内容；不传则建空文件；已存在会失败、不覆盖）"
 
     @property
     def category(self) -> str:
@@ -2359,6 +2362,8 @@ class FileTouchTool(ToolPlugin):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件路径"},
+                "content": {"type": "string",
+                            "description": "要写入的内容（可选）；不传 = 空文件"},
             },
             "required": ["path"],
         }
@@ -2367,6 +2372,9 @@ class FileTouchTool(ToolPlugin):
         try:
             path = self.resolve_path(self.get_required_string_arg(args, "path"))
             file_path = Path(path)
+            # 可选内容：缺省 None = 保持"只建空文件"的原行为
+            content = args.get("content")
+            content = None if content is None else str(content)
 
             # 【判断存在必须排在 intercept 之前】见模块 docstring：顺序反了会清空原文件
             if file_path.exists():
@@ -2374,11 +2382,16 @@ class FileTouchTool(ToolPlugin):
 
             if file_path.parent != Path(""):
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-            gate = intercept(self.name, str(path), None, "")
+            # 登记**真实**新文：审核界面要看到将要落盘的内容（老版本这里传 ""，
+            # 放行后必然是 0 字节文件 —— 上面 description 里那次实测就是这么来的）。
+            gate = intercept(self.name, str(path), None, "" if content is None else content)
             if gate is not None:
                 return gate
             # Java: Files.createFile —— 存在就抛 FileAlreadyExistsException
             file_path.touch(exist_ok=False)
+            if content is not None:
+                file_path.write_text(content, encoding="utf-8", newline="")
+                return self.success(f"文件已创建（{len(content)} 字符）: {path}")
             return self.success(f"文件已创建: {path}")
         except FileExistsError:
             return self.success(f"文件已存在: {args.get('path')}")

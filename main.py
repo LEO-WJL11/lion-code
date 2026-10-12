@@ -12867,7 +12867,8 @@ TOOL_PROMPT_HINTS: dict[str, str] = {
     "directory_tree": "画目录树（只看结构/有哪些文件、当前目录下有什么都用它）。用户说“目录结构/画给我看/树状/列一下目录”用它，path 给目录、maxDepth 控制层数",
     "glob_files": "按名字或后缀找文件。用户说“所有 .java 文件/找找 xyz 文件”用它，pattern 传 **/*.java 这种",
     "search_in_files": "在**文件内容**里搜文本或正则。用户说“哪里提到了 TODO/搜一下内容”用它",
-    "create_file": "只创建**空**文件。要写内容请用 write_file",
+    "create_file": "创建文件：带 content 就一次写入内容，不传则建空文件；**已存在会失败、不覆盖**。"
+                   "给已有文件写内容请用 write_file",
     "write_file": "新建文件并写入内容（也用于整体覆盖）。用户说“建个文件，写上…”用它；只想建空文件用 create_file；改已有文件的一小部分用 modify_file（别整体重写）；追加用 append_file",
     "append_file": "往文件末尾追加内容。用户说“追加一行/加到末尾”用它",
     "modify_file": "改文件内容：替换/插入/删除行。用 operation 指定动作，替换给 oldText+content，按行改给 startLine/endLine+content",
