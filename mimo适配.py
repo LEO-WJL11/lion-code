@@ -82,7 +82,7 @@ _SESSIONS: dict[str, dict] = {}          # id → Session
 _MESSAGES: dict[str, list] = {}          # sessionID → [Message]
 _PARTS: dict[str, list] = {}             # messageID → [Part]
 _TOOLS: dict[str, dict] = {}             # 会话 → 工具（给 /session/{id}/task 之类兜底）
-_SUBS: list[queue.Queue] = []            # SSE 订阅者
+_SUBS: list[tuple[queue.Queue, str, str]] = []   # SSE 订阅者: (队列, 本连接声明的 directory, workspace)
 _WORKSPACES: list[dict] = []             # 工作区（/workspace 新建的）
 #: 默认工作区的 id —— 只生成一次，保证状态接口的键和列表对得上
 _WORKSPACE_DEFAULT_ID = ""
@@ -374,9 +374,22 @@ def broadcast(payload: dict, directory: str | None = None,
     line = "data: " + json.dumps(evt, ensure_ascii=False) + "\n\n"
     with _LOCK:
         subs = list(_SUBS)
-    for q in subs:
+    for entry in subs:
+        # 每条 SSE 的"当前上下文"不同（连接声明的 directory/workspace）⇒ 逐连接覆写，
+        # 让 useEvent 的过滤键与该前端实例自己的 /path 结果一致（一致 ⇒ 不丢事件 ⇒ 不黑屏）。
+        q, cdir, cwid = entry
+        if cwid:
+            line2 = "data: " + json.dumps({"directory": cdir or d, "workspace": cwid,
+                                           "project": _PROJECT_ID, "payload": payload},
+                                          ensure_ascii=False) + "\n\n"
+        elif cdir:
+            line2 = "data: " + json.dumps({"directory": cdir, "workspace": "",
+                                           "project": _PROJECT_ID, "payload": payload},
+                                          ensure_ascii=False) + "\n\n"
+        else:
+            line2 = line
         try:
-            q.put_nowait(line)
+            q.put_nowait(line2)
         except Exception:                                 # noqa: BLE001
             pass
 
@@ -1458,6 +1471,21 @@ class Handler(BaseHTTPRequestHandler):
             # 不一致会让 useEvent 按 instance.directory() 过滤时**丢掉实时事件** ✗✗✗）。
             # 修法与 /project/current 同源同方法：header/query/body 三处读 workspace id
             # → 解析成真实目录；读不到就退回 `_DIRECTORY`（默认工作区）。
+            #
+            # 【第二处漏修（2026-10-13 复现黑屏的真因）】TUI 实际传的是 `?directory=<目录>`
+            # （本机实测：适配层日志里所有请求都带 `directory=C%3A%5C…%5CLionCode`），
+            # **不是 workspace id** ⇒ 上面那句解析退回了默认（= 安装目录）⇒ instance.path
+            # 仍与 sdk.directory 不一致 ⇒ 事件全丢 ⇒ 黑屏。所以：**优先用它自己传的目录**
+            # —— 那就是前端心里的"当前目录"，与 instance.path 必然一致（一致即不丢事件 ✓）。
+            _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _d = _q.get("directory")
+            if _d:
+                _dir = urllib.parse.unquote(str(_d[0])).strip()
+                if os.path.isdir(_dir):
+                    return self._json({"home": home,
+                                       "state": os.path.join(home, ".local", "share", "lioncode"),
+                                       "config": os.path.join(home, ".config", "lioncode"),
+                                       "worktree": _dir, "directory": _dir})
             wid = self._workspace_of()
             d = workspace_directory(wid) if wid else _DIRECTORY
             return self._json({"home": home,
@@ -1833,16 +1861,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         q: queue.Queue = queue.Queue()
+        # 【按连接记住声明的上下文】本连接的 ?directory= / ?workspace= 就是"这个前端
+        # 实例心里的当前上下文"，广播要按它覆写（见 broadcast）—— 否则从安装目录启动时
+        # 事件的 directory 是会话工作区、与 instance.directory 不一致 ⇒ useEvent 丢事件 ⇒ 黑屏。
+        _qq = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        _qd = urllib.parse.unquote(str(_qq.get("directory", [""])[0])).strip()
+        _qw = str(_qq.get("workspace", [""])[0]).strip()
+        if _qw:
+            _qdir, _qwid = workspace_directory(_qw) or _qd, _qw
+        else:
+            _qdir, _qwid = _qd, ""
         with _LOCK:
-            _SUBS.append(q)
+            _SUBS.append((q, _qdir, _qwid))
         try:
             # server.connected 也要带对 directory/workspace：useEvent
-            # （event.ts:20-28）对**每一条**事件都按当前工作区过滤，首条也不例外
-            # （过滤键与 GET /path 同源 —— 连接若带 ?workspace= 就按它解析，
-            #  不带则回默认工作区 `_DIRECTORY`，与 /path 无参时同值 ✓）。
-            wid0 = self._workspace_of()
-            d0 = workspace_directory(wid0) if wid0 else _DIRECTORY
-            first = {"directory": d0, "workspace": workspace_id(d0),
+            # （event.ts:20-28）对**每一条**事件都按当前工作区过滤，首条也不例外。
+            # 有本连接声明的就用它（与广播同源 ✓）；没有才回默认解析。
+            wid0 = _qwid or self._workspace_of()
+            d0 = _qdir or (workspace_directory(wid0) if wid0 else _DIRECTORY)
+            first = {"directory": d0, "workspace": _qwid or workspace_id(d0),
                      "project": _PROJECT_ID,
                      "payload": {"type": "server.connected", "properties": {}}}
             self.wfile.write(("data: " + json.dumps(first, ensure_ascii=False) + "\n\n").encode())
@@ -1860,8 +1897,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             with _LOCK:
-                if q in _SUBS:
-                    _SUBS.remove(q)
+                with _LOCK:
+                    _SUBS[:] = [s for s in _SUBS if s[0] is not q]
 
     # -- POST / PATCH / DELETE
     def do_POST(self):                                    # noqa: N802
