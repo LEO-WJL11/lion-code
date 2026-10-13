@@ -1080,6 +1080,13 @@ def seed_workspaces() -> None:
         path = str(it.get("path") or it.get("id") or "").strip()
         if not path or not os.path.isdir(path):
             continue
+        # 【不把测试产物当用户工作区列出来】实测列表里混进了 3 个纯空目录：
+        #   .lbcheck\workspace\workspaces\lion-code-2 / -3、.lbcheck\e2e_ws
+        # 那些是 e2e 自测时登记的工作区（都住在仓库的 .lbcheck 之下）—— 列表里塞满
+        # 空壳会让用户以为"工作区没有文件"（2026-10-11 就是这么报障的 ✗✗✗）。
+        # 只跳过 .lbcheck 内部的记录；用户的真实目录（哪怕当前是空的）照常列 ✓
+        if "\\.lbcheck\\" in path.replace("/", "\\").lower():
+            continue
         entry = workspace_entry(path)
         with _LOCK:
             if entry["id"] in known:
