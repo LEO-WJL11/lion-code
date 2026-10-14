@@ -630,9 +630,34 @@ def session_messages(sid: str) -> tuple:
     """
     with _LOCK:
         mem = list(_MESSAGES.get(sid) or [])
-        mem_parts = dict(_PARTS)
+        # 【别复制整张 parts 表】原来 `mem_parts = dict(_PARTS)` 在锁内把**所有会话的
+        # 所有 parts** 克隆一份（只为取下面那几条）✗✗✗ —— 会话多、parts 多时既是内存
+        # 峰值又是锁内停顿。按需取即可（下面只用 mem 里出现过的 id）。
     if mem:
-        return mem, {m["id"]: list(mem_parts.get(m["id"]) or []) for m in mem}
+        with _LOCK:
+            mem_parts = {m["id"]: list(_PARTS.get(m["id"]) or []) for m in mem}
+        # 【必须并入持久化历史】原来这里是 `if mem: return` —— 老会话在本进程发过
+        # 第一条新消息后，`_MESSAGES` 就非空 ⇒ 之后每次读历史**只返回新消息、
+        # 老的历史整段消失** ✗✗✗（2026-10-13 读代码发现，用户可见 ✗）。所以：
+        # 有内存就还要看持久化，两段合并后按 id（时序 id ⇒ 字典序=先后）排序。
+        bid0 = to_backend_id(sid)
+        if not bid0:
+            with _LOCK:
+                cur0 = _SESSIONS.get(sid)
+            bid0 = str((cur0 or {}).get("backendID") or "")
+        recs0 = _read_conv(bid0) if bid0 else []
+        if recs0:
+            persisted, pparts = _replay(bid0, sid, recs0)
+            seen = {m["id"] for m in persisted}
+            extra = [m for m in mem if m.get("id") not in seen]
+            if extra:
+                # 持久化在前、新消息在后；再按 id 兜一次序（两段都是时序 id ✓）
+                merged = sorted(persisted + extra, key=lambda m: m.get("id", ""))
+                outp = dict(pparts)
+                outp.update(mem_parts)
+                return merged, {m["id"]: outp.get(m["id"], []) for m in merged}
+            return persisted, pparts
+        return mem, mem_parts
 
     bid = to_backend_id(sid)
     if not bid:
@@ -643,8 +668,20 @@ def session_messages(sid: str) -> tuple:
         return [], {}
 
     recs = _read_conv(bid)
-    # model.modelID 用真实云端模型（原来写死 MODEL_ID = 本地权重名 ✗，见 current_model）
-    cur_model = current_model() if recs else MODEL_ID
+    if not recs:
+        return [], {}
+    return _replay(sid, recs)
+
+
+def _replay(sid: str, recs: list) -> tuple:
+    """把持久化对话回放成 (messages, parts)；**只读、不碰内存表**。
+
+    两条路都调它：① 全新会话（无内存）② 老会话"内存新消息 + 持久化历史"的合并
+    （session_messages 里的 `if mem:` 分支 —— 那里不能短路，否则老历史整段消失 ✗）。
+
+    model.modelID 用真实云端模型（原来写死 MODEL_ID = 本地权重名 ✗，见 current_model）
+    """
+    cur_model = current_model()
     # 【回放时钟必须是局部的】老消息的 id 只由**记录本身**（timestamp + 数组到达
     # 顺序）决定 ⇒ 同一个老会话读多少次都得到同一批 id（前端 sync.tsx:1042-1044
     # 虽是整体替换、id 漂移不至于串位，但两次读对不上就没法排查 ✗）。
@@ -674,8 +711,12 @@ def session_messages(sid: str) -> tuple:
         mid = _ordered_id(
             "msg_", ts_ms, hstate,
             tail=(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6] if raw else _slug(6)))
+        # time 用**记录时间**（原来两条都写 now_ms() ✗ —— 重开会话后历史的创建/
+        # 完成时间全变成"此刻" ✗✗✗ 显示与排序都失真）。completed 与 created 同值：
+        # 回放的记录本身没有"完成时刻"的独立字段，但 completed 是前端判"还在跑"的
+        # 依据（缺了会一直转圈）⇒ 给同值表示"早已完成"。
         base = {"id": mid, "sessionID": sid, "agentID": AGENT, "role": role,
-                "time": {"created": now_ms(), "completed": now_ms()}}
+                "time": {"created": ts_ms, "completed": ts_ms}}
         if role == "user":
             base.update({"agent": AGENT,
                          "model": {"providerID": PROVIDER_ID, "modelID": cur_model}})
@@ -1897,8 +1938,9 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             with _LOCK:
-                with _LOCK:
-                    _SUBS[:] = [s for s in _SUBS if s[0] is not q]
+                # 【只加一次锁】我上一轮改这里时写成了三层嵌套 with _LOCK（下面那层
+                # 是多余的）—— RLock 可重入所以没死锁 ✗，但它是笔误，不该留在仓库。
+                _SUBS[:] = [s for s in _SUBS if s[0] is not q]
 
     # -- POST / PATCH / DELETE
     def do_POST(self):                                    # noqa: N802

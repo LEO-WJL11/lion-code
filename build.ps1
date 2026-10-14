@@ -1,4 +1,4 @@
-﻿# Build script invoked by build.bat. UTF-8 with BOM (PS 5.1 reads BOM as UTF-8;
+# Build script invoked by build.bat. UTF-8 with BOM (PS 5.1 reads BOM as UTF-8;
 # without it CJK literals would be read as GBK and get mangled).
 # Fixes vs the old pipeline:
 #   1) NO output filtering - Nuitka's real error stays visible.
@@ -64,7 +64,7 @@ Write-Host '  kept: installer\output (deliverables)'
 # ---------------------------------------------------------------
 # STAGE 1: Nuitka, one target at a time, FULL output, exit code captured at once
 # ---------------------------------------------------------------
-Step 'STAGE 1  Nuitka x3 (16 threads) - FULL output, nothing filtered'
+Step 'STAGE 1  Nuitka x3 (single thread, --jobs=1 per user instruction) - FULL output'
 $ps1 = Join-Path $root '.lbcheck\build_one.ps1'
 # Resolve the adapter source by wildcard: a CJK literal here would be mangled if
 # this file ever lost its BOM - that already broke a build once.
