@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lion Code — 本地 TUI 编码助手（云端模型）</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --mut:#8b949e; --acc:#e3b341; --ok:#3fb950; --bad:#f85149; --line:#30363d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.7 -apple-system,"Segoe UI",Consolas,"Microsoft YaHei",sans-serif; }
+  .wrap { max-width: 980px; margin:0 auto; padding: 36px 20px 80px; }
+  h1 { font-size:30px; margin:0 0 6px; }
+  h2 { font-size:20px; margin:34px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .sub { color:var(--mut); margin-bottom:24px; }
+  code, pre { font-family:Consolas,"Cascadia Mono",monospace; }
+  code { background:var(--panel); padding:1px 6px; border-radius:4px; }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow:auto; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px; }
+  .tool { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:7px 10px; }
+  .tool b { color:var(--acc); font-family:Consolas,monospace; font-size:13px; }
+  .tool span { display:block; color:var(--mut); font-size:12.5px; margin-top:2px; }
+  .warn { border-left:3px solid var(--bad); background:#1c1113; padding:10px 14px; border-radius:0 6px 6px 0; margin:10px 0; }
+  .ok   { border-left:3px solid var(--ok);  background:#0d1a10; padding:10px 14px; border-radius:0 6px 6px 0; margin:10px 0; }
+  table { width:100%; border-collapse:collapse; margin:8px 0; }
+  th,td { text-align:left; padding:7px 10px; border:1px solid var(--line); font-size:14px; }
+  th { background:var(--panel); color:var(--mut); }
+  .muted { color:var(--mut); font-size:13px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Lion Code</h1>
+  <div class="sub">本地终端 AI 编码助手（MiMo TUI 前端 + 纯 Python 后端 · 云端模型）· v1.5.46</div>
+
+  <h2>它是什么</h2>
+  <p>在终端里工作的编码 Agent：读代码、改文件、跑命令、联网查资料、把大任务拆给子代理并行做。
+  模型走云端 API（<code>OpenAI 兼容</code>），<b>不带本地权重、不下载模型</b>。</p>
+
+  <h2>安装与启动</h2>
+  <pre>1) 双击安装包 LionCode-Setup-1.0.0.exe
+2) 装完【新开一个 cmd】（旧窗口认不到新 PATH ✗ 必须新开）
+3) 输入:  lion-code
+4) 首次使用先配云端:  /key &lt;你的 API key&gt;</pre>
+  <div class="warn">安装在旧窗口里敲 <code>lion-code</code> 会报"不是内部或外部命令" ——
+  Windows 的 cmd 只在启动那一刻读一次 PATH，装完必须<b>重开一个窗口</b>。</div>
+
+  <h2>21 个内置工具</h2>
+  <div class="grid">
+    <div class="tool"><b>read_file</b><span>读文件（已知路径）</span></div>
+    <div class="tool"><b>head_tail_file</b><span>只看开头/结尾（省上下文）</span></div>
+    <div class="tool"><b>directory_tree</b><span>目录树/看结构</span></div>
+    <div class="tool"><b>glob_files</b><span>按名字/后缀找文件</span></div>
+    <div class="tool"><b>search_in_files</b><span>文件内容里搜文本/正则</span></div>
+    <div class="tool"><b>line_count</b><span>数行数</span></div>
+    <div class="tool"><b>write_file</b><span>写文件（覆盖）</span></div>
+    <div class="tool"><b>create_file</b><span>新建文件（可带内容；不覆盖已有）</span></div>
+    <div class="tool"><b>modify_file</b><span>改文件（替换/插入/删除/追加）</span></div>
+    <div class="tool"><b>append_file</b><span>追加到末尾</span></div>
+    <div class="tool"><b>copy_file</b><span>复制文件/目录</span></div>
+    <div class="tool"><b>create_directory</b><span>建目录</span></div>
+    <div class="tool"><b>delete_file</b><span>删除（危险，需确认）</span></div>
+    <div class="tool"><b>download_file</b><span>下载（含 SSRF 闸门）</span></div>
+    <div class="tool"><b>execute_command</b><span>跑命令（PowerShell，含 git）</span></div>
+    <div class="tool"><b>web_search</b><span>联网搜索（bing 默认）</span></div>
+    <div class="tool"><b>system_info</b><span>本机系统信息</span></div>
+    <div class="tool"><b>timestamp</b><span>当前日期时间</span></div>
+    <div class="tool"><b>context_window</b><span>上下文窗口说明</span></div>
+    <div class="tool"><b>context_prune</b><span>上下文占用与建议</span></div>
+    <div class="tool"><b>ask_user</b><span>向你提问</span></div>
+  </div>
+  <p class="muted">另有插件工具 <code>skill_load</code>（载入技能）与子代理 <code>agent_spawn</code> / <code>agent_team_run</code>。</p>
+
+  <h2>能力一览</h2>
+  <table>
+    <tr><th>批量工具调用</th><td>一轮最多 <b>10 个</b>互不依赖的调用并行发</td></tr>
+    <tr><th>插队</th><td>正在跑时发消息会<b>打断当前任务并立刻接管</b>（不再只是"会话正忙"被拒）</td></tr>
+    <tr><th>改动审核</th><td>写文件前先给你 diff，<b>通过才落盘</b>，可打回让模型重写</td></tr>
+    <tr><th>子代理</th><td>可查看状态（running/idle/completed/…）、<b>可停止且级联停子代理</b></td></tr>
+    <tr><th>工作区</th><td>多工作区管理；切换即生效（会话落进所选目录）</td></tr>
+  </table>
+
+  <h2>已知限制（如实）</h2>
+  <div class="warn">
+    ① <b>界面偶发崩溃</b>：上游 OpenTUI（Bun 1.4.2）有原生段错误，崩了会打印症状并提示
+    "重新打开即可"，数据不丢。<br>
+    ② 本沙箱类环境（Low 权限）安装时无法写用户 PATH → 日志会明确提示"需手动加"。
+  </div>
+  <div class="ok">云端-only：不下载、不运行任何本地模型；密钥在界面里显示为掩码形式。</div>
+
+  <p class="muted">构建与验收：Nuitka 单核编译（<code>--jobs=1</code>）· Inno Setup 6 打包 ·
+  自带测试 225 条 · 验收门 27 项全过 · 真装真卸 63/0。</p>
+</div>
+</body>
+</html>
