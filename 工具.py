@@ -7164,6 +7164,46 @@ _CHUNK__tools_web_download_file = 1 << 16
 
 
 @tool
+def _ssrf_blocked(url: str) -> str | None:
+    """SSRF 闸门：返回拒绝理由；放行返回 None。
+
+    【为什么要有】`download_file` 原来直接 urlopen（模型让它打内网/环回/云元数据
+    端点毫无阻拦 ✗✗✗）。判据只到"地址层面"：
+      · 只许 http/https（file/ftp 等一律拒 —— 后者还能读本地文件）
+      · 解析出的 IP 属于 私网/环回/link-local/保留/组播/未指定 → 拒绝
+      · DNS 解析失败**不拦**（交给 urlopen 报"无法解析"，别把拼错域名说成 SSRF）
+    【诚实边界】只校验**发起时**的地址：域名解析被劫持/服务端重定向到内网
+    （urlopen 默认跟随重定向）仍可能绕过 —— 那需要逐跳校验，改动面大，先如实记录。
+    """
+    import ipaddress as _ip
+    import socket as _sock
+    from urllib.parse import urlparse as _urlparse
+    try:
+        pr = _urlparse(url)
+    except ValueError:
+        return "下载失败: URL 格式非法"
+    if pr.scheme and pr.scheme.lower() not in ("http", "https"):
+        return f"下载被拒绝：只允许 http/https（收到 {pr.scheme}）"
+    host = (pr.hostname or "").strip()
+    if not host:
+        return "下载失败: URL 里没有主机名"
+    try:
+        infos = _sock.getaddrinfo(host, None)
+    except OSError:
+        return None                      # DNS 失败 → 交给 urlopen 自己报错
+    for _fam, _typ, _proto, _canon, sockaddr in infos:
+        addr = sockaddr[0]
+        try:
+            ip = _ip.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return (f"下载被拒绝：目标 {host} 解析到内网/受限地址 {addr} —— "
+                    "不允许让工具去打内网、环回或云元数据端点")
+    return None
+
+
 class DownloadTool(ToolPlugin):
     """从URL下载文件"""
 
@@ -7205,6 +7245,16 @@ class DownloadTool(ToolPlugin):
             save_path = self.get_required_string_arg(args, "savePath")
         except ValueError as e:
             return self.error("下载失败: " + str(e))
+
+        # 【SSRF 闸门】原来直接 urlopen ✗✗✗ —— 模型可以让它去打内网/环回/云元数据端点
+        # （http://169.254.169.254/…、http://127.0.0.1:18080/api/… 等），等于把
+        # 后端所在网络暴露给模型。这里：
+        # · 只许 http/https（file:// / ftp:// 一律拒）
+        # · 主机名解析后若是 私网/环回/link-local/保留地址 → 拒绝
+        # · DNS 解析失败**不拦**（交给 urlopen 自己报错，别把"域名输错"变成 SSRF 提示）
+        blocked = _ssrf_blocked(url)
+        if blocked is not None:
+            return self.error(blocked)
 
         target = self.resolve_path(save_path)
         part = target.with_name(target.name + ".part")

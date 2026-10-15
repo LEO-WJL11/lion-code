@@ -709,6 +709,13 @@ class ChangeReview:
             if drop <= 0:
                 break
             if c.status == PENDING:
+                # 【丢待审必须出声】丢最老的待审是上面审计修的有意行为（否则全待审时
+                # 映射无界增长 ✗），但**静默丢**会让用户"没看到这条改动它就没了" ✗✗✗
+                # —— 至少留一行日志，界面/日志里能追（不改行为，只出声 ✓）。
+                print(f"[改动审核] 会话 {session_id} 待审条目超过 "
+                      f"{self.MAX_PER_SESSION} 条上限，丢弃最老的待审改动 "
+                      f"{c.id}（{c.path}）—— 若这是你要的改动，请让 Agent 重新提交。",
+                      flush=True)
                 self._changes.pop(c.id, None)
                 drop -= 1
 
