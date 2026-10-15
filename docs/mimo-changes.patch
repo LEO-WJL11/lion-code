@@ -2135,7 +2135,7 @@ index d2c42d0..2205daa 100644
  
    return <DialogSelect title="Subagents" options={options()} />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
-index e7c9c35..32ef3fe 100644
+index e7c9c35..9544c1d 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 @@ -18,6 +18,9 @@ import { useProject } from "@tui/context/project"
@@ -2299,6 +2299,53 @@ index e7c9c35..32ef3fe 100644
      {
        title: t("tui.command.session.undo.title"),
        value: "session.undo",
+@@ -2328,6 +2215,46 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
+         <Match when={props.part.tool === "plan_exit"}>
+           <PlanExit {...toolprops} />
+         </Match>
++        {/* ── Lion Code 的 21 个工具名（上面全是上游 Claude Code 的名字 ✗✗✗，
++            我们的名字一个都不在 ⇒ 之前全落到 GenericTool 兜底、专用样式显示不出来）。
++            映射到形状最接近的上游组件；组件读不到的 metadata 字段会由它内部的
++            <Show when={…}> 自然降级（falsy 不渲染、不崩）✗ 而 input（我们已改成真实
++            参数）正好对上 pattern/path 这些键 ✓。没有对应组件的（line_count /
++            create_directory / system_info / timestamp / context_*）继续走 fallback。 */}
++        <Match when={props.part.tool === "execute_command"}>
++          <Bash {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "read_file" || props.part.tool === "head_tail_file"}>
++          <Read {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "glob_files" || props.part.tool === "directory_tree"}>
++          <Glob {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "search_in_files"}>
++          <Grep {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "write_file" || props.part.tool === "create_file"}>
++          <Write {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "modify_file" || props.part.tool === "append_file"
++                     || props.part.tool === "copy_file" || props.part.tool === "delete_file"}>
++          <Edit {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "download_file"}>
++          <WebFetch {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "web_search"}>
++          <WebSearch {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "ask_user"}>
++          <Question {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "skill_load"}>
++          <Skill {...toolprops} />
++        </Match>
++        <Match when={props.part.tool === "agent_spawn" || props.part.tool === "agent_team_run"}>
++          <Task {...toolprops} />
++        </Match>
+         <Match when={true}>
+           <GenericTool {...toolprops} />
+         </Match>
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/permission.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/permission.tsx
 index 5b610c6..b02276b 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/permission.tsx
