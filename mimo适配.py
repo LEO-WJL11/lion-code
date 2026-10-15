@@ -1352,7 +1352,13 @@ def _stream_backend(sid: str, text: str, mid: str, thinking: str = "HIGH",
                     with _LOCK:
                         part = {"id": new_time_id("prt_"), "sessionID": sid, "messageID": mid,
                                 "type": "tool", "callID": "call_" + _slug(12), "tool": tool,
-                                "state": {"status": "completed", "input": {}, "output": content,
+                                # input 必须是**模型传的真实参数** ✗✗ —— 原来恒为 {} ⇒
+                                # 前端工具组件读 input.pattern/input.path 全 undefined，
+                                # 专用组件渲染不出内容（只能落 GenericTool）✗✗✗。
+                                # arguments 由后端 TOOL_CALL 帧带上（AgentChunk.arguments）。
+                                "state": {"status": "completed",
+                                          "input": (f.get("arguments") or {}),
+                                          "output": content,
                                           "title": tool, "metadata": {},
                                           "time": {"start": _t, "end": _t}}}
                         # 【存进消息里】原来只广播不存 ✗ → 刷新/重开这个会话时工具调用整段消失 ✓
@@ -2098,6 +2104,18 @@ class Handler(BaseHTTPRequestHandler):
                                   "time": {"created": now_ms(), "updated": now_ms()}}
                 _MESSAGES.setdefault(sid, [])
         text = _extract_text(body)
+        # 【空文本先拒，别发给后端】后端 /api/chat/stream 对空 message 直接回
+        # "消息内容为空" ✗✗ —— 与其让它挡，不如在这里就给出**可读的原因**：
+        # · 有 parts 没文本 = 模型/用户发的是纯附件（附件内容目前不支持直发）
+        # · 连 parts 都没有 = 真空消息（调用方的 bug）
+        # 返回 400：SDK 只有非 2xx 才进 result.error（client.gen.ts:227），
+        # 前端据此弹错 —— 静默吞掉/发空消息都是"看着发成功其实被后端拒" ✗✗✗。
+        if not str(text or "").strip():
+            parts_in = body.get("parts")
+            has_parts = isinstance(parts_in, list) and len(parts_in) > 0
+            reason = ("消息里没有文本内容（目前不支持只发附件，请把要做的事写成文字）"
+                      if has_parts else "消息内容为空（调用方没有传 text/parts）")
+            return self._json({"success": False, "message": reason, "error": reason}, 400)
         # 【按 agent 切工作模式】MiMo 的 `Tab` / `/agents` 切的是它自己的 agent
         # （本地 store ✓），切完随消息发出来（SDK 字段 `agent` / `agentID` ✓）。
         # 我们后端只有工作模式（STANDARD / MINIMAL ✓），所以在这里把 agent 名
@@ -2112,6 +2130,11 @@ class Handler(BaseHTTPRequestHandler):
             # **从来不切** ✗。POST 是幂等的，直接设即可（一次本地调用，代价可忽略 ✓）。
             if _bid:
                 _req("/api/sessions/" + _bid + "/mode", {"mode": want_mode}, method="POST")
+            else:
+                # 【别静默跳过】原来是 `if _bid:` 直接过 —— sid 映射不到后端时**一声不吭**
+                # ✗✗✗ 用户切了 agent 却没生效、日志里也查不到原因（本项目的规矩：失败要出声）。
+                print(f"[会话] 切换工作模式失败：sid={sid} 映射不到后端会话，"
+                      f"本次 {want_mode} 未生效", flush=True)
         umid = new_message(sid, "user", text=text)
         if text:
             new_part_text(sid, umid, text, start=True, end=True)

@@ -2885,18 +2885,26 @@ class RuntimeApi:
         return {}
 
     def mode_payload(self) -> dict[str, Any]:
+        # deps 是**局部导入**（与本文件其它 handler 同款 —— 模块级没有它 ✗）
+        from lionbox.api import deps
         mode = str(self.cfg.get("providerMode", "custom"))
         custom = self._custom_provider()
         api_key = str(custom.get("apiKey") or "")
+        # 【响应回显必须掩码】本函数只被 GET/POST /api/runtime/mode 当**响应**用
+        # （L2966/L3004 两处），不参与任何真实请求 ⇒ 明文回显没有收益，只有泄露风险
+        # （实测这两个端点原文回显 `tp-cst…nuu` ✗✗✗）。口径与 `_masked()` 一致：
+        # 只在副本上掩码，**不动内存里的 apiKey**（那份还要真发请求，盖掉就再也调不通 ✗）。
+        # 消费方核对：适配层只读 customApi.model/`model`、前端 0 处读本端点 ⇒ 掩码不影响功能。
+        masked_key = deps.SecretMask.mask(api_key)
         local = self._local_base_url()
         status = self.runtime.status()
         return {
             "mode": mode,
             "baseUrl": local if mode == "local" else str(custom.get("baseUrl") or ""),
-            "apiKey": "" if mode == "local" else api_key,
+            "apiKey": "" if mode == "local" else masked_key,
             "customApi": {
                 "baseUrl": str(custom.get("baseUrl") or ""),
-                "apiKey": api_key,
+                "apiKey": masked_key,
                 "hasApiKey": bool(api_key.strip()),
                 "model": str(custom.get("model") or ""),
             },
@@ -12615,22 +12623,26 @@ class AgentChunk:
     DONE = "DONE"
     ERROR = "ERROR"
 
-    __slots__ = ("type", "content", "tool_name", "finished")
+    __slots__ = ("type", "content", "tool_name", "finished", "arguments")
 
     def __init__(self, chunk_type: str, content: str = "", tool_name: str | None = None,
-                 finished: bool = False) -> None:
+                 finished: bool = False, arguments: dict | None = None) -> None:
         self.type = chunk_type
         self.content = content
         self.tool_name = tool_name
         self.finished = finished
+        # 【为什么要带 arguments】适配层把 TOOL_CALL 帧翻译成前端的 ToolPart.state.input
+        # —— 不带它 state.input 只能是 {} ✗✗✗ ⇒ 前端的工具组件（读 input.pattern 之类）
+        # 全渲染成空、专用组件没东西可显 ✗✗✗。只在 TOOL_CALL 帧带，其余类型保持 None。
+        self.arguments = arguments
 
     @staticmethod
     def text(content: str) -> "AgentChunk":
         return AgentChunk(AgentChunk.TEXT, content, None, False)
 
     @staticmethod
-    def tool_call(tool_name: str, message: str) -> "AgentChunk":
-        return AgentChunk(AgentChunk.TOOL_CALL, message, tool_name, False)
+    def tool_call(tool_name: str, message: str, arguments: dict | None = None) -> "AgentChunk":
+        return AgentChunk(AgentChunk.TOOL_CALL, message, tool_name, False, arguments)
 
     @staticmethod
     def done(full_content: str) -> "AgentChunk":
@@ -12642,7 +12654,7 @@ class AgentChunk:
 
     def to_dict(self) -> dict[str, Any]:
         return {"type": self.type, "content": self.content, "toolName": self.tool_name,
-                "finished": self.finished}
+                "finished": self.finished, "arguments": self.arguments}
 
     def __repr__(self) -> str:
         return f"AgentChunk({self.type}, {self.content[:30]!r}, tool={self.tool_name!r})"
@@ -14067,7 +14079,8 @@ class AgentLoop:
                     outcome = self.execute_tool(session_id, tool_call, mode)
                     self.tool_guard.after_call(session_id, tool_call.name, outcome.success)
                     executed += 1
-                    yield AgentChunk.tool_call(tool_call.name, "执行完成")
+                    yield AgentChunk.tool_call(tool_call.name, "执行完成",
+                                                tool_call.arguments or {})
 
             messages = self.build_messages(session_id, mode, user_message)
             round_no += 1
@@ -15298,14 +15311,25 @@ def _num_to_str(v: Any) -> str:
 
 
 def _parse_json_object(raw: str | None) -> dict[str, Any]:
-    """把一段字符串当 JSON 对象读（读不出来当没参数，与 Java 的 catch-空 Map 一致）。"""
+    """把一段字符串当 JSON 对象读（读不出来当没参数，与 Java 的 catch-空 Map 一致）。
+
+    【但失败必须出声】返回 `{}` 的语义不能改（与 Java 对齐 ✓），可**静默**是问题：
+    模型的参数会全部无声丢失 ⇒ 工具报"缺少 path" ⇒ 模型反复试却**查不到根因** ✗✗✗
+    （本项目的规矩：失败要在日志里留下痕迹）。所以解析失败时打一行原文前 120 字。
+    """
     if raw is None or not str(raw).strip():
         return {}
     try:
         parsed = json.loads(raw)
-    except ValueError:
+    except ValueError as e:
+        print(f"[解析] 工具参数不是合法 JSON，按空参数处理（{e}）: "
+              f"{str(raw)[:120]!r}", flush=True)
         return {}
-    return parsed if isinstance(parsed, dict) else {}
+    if not isinstance(parsed, dict):
+        print(f"[解析] 工具参数是 {type(parsed).__name__} 而非 JSON 对象，按空参数处理: "
+              f"{str(raw)[:120]!r}", flush=True)
+        return {}
+    return parsed
 
 
 def _info_get(info: Any, *names: str) -> Any:
@@ -21978,6 +22002,9 @@ def _chunk_json(chunk: Any) -> dict[str, Any]:
         "content": chunk.get("content"),
         "toolName": chunk.get("toolName"),
         "finished": chunk.get("finished"),
+        # 【帧里必须带 arguments】适配层据此填 ToolPart.state.input（空 input ⇒
+        # 前端工具组件读 input.pattern/… 全 undefined，专用组件渲染不出内容 ✗✗✗）
+        "arguments": chunk.get("arguments"),
     }
 
 
