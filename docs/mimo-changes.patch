@@ -2135,7 +2135,7 @@ index d2c42d0..2205daa 100644
  
    return <DialogSelect title="Subagents" options={options()} />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
-index e7c9c35..9544c1d 100644
+index e7c9c35..83cceb0 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 @@ -18,6 +18,9 @@ import { useProject } from "@tui/context/project"
@@ -2148,7 +2148,41 @@ index e7c9c35..9544c1d 100644
  import { Spinner } from "@tui/component/spinner"
  import { selectedForeground, useTheme } from "@tui/context/theme"
  import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA, MouseEvent } from "@opentui/core"
-@@ -364,11 +367,15 @@ export function Session() {
+@@ -68,6 +71,8 @@ import { DialogMessage } from "./dialog-message"
+ import type { PromptInfo } from "../../component/prompt/history"
+ import { DialogConfirm } from "@tui/ui/dialog-confirm"
+ import { DialogAlert } from "@tui/ui/dialog-alert"
++import { Log } from "@/util"
++import { errorData } from "@/util/error"
+ import { DialogPrompt } from "@tui/ui/dialog-prompt"
+ import { DialogTimeline } from "./dialog-timeline"
+ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
+@@ -255,8 +260,22 @@ export function Session() {
+ 
+   createEffect(async () => {
+     const previousWorkspace = project.workspace.current()
+-    const result = await sdk.client.session.get({ sessionID: route.sessionID }, { throwOnError: true })
+-    if (!result.data) {
++    // 【404 不能炸掉整个 effect】`throwOnError: true` 会让 HTTP 404 变成 **rejection**
++    // ⇒ 下面那个 `if (!result.data)` 守卫根本执行不到 ⇒ effect 静默死在第一个 await
++    // ⇒ 既不 toast 也不 navigate home ⇒ `session()` 永远 undefined ⇒ sidebar 与正文
++    // 的最外层 `<Show when={session()}>` 全部不渲染 ⇒ **黑屏**（本机 2026-10-17 实测：
++    // 会话被删/换了后端后，TUI 用旧 --session 恢复路由就踩到这条 ✗✗✗）。所以这里必须
++    // 把 rejection 也接到"未找到"分支。
++    const result = await sdk.client.session
++      .get({ sessionID: route.sessionID }, { throwOnError: true })
++      .catch((error) => {
++        Log.Default.error("session get failed", {
++          sessionID: route.sessionID,
++          error: errorData(error),
++        })
++        return undefined
++      })
++    if (!result?.data) {
+       toast.show({
+         message: `Session not found: ${route.sessionID}`,
+         variant: "error",
+@@ -364,11 +383,15 @@ export function Session() {
      const title = Locale.truncate(session()?.title ?? "", 50)
      const pad = (text: string) => text.padEnd(10, " ")
      const weak = (text: string) => UI.Style.TEXT_DIM + pad(text) + UI.Style.TEXT_NORMAL
@@ -2165,7 +2199,7 @@ index e7c9c35..9544c1d 100644
          `  ${weak("Session")}${UI.Style.TEXT_NORMAL_BOLD}${title}${UI.Style.TEXT_NORMAL}`,
          `  ${weak("Continue")}${UI.Style.TEXT_NORMAL_BOLD}mimo -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
          ``,
-@@ -561,46 +568,6 @@ export function Session() {
+@@ -561,46 +584,6 @@ export function Session() {
          dialog.clear()
        },
      },
@@ -2212,7 +2246,7 @@ index e7c9c35..9544c1d 100644
      {
        title: t("tui.command.session.rename.title"),
        value: "session.rename",
-@@ -686,86 +653,6 @@ export function Session() {
+@@ -686,86 +669,6 @@ export function Session() {
          dialog.clear()
        },
      },
@@ -2299,7 +2333,7 @@ index e7c9c35..9544c1d 100644
      {
        title: t("tui.command.session.undo.title"),
        value: "session.undo",
-@@ -2328,6 +2215,46 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
+@@ -2328,6 +2231,46 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
          <Match when={props.part.tool === "plan_exit"}>
            <PlanExit {...toolprops} />
          </Match>
@@ -2374,17 +2408,17 @@ index 5b610c6..b02276b 100644
        </box>
        <box
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/sidebar.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/sidebar.tsx
-index cd532d8..6282d58 100644
+index cd532d8..8071ebb 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/sidebar.tsx
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/sidebar.tsx
-@@ -1,18 +1,35 @@
+@@ -1,18 +1,36 @@
  import { useProject } from "@tui/context/project"
 +import { useRoute } from "@tui/context/route"
 +import { useSDK } from "@tui/context/sdk"
  import { useSync } from "@tui/context/sync"
 -import { createMemo, Show } from "solid-js"
 -import { useTerminalDimensions } from "@opentui/solid"
-+import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
++import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 +import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
  import { useTheme } from "../../context/theme"
 +import { useToast } from "../../ui/toast"
@@ -2392,6 +2426,7 @@ index cd532d8..6282d58 100644
  import { InstallationChannel, InstallationVersion } from "@/installation/version"
  import { TuiPluginRuntime } from "../../plugin"
 +import { Locale } from "@/util"
++import { appendFileSync } from "node:fs"
  
  import { getScrollAcceleration } from "../../util/scroll"
  
@@ -2415,7 +2450,7 @@ index cd532d8..6282d58 100644
    const sync = useSync()
    const { theme } = useTheme()
    const tuiConfig = useTuiConfig()
-@@ -32,6 +49,77 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
+@@ -32,6 +50,99 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
    }
    const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
  
@@ -2446,6 +2481,28 @@ index cd532d8..6282d58 100644
 +      .slice(0, MAX_SESSION_ROWS)
 +  })
 +  const toast = useToast()
++
++  // 【临时诊断（查完删）】左边"会话"栏看不见时，靠这行区分三件事：
++  //   fetched=0  → session.list 没拉到（网络/解析/被丢）
++  //   fetched 有但 rows=0 → 过滤把全滤掉了（parentID/time 的形状问题）
++  //   rows>0 但用户仍看不见 → 渲染条件/外层 <Show when={session()}> 的问题
++  // 【补：工作区切换不生效】workspace()=store 里的当前工作区（用户选的）、
++  // ws-of-session=本会话所属工作区（workspaceLabel 就读它）、name=解析出的显示名。
++  // 三者对不上时就能看出是"set 没生效"还是"会话没跟着切"。
++  createEffect(() => {
++    try {
++      appendFileSync("C:/Users/Leo/Desktop/lion-code/.lbcheck/sidebar-diag.log",
++        `${new Date().toISOString()} fetched=${(fetched() ?? []).length} `
++        + `sync=${sync.data.session.length} rows=${sessions().length} `
++        + `session()=${session() ? session()!.id.slice(0, 12) : "undefined"} `
++        + `route=${route.data.type} `
++        + `workspace()=${project.workspace.current() ?? "undefined"} `
++        + `ws-of-session=${session()?.workspaceID ?? "none"} `
++        + `name=${workspaceLabel()}\n`)
++    } catch {
++      // 诊断用，失败无所谓
++    }
++  })
 +
 +  // 【点选 + Delete 删除】两段式：第一次按 Delete 只登记待删项，再按一次才真删 ——
 +  // 与 MiMo 自带删除（`/sessions` 里 Ctrl+D 按两次）保持同一套手感，免得侧栏误触。
@@ -2493,7 +2550,7 @@ index cd532d8..6282d58 100644
    return (
      <Show when={session()}>
        <box
-@@ -80,17 +168,59 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
+@@ -80,17 +191,59 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                  </Show>
                </box>
              </TuiPluginRuntime.Slot>
@@ -2558,7 +2615,7 @@ index cd532d8..6282d58 100644
                <span>{InstallationVersion}</span>
              </text>
            </TuiPluginRuntime.Slot>
-@@ -98,4 +228,4 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
+@@ -98,4 +251,4 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
        </box>
      </Show>
    )
