@@ -1175,7 +1175,10 @@ async function create(){const msg=$('msg');msg.textContent='创建中…';
   memoryMb:+$('mem').value,diskGb:+$('disk').value,
   aiApi:$('apisel').value==='custom'?{baseUrl:$('baseUrl').value,apiKey:$('apiKey').value,model:$('model').value}:{}};
  try{const d=await j('/api/platform/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  msg.textContent='已创建 '+d.id+' ，Agent 开始干活…';$('prompt').value='';refresh()}
+  msg.textContent='已创建，正在进入 Agent 对话页…';$('prompt').value='';refresh();
+  // 【创建即进入对话页】原来只刷列表、要手动点"详情" ✗✗✗ —— 创建后直接打开
+  // 该项目的详情/对话面板（构建日志 + 与 AI 对话都在那里，边建边看）。
+  detail(d.id)}
  catch(e){msg.innerHTML='<span class="err">'+esc(e.message)+'</span>'}}
 async function refresh(){try{const d=await j('/api/platform/projects');$('list').innerHTML=d.items.map(p=>card(p,d.busy)).join('')||'<div class="muted">还没有项目</div>'}catch(e){}}
 function card(p,busy){const b=busy.includes(p.id)||['building','testing','deploying'].includes(p.status);
@@ -1209,9 +1212,12 @@ async function detail(id){SEL=id;const p=await j('/api/platform/projects/'+id);
  </div>
  <div class="card"><b>构建/部署日志</b><pre id="dlog">${esc(p.log||'（暂无）')}</pre></div>
  <div class="card"><b>继续跟 AI 说话</b>（改功能 / 修 bug，都在同一会话）
- <div id="msgs" class="muted">发送记录见日志</div>
- <textarea id="chatin" placeholder="例：把标题改成「我的账本」并自测一遍"></textarea>
- <div style="margin-top:8px"><button id="chatsend" onclick="send()">发送</button><span class="muted" id="chatmsg"></span></div></div>`;}
+ <div id="msgs" class="muted">${p.busy?'⏳ Agent 正在构建/部署中 —— 完成后这里就能对话（本面板每 5 秒自动刷新）':'发送记录见日志'}</div>
+ <textarea id="chatin" ${p.busy?'disabled':''} placeholder="${p.busy?'构建中…请稍候':'例：把标题改成「我的账本」并自测一遍'}"></textarea>
+ <div style="margin-top:8px"><button id="chatsend" onclick="send()" ${p.busy?'disabled':''}>发送</button><span class="muted" id="chatmsg"></span></div></div>`;}
+ // 构建期间自动刷新本面板：忙 ⇒ 5 秒后重取（聊天框从禁用变可用就是靠它）；
+ // 闲 ⇒ 不再重取（避免把用户已输入但没发的文字清掉）。
+ if(p.busy) setTimeout(()=>{if(SEL===p.id) detail(p.id)},5000)}
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function send(){const id=SEL,msg=$('chatin').value.trim();if(!msg)return;
  $('chatsend').disabled=true;$('chatmsg').textContent='AI 思考中…（改动+自测需要时间）';
