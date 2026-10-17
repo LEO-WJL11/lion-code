@@ -645,10 +645,10 @@ index db1905c..f11c210 100644
      />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx
 new file mode 100644
-index 0000000..94c6904
+index 0000000..d3e0c87
 --- /dev/null
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/component/dialog-workspace-list.tsx
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,155 @@
 +import { DialogSelect } from "@tui/ui/dialog-select"
 +import { useDialog } from "@tui/ui/dialog"
 +import { useSDK } from "@tui/context/sdk"
@@ -696,6 +696,13 @@ index 0000000..94c6904
 +          // 同上：新建完要**切过去** ✗ —— 不 set current 的话
 +          // 界面仍显示上一个工作区（与选择分支是同一个坑）。
 +          project.workspace.set(workspaceID)
++          // 【切工作区必须重拉 /path，否则"工作目录"不变】sidebar-cwd 显示的是
++          // `instance.path.directory`，它唯一的刷新来源是 project.sync() 里的
++          // `sdk.client.path.get({ workspace })`（project.tsx:40）。原来这里只
++          // workspace.sync()（拉列表）+ set + open ⇒ /path 从不重拉 ⇒ instance.path
++          // 停在启动目录 ✗✗✗（用户实测"选了工作区这行字不变"）。set 之后才有新 current，
++          // 所以必须放在 set 后面；不 catch 会把切换整个吞掉。
++          await project.sync().catch(() => undefined)
 +          await open(workspaceID)
 +        }}
 +      />
@@ -768,6 +775,10 @@ index 0000000..94c6904
 +              // 全仓此前**没有任何地方调过 `workspace.set`** ⇒ current 恒为初值 ⇒
 +              // 用户切完工作区"显示不变"。先 set 再开，后续 sync/sessions 才落在新工作区。
 +              project.workspace.set(workspace.id)
++              // 【切工作区必须重拉 /path，否则"工作目录"不变】见 createWorkspace 分支注释：
++              // sidebar-cwd 显示 instance.path.directory，唯一刷新源是 project.sync() 的
++              // `path.get({ workspace })`。不重拉就停在启动目录 ✗✗✗。set 之后才有新 current。
++              void project.sync().catch(() => undefined)
 +              void open(workspace.id)
 +            },
 +          },
