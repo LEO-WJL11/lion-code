@@ -1580,7 +1580,12 @@ class Router:
         self._dynamic: list[tuple[str, re.Pattern[str], Callable[[Request], Any]]] = []
 
     def add(self, method: str, pattern: str, handler: Callable[[Request], Any]) -> None:
-        regex = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", r"(?P<\1>[^/]+)", pattern)
+        # 【两种占位符】`{name}` 匹配单段（不含 /）；`{name*}` 匹配**剩余全部段**（含 /，
+        # 非空）。后者给"静态站代理"这类路径用（/serve/<id>/assets/app.js 要整段透传），
+        # 不能写成单段否则所有带子路径的资源都 404。先替换 * 形式再替换单段形式，
+        # 顺序反了会把 `*` 当成模式里的普通字符。
+        regex = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\*\}", r"(?P<\1>.+)", pattern)
+        regex = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", r"(?P<\1>[^/]+)", regex)
         entry = (method.upper(), re.compile("^" + regex + "$"), handler)
         self._routes.append(entry)
         (self._dynamic if entry[1].groups else self._static).append(entry)
@@ -3208,6 +3213,7 @@ MODULES: tuple[str, ...] = (
     "runtime_extra",    # RuntimeController 的未覆盖部分
     "chat",             # ChatController           /api/chat
     "agent_control",    # AgentControlController   /api/chat/control
+    "platform",         # LionForge（狮铸）项目 AI 开发平台  /platform + /api/platform/* + /serve + /dl
 )
 
 
@@ -25962,6 +25968,19 @@ class Wiring:
 
 
 # 接口模块登记表（内联后替代动态导入；顺序与 MODULES 一致）
+def register__api_platform(router: Any, ctx: ApiContext) -> None:
+    """LionForge（狮铸）项目 AI 开发平台 —— 平台逻辑在 `平台.py`。
+
+    【为什么要从这里传类】`平台.py` 是独立模块（不在本文件里），拿不到本文件的
+    `Response`；而 handler 的返回类型必须是它（HttpApp 只认 Response）。所以由
+    这里把 Response 类**递进去**，平台模块只依赖 router/ctx/Response 三样。
+    延迟 import 放在函数里：模块别名（lionbox.api.deps）在本文件加载早期才注册完，
+    顶层 import 会踩到加载顺序。
+    """
+    import 平台 as platform_mod                           # noqa: PLC0415
+    platform_mod.register(router, ctx, Response)
+
+
 _API_REGISTER = {
     "workspaces": register,
     "sessions": register__api_sessions,
@@ -25981,6 +26000,7 @@ _API_REGISTER = {
     "runtime_extra": register__api_runtime_extra,
     "chat": register__api_chat,
     "agent_control": register__api_agent_control,
+    "platform": register__api_platform,
 }
 
 
