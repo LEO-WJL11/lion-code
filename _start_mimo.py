@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-r"""一键启动：Lion Code 后端 + MiMo 兼容接口层 + MiMo 原版前端。
+r"""一键启动：Lion Code 后端 + MiMo 兼容接口层 + 自带终端界面（tui/）。
 
 三段式（顺序不能反）：
 
     ① main.py --backend-only        我们的 Python 后端（能力都在这）
-    ② mimo适配.py                   把 MiMo 的 139 个端点形状翻译到 ①
-    ③ MiMo 前端 attach 到 ②         MiMo 的 TUI 一行不改，直接挂上去
+    ② mimo适配.py                   MiMo 形状的兼容接口层（保留备用，界面不再依赖它）
+    ③ tui/                          自带终端界面（OpenTUI + SolidJS）→ 直连 ① 的 HTTP
 
-【为什么用 attach】MiMo 的 TUI 只是个客户端（`packages/cli/src/cli/cmd/tui/`），
-它的 `attach <url>` 子命令专门用来挂到任意服务端上 —— 这就是"改接口"的入口。
-不 attach 的话它会自己去起它自己那套服务端，那就是 MiMo 的后端，不是我们的。
+【为什么不再 attach MiMo】MiMo 前端与它的补丁机制已整体移除；界面换成仓库自带的 `tui/`
+（同一渲染栈，但只做界面、直连后端，不经 8791 适配层）。
 
 【看门狗】① ② 死掉会自动拉起 —— 这条是踩出来的：用户有一次盯着界面等了 10 分钟
 "它啥也没干"，查下来是**后端与适配层的 python 进程一个都不在了**，界面还在、
@@ -28,7 +27,6 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 PY = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
 if not os.path.isfile(PY):
     PY = sys.executable
-MIMO_CLI = os.path.join(ROOT, "MiMo-Code-main", "packages", "cli")
 
 def _env_port(name: str, default: int) -> int:
     """读环境变量里的端口；**非法值显式告警并回退默认值**，绝不让 import 崩。
@@ -355,88 +353,58 @@ def main() -> int:
         if _cand and os.path.isfile(_cand):
             bun = _cand
             break
-    print("[3/3] 拉起 MiMo 原版前端（attach 到适配层）…", flush=True)
-    # 适配层启动时会预建一个会话并把 id 写在这里。带上 --session 就跳过 MiMo
-    # 那两步"选工作区 / 选会话"的选择界面，直接进聊天。
-    extra: list[str] = []
-    try:
-        p = os.path.join(_LOGDIR, "mimo_session.txt")
-        with open(p, encoding="utf-8") as f:
-            sid = f.read().strip()
-        if sid:
-            extra = ["--session", sid]
-            print(f"      直接进入预建会话 {sid}", flush=True)
-    except Exception:                                     # noqa: BLE001
-        pass
-    print(f"      {bun} run --conditions=browser ./src/index.ts "
-          f"attach http://127.0.0.1:{ADAPTER_PORT} {' '.join(extra)}", flush=True)
-    # 【只重定向 stderr】TUI 必须拿到真终端（stdout 不能动），但它的报错走
-    # console.error = stderr，而 TUI 会把屏幕糊掉、错误看不见。
-    # 插件加载失败就是这样被吞掉的：runtime 的 fail() 只 console.error 不抛异常，
-    # 表现成"侧栏插件一个都不渲染"，却查不到任何原因。落到文件里就能看了。
-    # （打开这个文件的动作放在下面的 try 里 ✗ —— 放在外面抛了就没人收尾，见 audit2。）
-    # 【必须搬 home】MiMo 默认把状态放在 `~/.local/share/mimocode`（xdgData）等
-    # 四处，SQLite 库 `mimocode.db` 就在那儿。那个位置在沙箱里**不可写**：
-    #   PRAGMA wal_checkpoint(PASSIVE) → "attempt to write a readonly database"
-    #   → db.ts:97 抛错 → 插件运行时 load() 失败 → 所有内置侧栏插件从未激活
-    #     （runtime 的 fail() 只 console.error，TUI 占屏所以完全看不见）
-    # 注意 DACL 本身没问题（用户是 (OI)(CI)(F)、无 Deny）——是进程令牌被限制在
-    # 工作区内，所以正确解法是把状态搬进能写的地方，而不是去改权限。
-    # MIMOCODE_HOME 是官方开关（flag.ts:458 / shared/global.ts:26）：设了就把它
-    # 当 home，data/cache/config/state 四个目录都落在它下面。
-    mimo_home = os.path.join(_LOGDIR, "mimo-home")
-    # 【临时目录也得搬】SQLite 建 FTS5 虚拟表、跑迁移 DDL、checkpoint 都要写临时
-    # 文件，默认落在 %TEMP%（工作区外 → 沙箱里不可写），报的是
-    #   SQLiteError: unable to open database file
-    # 这个错误藏在 DrizzleError 的 `cause` 里（前端日志只显示外层 ✗），
-    # 最初那条 `wal_checkpoint(PASSIVE)` 报 readonly 也是同一个原因。
-    # ⚠ `os.makedirs` 统一放到下面的 try 里 —— 放在外面抛了就没人收尾（audit2 ✗）。
-    tmp = os.path.join(logdir, "tmp")
-    env = dict(os.environ)
-    env["MIMOCODE_HOME"] = mimo_home
-    for k in ("TMP", "TEMP", "TMPDIR", "SQLITE_TMPDIR"):
-        env[k] = tmp
-    # 【这三步都可能抛，抛了就没人收尾】wd.start() 之后没有 try/finally ✗ ——
-    # 一旦中途抛异常（bun/MiMo CLI 不存在、mimo-home 建不出来、frontend.log 打不开），
-    # backend/adapter 就**无人 terminate** ✗，下一次启动必然"端口被占"。
-    # 所以每一处都接住并让 rc≠0，落到下面统一的收尾流程 ✓。
+    print(f"[3/3] 拉起 Lion Code 终端界面（tui/ → 后端 :{BACKEND_PORT}）…", flush=True)
+    # 【为什么不再 attach MiMo】MiMo 前端与它的补丁机制已整体移除；界面换成仓库自带的
+    # `tui/`（OpenTUI + SolidJS，同一渲染栈，但**只做界面**、直连后端 HTTP —— 不再需要
+    # 8791 适配层参与这条链）。启动约定沿用 main.py 的 `_ink_frontend_cmd`：
+    #   cwd 必须切到 tui/（Bun 按 cwd 找 bunfig.toml 的 preload，否则 JSX runtime 报错）
+    #   --conditions=browser 少它会在依赖解析上翻车
+    #   --port <后端端口>（tui/src/index.tsx: PORT = Number(arg("port","8080"))）
+    tui_app = os.path.join(ROOT, "tui", "src", "index.tsx")
     rc = 1
-    try:
-        os.makedirs(mimo_home, exist_ok=True)
-        os.makedirs(tmp, exist_ok=True)
-        frontend_log = open(os.path.join(logdir, "frontend.log"), "a",
-                            encoding="utf-8", errors="replace")
-        # 【成功必须把 rc 翻回 0】初始 `rc = 1` 只是"还没做成"的默认值 ✗
-        # —— 我第一版漏了这句，下面 `if … and rc == 0` 于是**恒假**，
-        # **bun 根本没被启动过**，却照样打印"前端已退出（1）"，
-        # watchdog 日志表现为"已启动 → 同一秒停止"（与实测完全吻合）。
-        # 教训（本会话反复强调过、这次栽在自己身上）：**改启动路径必须真跑一次** ✗
-        # —— py_compile + 单元断言发现不了"条件恒假导致整段没执行"这类错 ✓
-        rc = 0
-    except OSError as e:
-        print(f"✗ 建 MiMo home / 临时目录 / 前端日志失败: {type(e).__name__}: {e}", flush=True)
-        frontend_log = None
-        rc = 1
-    print(f"      MiMo home → {mimo_home}", flush=True)
-    print(f"      临时目录  → {tmp}", flush=True)
-
-    if frontend_log is not None and rc == 0:
+    frontend_log = None
+    if not os.path.isfile(tui_app):
+        bar = "=" * 62
+        print(bar, flush=True)
+        print("✗ 找不到界面入口: " + tui_app, flush=True)
+        print("  安装包没带 tui/ 前端源码（打包 staging 漏了）", flush=True)
+        print(bar, flush=True)
+        rc = 127
+    else:
+        print(f"      {bun} run --conditions=browser src/index.tsx --port {BACKEND_PORT}", flush=True)
+        # 【只重定向 stderr】TUI 必须拿到真终端（stdout 不能动），但它的报错走
+        # console.error = stderr，而 TUI 占屏后错误看不见 ⇒ 落到文件里才能查。
+        # 【三步都可能抛，抛了也要走下面的统一收尾】—— wd.start() 之后没有 try/finally，
+        # 中途抛异常会让 backend/adapter 无人 terminate（下次启动"端口被占"）。
         try:
-            rc = subprocess.call(
-                [bun, "run", "--conditions=browser", "./src/index.ts",
-                 "attach", f"http://127.0.0.1:{ADAPTER_PORT}", "--dir",
-                 os.getcwd(), *extra],
-                cwd=MIMO_CLI, stderr=frontend_log, env=env)
-        except FileNotFoundError as e:
-            # bun 没装 / MiMo 前端目录缺失 —— 这是打包后最常见的失败 ✗
-            print(f"✗ 找不到可执行文件: {getattr(e, 'filename', e)}", flush=True)
-            print("  · bun 缺失 → npm install -g bun（或把 bun.exe 放进安装目录）", flush=True)
-            print("  · 报的是 src/index.ts → 安装包没带 MiMo 前端源码", flush=True)
-            rc = 127
-        except Exception as e:                             # noqa: BLE001
-            print(f"✗ 前端启动失败: {type(e).__name__}: {e}", flush=True)
-            rc = 1
-    print(f"前端已退出（{rc}），收尾。", flush=True)
+            os.makedirs(_LOGDIR, exist_ok=True)
+            tmp = os.path.join(logdir, "tmp")
+            os.makedirs(tmp, exist_ok=True)
+            frontend_log = open(os.path.join(logdir, "frontend.log"), "a",
+                                encoding="utf-8", errors="replace")
+            env = dict(os.environ)
+            for k in ("TMP", "TEMP", "TMPDIR", "SQLITE_TMPDIR"):
+                env[k] = tmp
+            rc = 0
+        except OSError as e:
+            print(f"✗ 建临时目录 / 前端日志失败: {type(e).__name__}: {e}", flush=True)
+        if frontend_log is not None and rc == 0:
+            try:
+                # cwd 必须是 tui/：Bun 按 cwd 找 bunfig.toml 的 preload（JSX runtime）
+                rc = subprocess.call(
+                    [bun, "run", "--conditions=browser", "src/index.tsx",
+                     "--port", str(BACKEND_PORT)],
+                    cwd=os.path.join(ROOT, "tui"),
+                    stderr=frontend_log, env=env)
+            except FileNotFoundError as e:
+                print(f"✗ 找不到可执行文件: {getattr(e, 'filename', e)}", flush=True)
+                print("  · bun 缺失 → npm install -g bun（或把 bun.exe 放进安装目录）", flush=True)
+                print("  · 报的是 src/index.tsx → 安装包没带 tui/ 源码", flush=True)
+                rc = 127
+            except Exception as e:                             # noqa: BLE001
+                print(f"✗ 界面启动失败: {type(e).__name__}: {e}", flush=True)
+                rc = 1
+    print(f"界面已退出（{rc}），收尾。", flush=True)
     # 【崩溃必须出声】TUI 崩掉时控制台会停在**崩溃前最后一帧**（用户看到的就是一块
     # 冻结的黑屏 ✗✗）—— 而收尾一跑，后端/适配层也一起没了，看起来像"整套死掉"。
     # opentui.dll 段错误是上游 bug（本机 17 份报告），治不了 ✗；但"静默"是我们的锅 ✓。
@@ -456,7 +424,7 @@ def main() -> int:
     wd.join(timeout=20)
     if wd.is_alive():
         log("「看门狗」线程 20 秒后仍未退出（可能卡在健康检查），已放弃等待")
-    # 【必须复位控制台】MiMo 的 TUI 会打开鼠标上报/备用屏等模式，退出时**不还原**。
+    # 【必须复位控制台】OpenTUI 的界面会打开鼠标上报/备用屏等模式，退出时**不还原**。
     # 不还原的话，之后这个窗口会把鼠标事件当普通文字打出来，满屏
     # `^[[<35;96;43M` 这种（实测就是这么被看到的）。
     # 关鼠标上报(1000/1002/1003/1006) + 退备用屏(1049) + 显示光标(25)

@@ -592,12 +592,18 @@ def walk_files(root: Path, max_depth: int = 10) -> list[Path]:
     """等价于 Java 的 `Files.walk(root, maxDepth).filter(Files::isRegularFile)`。
 
     返回的是**普通文件**，顺序按目录逐层展开（先父目录的内容，再子目录），
-    不跟符号链接目录，碰到读不了的目录直接跳过。
+    跟随符号链接/junction（node_modules 靠 junction 组织，关掉会漏内容），
+    但**用 realpath 的 seen 集合防循环** —— 否则自指 junction 会把
+    `WALK_UNLIMITED_DEPTH`(1_000_000) 层走满才停，表现为命令挂死 ✗✗✗。
+    读不了的目录直接跳过。
     """
     out: list[Path] = []
     root = Path(root)
     # (目录, 剩余深度)；剩余深度 0 表示"这个目录本身不再展开"
     stack: list[tuple[Path, int]] = [(root, max_depth)]
+    # 【循环检测】按**解析后的真实路径**记（大小写不敏感 + 规范化）：
+    # junction 循环 a→b→a 每次看 entry.path 都是新字符串，必须认真身。
+    seen: set[str] = {os.path.normcase(os.path.realpath(str(root)))}
     while stack:
         current, depth = stack.pop()
         try:
@@ -610,6 +616,10 @@ def walk_files(root: Path, max_depth: int = 10) -> list[Path]:
                 if entry.is_file(follow_symlinks=True):
                     out.append(Path(entry.path))
                 elif entry.is_dir(follow_symlinks=True) and depth > 1:
+                    key = os.path.normcase(os.path.realpath(entry.path))
+                    if key in seen:
+                        continue                      # 转回自己/已走过 ⇒ 不再入栈
+                    seen.add(key)
                     subdirs.append(Path(entry.path))
             except OSError:
                 continue
@@ -631,6 +641,8 @@ def walk_entries(root: Path, max_depth: int) -> list[tuple[Path, str]]:
     if depth == 0:
         return out
     stack: list[tuple[Path, int, str]] = [(root, depth, "")]
+    # 【循环检测】与 walk_files 同款：按 realpath 认真身，junction 循环时不再入栈
+    seen: set[str] = {os.path.normcase(os.path.realpath(str(root)))}
     while stack:
         current, remaining, rel = stack.pop()
         try:
@@ -643,6 +655,10 @@ def walk_entries(root: Path, max_depth: int) -> list[tuple[Path, str]]:
             out.append((Path(entry.path), child_rel))
             try:
                 if entry.is_dir(follow_symlinks=True) and remaining > 1:
+                    key = os.path.normcase(os.path.realpath(entry.path))
+                    if key in seen:
+                        continue                      # 循环链接：不再入栈
+                    seen.add(key)
                     subdirs.append((Path(entry.path), remaining - 1, child_rel))
             except OSError:
                 continue

@@ -103,34 +103,17 @@ Source: "..\.lbcheck\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; "stuck". Never write a number here that was not measured.
 ; NOTE the doubled quotes: Inno's own docs use Parameters: "/C ""{app}\x.cmd"""
 ; - a single quote pair gave "Mismatched or misplaced quotes" at compile time.
-Filename: "{cmd}"; Parameters: "/C ""{app}\install_deps.cmd"" extract"; Flags: runhidden waituntilterminated; StatusMsg: "Extracting MiMo TUI dependencies (offline; typically 3-4 minutes, depends on disk speed and antivirus scanning)..."
-Filename: "{cmd}"; Parameters: "/C ""{app}\install_deps.cmd"" relink"; Flags: runhidden waituntilterminated; StatusMsg: "Rebuilding directory links (typically a few seconds)..."
-
-[UninstallRun]
-; ---------------------------------------------------------------------------
-; The node_modules trees must go BEFORE Inno starts deleting the [Files] tree.
-; Why: MiMo's workspace packages each have their own node_modules full of
-; JUNCTIONS; Inno's recursive delete walks into them and then fails with
-; error 145 (directory not empty) - measured 976 "Failed to delete directory"
-; lines and 1014 leftover items when they were only listed under
-; [UninstallDelete] (which runs AFTER the [Files] pass). cmd's `rmdir /s /q`
-; removes a junction as a reparse point without following it, so it clears the
-; tree in one go; the [UninstallDelete] entries stay as a fallback.
-; ---------------------------------------------------------------------------
-Filename: "{cmd}"; Parameters: "/C rmdir /s /q ""{app}\MiMo-Code-main\node_modules"""; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/C rmdir /s /q ""{app}\MiMo-Code-main\packages\cli\node_modules"""; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/C rmdir /s /q ""{app}\MiMo-Code-main\packages\plugin\node_modules"""; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/C rmdir /s /q ""{app}\MiMo-Code-main\packages\sdk\node_modules"""; Flags: runhidden waituntilterminated
-Filename: "{cmd}"; Parameters: "/C rmdir /s /q ""{app}\MiMo-Code-main\packages\shared\node_modules"""; Flags: runhidden waituntilterminated
+; tui/node_modules ships PLAIN (0 junctions) - no extract phase, no relink.
+; The MiMo-era [Run] extract+relink steps were removed with the MiMo frontend.
 
 [Icons]
-Name: "{autoprograms}\Lion Code"; Filename: "{app}\StartLionCode.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\LionCode.exe"; Comment: "Start Lion Code (backend + adapter + MiMo TUI)"
-Name: "{autodesktop}\Lion Code"; Filename: "{app}\StartLionCode.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\LionCode.exe"; Comment: "Start Lion Code (backend + adapter + MiMo TUI)"; Tasks: desktopicon
+Name: "{autoprograms}\Lion Code"; Filename: "{app}\StartLionCode.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\LionCode.exe"; Comment: "Start Lion Code (backend + adapter + terminal UI)"
+Name: "{autodesktop}\Lion Code"; Filename: "{app}\StartLionCode.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\LionCode.exe"; Comment: "Start Lion Code (backend + adapter + terminal UI)"; Tasks: desktopicon
 
 ; ---------------------------------------------------------------------------
 ; "lion-code" must work from a plain cmd prompt after install (user request).
 ;   1) {app}\lion-code.cmd does the actual work (ships in [Files] through the
-;      staged payload) and runs start.exe IN THE CURRENT CONSOLE - the MiMo TUI
+;      staged payload) and runs start.exe IN THE CURRENT CONSOLE - the terminal UI
 ;      pokes the console mode through FFI, so neither a new window nor a
 ;      hidden run is acceptable.
 ;   2) This entry appends {app} to the USER PATH in HKCU\Environment.
@@ -151,15 +134,8 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: LionPathNeedsAppend
 
 [UninstallDelete]
-; node_modules as extracted by install_deps.cmd (7z output, junctions, ...)
-Type: filesandordirs; Name: "{app}\MiMo-Code-main\node_modules"
-; bun-era safety net (a run once left 16 dirs behind: error 145 = not empty).
-; NOTE: a middle wildcard (packages\*\node_modules) did NOT match anything in
-; the real self-test, so the four workspace packages are listed explicitly.
-Type: filesandordirs; Name: "{app}\MiMo-Code-main\packages\cli\node_modules"
-Type: filesandordirs; Name: "{app}\MiMo-Code-main\packages\plugin\node_modules"
-Type: filesandordirs; Name: "{app}\MiMo-Code-main\packages\sdk\node_modules"
-Type: filesandordirs; Name: "{app}\MiMo-Code-main\packages\shared\node_modules"
+; tui/node_modules ships plain (0 junctions) - no pre-extraction, no junction leftovers
+Type: filesandordirs; Name: "{app}\tui\node_modules"
 Type: filesandordirs; Name: "{app}\.lbcheck"
 Type: filesandordirs; Name: "{app}\tmp"
 Type: files; Name: "{app}\install-deps.log"

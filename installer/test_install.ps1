@@ -274,11 +274,10 @@ Write-Host ('  install dir short form: ' + $ndShort)
 Step 'STEP 2  installed layout (TUI entry, bun.exe, lion-code.cmd, NO local runtime)'
 $must = @(
     'start.exe', 'LionCode.exe', 'adapter.exe', 'bun.exe', 'python315.dll',
-    'StartLionCode.cmd', '_run_mimo.cmd', 'install_deps.cmd', 'README-install.md',
+    'StartLionCode.cmd', '_run_mimo.cmd', 'README-install.md',
     'lion-code.cmd',
-    'node_modules.7z', '7za.exe', 'relink-nm.cmd',
-    'MiMo-Code-main\packages\cli\src\index.ts',
-    'MiMo-Code-main\package.json', 'MiMo-Code-main\bun.lock',
+    'tui\package.json', 'tui\bunfig.toml', 'tui\src\index.tsx',
+    'tui\node_modules\@opentui\core',
     'unins000.exe'
 )
 foreach ($f in $must) {
@@ -291,37 +290,28 @@ foreach ($f in $must) {
 Assert (-not (Test-Path (Join-Path $installdir 'runtime-vulkan'))) 'runtime-vulkan NOT shipped (cloud-only build)'
 $ggufAll = @(Get-ChildItem -LiteralPath $installdir -Recurse -Filter '*.gguf' -File -Force -ErrorAction SilentlyContinue)
 Assert ($ggufAll.Count -eq 0) ('no *.gguf anywhere under the install dir (' + $ggufAll.Count + ')')
-$nm = Join-Path $installdir 'MiMo-Code-main\node_modules'
-$ok = Join-Path $installdir 'install-deps.ok'
-$log = Join-Path $installdir 'install-deps.log'
-Assert (Test-Path -LiteralPath $ok) 'install-deps.ok marker (7z extract + relink succeeded during install)'
-if (Test-Path -LiteralPath $log) {
-    Write-Host '  --- raw install-deps.log (last 40 lines) ---'
-    Get-Content -LiteralPath $log | Select-Object -Last 40 | ForEach-Object { Write-Host ('  | ' + $_) }
-    Write-Host '  --- end install-deps.log ---'
-} else { Fail 'install-deps.log missing' }
+# tui/node_modules ships PLAIN (0 junctions) - no extract phase, no relink phase.
+# Assert the tree is actually there and big enough to be the real dependency set.
+$nm = Join-Path $installdir 'tui\node_modules'
+Assert (Test-Path -LiteralPath $nm) 'tui\node_modules present (ships plain, no 7z)'
 if (Test-Path -LiteralPath $nm) {
     $n = @(Get-ChildItem -LiteralPath $nm -Recurse -File -Force -ErrorAction SilentlyContinue)
     $mb = [math]::Round(($n | Measure-Object Length -Sum).Sum / 1MB, 1)
-    Write-Host ('  node_modules: ' + $n.Count + ' files, ' + $mb + ' MB (logical)')
-    Assert ($n.Count -gt 50000) 'node_modules extracted from the pre-packed archive'
-    # junctions: 7z -snl leaves them as empty folders; relink-nm.cmd must have
-    # recreated them (dev tree has 3275)
-    $j = @(Get-ChildItem -LiteralPath $nm -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
-    Write-Host ('  junctions/symlinks now: ' + $j.Count)
-    Assert ($j.Count -gt 1000) 'junctions recreated by relink-nm.cmd'
-} else { Fail 'node_modules missing' }
-# Plan B acceptance: the EXTRACTED tree must actually run the TUI CLI
-$cliDir = Join-Path $installdir 'MiMo-Code-main\packages\cli'
-Push-Location $cliDir
+    Write-Host ('  tui node_modules: ' + $n.Count + ' files, ' + $mb + ' MB')
+    Assert ($n.Count -gt 5000) 'tui deps are complete (thousands of files)'
+}
+# The installed tree must actually RUN the terminal UI entry (bun + OpenTUI deps usable)
+$uiEntry = Join-Path $installdir 'tui\src\index.tsx'
+Assert (Test-Path -LiteralPath $uiEntry) 'installed tree has tui/src/index.tsx (UI entry)'
 $t0 = Get-Date
-$cliOut = & (Join-Path $installdir 'bun.exe') run --conditions=browser '.\src\index.ts' --help 2>&1
-$cliRc = $LASTEXITCODE
+Push-Location (Join-Path $installdir 'tui')
+$uiOut = & (Join-Path $installdir 'bun.exe') build --target=bun '.\src\index.tsx' --outfile="$env:TEMP\lion_tui_check.js" 2>&1
+$uiRc = $LASTEXITCODE
 Pop-Location
-$cliMs = [int]((Get-Date) - $t0).TotalMilliseconds
-Write-Host ('  installed CLI --help: rc=' + $cliRc + ' ms=' + $cliMs)
-@($cliOut) | Select-Object -First 6 | ForEach-Object { Write-Host ('    | ' + $_) }
-Assert ($cliRc -eq 0) 'installed tree runs the MiMo TUI CLI (extracted deps are usable)'
+$uiMs = [int]((Get-Date) - $t0).TotalMilliseconds
+Write-Host ('  installed UI bundles: rc=' + $uiRc + ' ms=' + $uiMs)
+@($uiOut) | Select-Object -First 6 | ForEach-Object { Write-Host ('    | ' + $_) }
+Assert ($uiRc -eq 0) 'installed tree bundles the terminal UI (tui deps are usable)'
 # no python sources shipped (compiled exes only), and NO gguf models shipped
 Assert (-not (Test-Path (Join-Path $installdir 'main.py'))) 'main.py NOT shipped (backend is compiled)'
 $ggufs = @(Get-ChildItem -LiteralPath $installdir -Filter '*.gguf' -File -ErrorAction SilentlyContinue)

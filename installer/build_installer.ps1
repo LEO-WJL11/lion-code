@@ -60,10 +60,11 @@ if (-not $SkipStage) {
     $srcs = @()
     if ($mainDist) { $srcs += @{ from = $mainDist; to = $stage; excl = @() } }
     $srcs += @(
-        # MiMo sources WITHOUT node_modules - the deps ship pre-packed below
-        @{ from = (Join-Path $root 'MiMo-Code-main'); to = (Join-Path $stage 'MiMo-Code-main'); excl = @('node_modules') },
+        # tui/ sources WITH node_modules - it has 0 junctions so it ships plain
+        # (no 7z + extract + relink dance; the MiMo payload needed that, tui does not)
+        @{ from = (Join-Path $root 'tui'); to = (Join-Path $stage 'tui'); excl = @() },
         @{ from = (Join-Path $root 'skills'); to = (Join-Path $stage 'skills'); excl = @() },
-        @{ from = (Join-Path $root 'installer\payload'); to = $stage; excl = @() }
+        @{ from = (Join-Path $root 'installer\payload'); to = $stage; excl = @('node_modules.7z','install_deps.cmd','relink-nm.cmd') }
     )
     foreach ($s in $srcs) {
         if (-not (Test-Path -LiteralPath $s.from)) { Bad ('missing source: ' + $s.from); continue }
@@ -81,26 +82,9 @@ if (-not $SkipStage) {
     Copy-Item -LiteralPath $startExe (Join-Path $stage 'start.exe') -Force
     Copy-Item -LiteralPath 'C:\Users\Leo\AppData\Roaming\npm\node_modules\bun\bin\bun.exe' (Join-Path $stage 'bun.exe') -Force
     Copy-Item -LiteralPath (Join-Path $root 'installer\README-install.md') (Join-Path $stage 'README-install.md') -Force
-    # Plan B payload: pre-packed node_modules + x64 7za + junction relink script
-    # (pack_nm.ps1 produced all of it from the proven dev tree; relink_split.ps1
-    #  turned relink-nm.cmd into a dispatcher + 16 parallel slices)
-    $planB = @(
-        @{ from = (Join-Path $root '.lbcheck\node_modules.7z'); to = (Join-Path $stage 'node_modules.7z') },
-        @{ from = (Join-Path $root '.lbcheck\7zextra\x64\7za.exe');  to = (Join-Path $stage '7za.exe') },
-        @{ from = (Join-Path $root '.lbcheck\7zextra\x64\7za.dll');  to = (Join-Path $stage '7za.dll') },
-        @{ from = (Join-Path $root '.lbcheck\7zextra\x64\7zxa.dll'); to = (Join-Path $stage '7zxa.dll') },
-        @{ from = (Join-Path $root '.lbcheck\relink-nm.cmd');        to = (Join-Path $stage 'relink-nm.cmd') }
-    )
-    foreach ($f in $planB) {
-        if (Test-Path -LiteralPath $f.from) { Copy-Item -LiteralPath $f.from $f.to -Force }
-        else { Bad ('plan B file missing: ' + $f.from) }
-    }
-    # the parallel relink SLICES the dispatcher starts (relink-nm.p00.cmd ..
-    # relink-nm.p15.cmd). Missing slices are a hard error: the dispatcher would
-    # fall back to serial and install ~16 s slower without anyone noticing.
-    $slices = @(Get-ChildItem -LiteralPath (Join-Path $root '.lbcheck') -Filter 'relink-nm.p*.cmd' -File -ErrorAction SilentlyContinue)
-    if ($slices.Count -lt 16) { Bad ('only ' + $slices.Count + ' relink slice file(s) in .lbcheck, need 16') }
-    foreach ($pf in $slices) { Copy-Item -LiteralPath $pf.FullName (Join-Path $stage $pf.Name) -Force }
+    # 【没有 Plan B 了】MiMo 那套 pre-packed node_modules.7z + 7za + relink(16 slices)
+    # 随 MiMo 前端一起移除：tui/node_modules 是 0 junction 的普通目录，直接明文进包，
+    # 安装器不再需要"解压 + 重建 junction"那一步（装完即用，也少一个 3 分钟的提取阶段）。
     $sw.Stop()
     Write-Host ('STAGE done in ' + [math]::Round($sw.Elapsed.TotalSeconds, 1) + ' s')
 }
@@ -109,25 +93,19 @@ if (-not $SkipStage) {
 Step 'verify stage'
 $required = @(
     'LionCode.exe', 'adapter.exe', 'start.exe', 'bun.exe', 'python315.dll',
-    'StartLionCode.cmd', '_run_mimo.cmd', 'install_deps.cmd', 'README-install.md',
-    'lion-code.cmd',
-    'node_modules.7z', '7za.exe', 'relink-nm.cmd',
-    'MiMo-Code-main\package.json', 'MiMo-Code-main\bun.lock',
-    'MiMo-Code-main\packages\cli\src\index.ts'
+    'StartLionCode.cmd', '_run_mimo.cmd', 'README-install.md', 'lion-code.cmd',
+    'tui\package.json', 'tui\bunfig.toml',
+    'tui\src\index.tsx', 'tui\node_modules\@opentui\core'
 )
 foreach ($r in $required) {
     if (-not (Test-Path (Join-Path $stage $r))) { Bad ('stage missing: ' + $r) }
 }
-$stageSlices = @(Get-ChildItem -LiteralPath $stage -Filter 'relink-nm.p*.cmd' -File -ErrorAction SilentlyContinue)
-if ($stageSlices.Count -lt 16) { Bad ('stage has ' + $stageSlices.Count + ' relink slice(s), need 16') }
-else { Write-Host ('  [OK] ' + $stageSlices.Count + ' relink slices staged') }
 # CLOUD-ONLY payload: no llama-server, no GGUF weights. Ship any of them and
 # the package is wrong (and 5 GB bigger) - fail loudly instead of shipping it.
 if (Test-Path (Join-Path $stage 'runtime-vulkan')) { Bad 'runtime-vulkan must NOT be staged (cloud-only build)' }
 $gguf = @(Get-ChildItem -LiteralPath $stage -Recurse -Filter '*.gguf' -File -ErrorAction SilentlyContinue)
 if ($gguf.Count -gt 0) { Bad ($gguf.Count + ' .gguf weight(s) staged: ' + ($gguf[0].FullName)) }
-$cmdFiles = @('StartLionCode.cmd', '_run_mimo.cmd', 'install_deps.cmd', 'relink-nm.cmd', 'lion-code.cmd') +
-            @($stageSlices | ForEach-Object { $_.Name })
+$cmdFiles = @('StartLionCode.cmd', '_run_mimo.cmd', 'lion-code.cmd')
 foreach ($c in $cmdFiles) {
     $bytes = [IO.File]::ReadAllBytes((Join-Path $stage $c))
     $nonAscii = ($bytes | Where-Object { $_ -gt 127 }).Count
@@ -140,7 +118,6 @@ foreach ($c in $cmdFiles) {
 $st = Get-ChildItem -LiteralPath $stage -Recurse -File -Force
 $stMB = [math]::Round(($st | Measure-Object Length -Sum).Sum / 1MB, 1)
 Write-Host ('  stage: ' + $st.Count + ' files, ' + $stMB + ' MB')
-if (Test-Path (Join-Path $stage 'MiMo-Code-main\node_modules')) { Bad 'node_modules leaked into stage' }
 if ($fail -gt 0) { Write-Host ('STAGE VERIFICATION FAILED: ' + $fail + ' problem(s)'); exit 1 }
 
 # ---- 3. compile ------------------------------------------------------------
