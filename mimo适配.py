@@ -1524,7 +1524,21 @@ class Handler(BaseHTTPRequestHandler):
             # **不是 workspace id** ⇒ 上面那句解析退回了默认（= 安装目录）⇒ instance.path
             # 仍与 sdk.directory 不一致 ⇒ 事件全丢 ⇒ 黑屏。所以：**优先用它自己传的目录**
             # —— 那就是前端心里的"当前目录"，与 instance.path 必然一致（一致即不丢事件 ✓）。
+            #
+            # 【第三处修（2026-10-17 "工作区换了显示没变"）】directory 是 TUI **启动时**定死的
+            # （`--dir`，安装目录），切工作区它不会跟着变 ⇒ 上面的"directory 优先"让 /path
+            # 永远返回启动目录 ⇒ 侧栏"工作目录"永远不变 ✗✗✗。而日志实测 TUI 切工作区后的
+            # 请求都带 `?workspace=wrk_…` ⇒ **workspace 存在时优先按它解析**（这才是"当前
+            # 工作区"的目录）；无 workspace 再退回 directory（黑屏那条修复不受影响 ✓）。
             _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _wid = str(_q.get("workspace", [""])[0]).strip()
+            if _wid:
+                _dir = workspace_directory(_wid)
+                if _dir and os.path.isdir(_dir):
+                    return self._json({"home": home,
+                                       "state": os.path.join(home, ".local", "share", "lioncode"),
+                                       "config": os.path.join(home, ".config", "lioncode"),
+                                       "worktree": _dir, "directory": _dir})
             _d = _q.get("directory")
             if _d:
                 _dir = urllib.parse.unquote(str(_d[0])).strip()
