@@ -1102,6 +1102,9 @@ async function detail(id){SEL=id;const p=await j('/api/platform/projects/'+id);
  ${p.webUrl?`<div>网页：<a href="${p.webUrl}" target="_blank">${p.webUrl}</a></div>`:''}
  ${p.dlUrl?`<div>下载页：<a href="${p.dlUrl}" target="_blank">${p.dlUrl}</a></div>`:''}
  ${p.error?`<div class="err">${p.error}</div>`:''}
+ <div class="muted" style="margin-top:6px">隔离说明：本项目的工作目录就是这个租户实例的**全部可见空间**
+ —— Agent 的文件工具被硬性限定在该目录内（越界访问会被直接拒绝）。shell 命令以该目录为工作目录启动；
+ 若需要 OS 级强隔离（多租户同机），需要把实例跑进受限账户/容器 —— 见 README 的部署说明。</div>
  <div style="margin-top:8px"><button class="ghost" onclick="redeploy('${p.id}')">重新部署</button></div>
  ${p.buildReply?`<details><summary class="muted">Agent 结论</summary><div class="muted">${esc(p.buildReply)}</div></details>`:''}
  </div>
