@@ -48,10 +48,11 @@ if not exist "%MIMO%" (
     echo === rc=4 === >> "%LOG%"
     exit /b 4
 )
-rem -mmt=16: the pack side used -mmt=16, so the LZMA2 stream is block-parallel
-rem and the unpacker may use every logical core instead of one.
+rem -mmt=on: use EVERY core the TARGET machine has (auto). Was -mmt=16, which
+rem oversubscribes on 4/8-core user machines - 16 decoder threads over 4 cores
+rem is slower than auto and this runs on hardware we do not control.
 echo === extract start %TIME% === >> "%LOG%"
-"%APP%7za.exe" x "%APP%node_modules.7z" "-o%MIMO%" -y -mmt=16 >> "%LOG%" 2>&1
+"%APP%7za.exe" x "%APP%node_modules.7z" "-o%MIMO%" -y -mmt=on >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo extract failed rc=%RC% >> "%LOG%"
