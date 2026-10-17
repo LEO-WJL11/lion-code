@@ -139,10 +139,13 @@ class ResourcePool:
             self._save()
         return None
 
-    def release(self, pid: str) -> None:
+    def release(self, pid: str) -> bool:
+        """释放配额；返回这次是否真的释放了（幂等：没登记过返回 False）。"""
         with LOCK:
             if self._alloc.pop(pid, None) is not None:
                 self._save()
+                return True
+        return False
 
 
 def apply_process_limits(pid: int, cpu_cores: int, mem_mb: int) -> list[str]:
@@ -301,6 +304,14 @@ class PlatformApi:
                 # 另一类僵尸：修复前的版本会把 unknown 标成 live（实测发生过 ✗✗✗）。
                 self.store.update(p["id"], status=ST_FAILED,
                                   error="该记录来自旧版本的误判（没有产物却标了已上线）——重新构建或让 AI 重做")
+        # 【僵尸配额清理】失败/中断的项目不该继续占资源池（实测：历史失败项目留下
+        # 7 条 14 核/14GB 的死配额 ✗✗✗，池按物理机总量算，攒几次就建不了新项目）。
+        # 规则：只有 live 项目保留配额；其余（failed/stopped/不存在）一律回收。
+        live_ids = {p["id"] for p in self.store.all() if p.get("status") == ST_LIVE}
+        for held in list(self.pool._alloc):
+            if held not in live_ids:
+                if self.pool.release(held):
+                    print(f"[平台] 回收无主配额: {held}（项目非 live）", flush=True)
 
     # ---------------------------------------------------- 依赖定位
     def _deps(self) -> Any:
@@ -434,11 +445,17 @@ class PlatformApi:
             finally:
                 beat_stop.set()
             self.log(pid, f"Agent 完成，耗时 {int(time.time() - t0)} 秒")
+            # 【停止权优先】用户在构建期间点了停止 ⇒ 不进自测/部署（状态保持已停止）
+            if not self._still_running(pid):
+                self.log(pid, "构建期间被用户停止（跳过自测与部署）")
+                return
             self.store.update(pid, status=ST_TESTING, buildReply=reply[:4000])
             self._test_and_deploy(pid, src)
         except Exception as e:                               # noqa: BLE001 平台不许静默失败
             self.log(pid, f"❌ 管线异常: {type(e).__name__}: {e}")
-            self.store.update(pid, status=ST_FAILED, error=f"{type(e).__name__}: {e}")
+            self._release_quota(pid, "管线异常")
+            if self._still_running(pid):
+                self.store.update(pid, status=ST_FAILED, error=f"{type(e).__name__}: {e}")
         finally:
             with LOCK:
                 self._busy.discard(pid)
@@ -492,9 +509,18 @@ class PlatformApi:
         return "unknown"
 
     def _pick_port(self) -> int:
-        port = self._next_port
-        self._next_port += 1
-        return port
+        """挑一个**当前空闲**的端口。
+        【为什么不能单调 +1 就返回】原实现从不 bind 验证 ⇒ 19000+ 里被别的服务/
+        别的项目占着的端口照样会被发出去 ⇒ 新进程绑不上、探活探到**别人的服务**
+        当成自己部署成功的证据 ✗✗✗（连挑 50 次都不空 → 返回 0，调用方按静态站处理）。"""
+        for _ in range(50):
+            port = self._next_port
+            self._next_port += 1
+            if self._next_port > 19999:
+                self._next_port = 19000
+            if self._port_free(port):
+                return port
+        return 0
 
     def _start_server(self, pid: str, src: Path, port: int) -> subprocess.Popen[str] | None:
         """起网页服务（优先 bun，其次 node/npm）；起不来返回 None（当静态站处理）。"""
@@ -587,9 +613,41 @@ class PlatformApi:
         made.append(zp.name)
         return made
 
+    def _stop_proc(self, pid: str) -> None:
+        """停掉本项目已登记的服务进程（stop / redeploy / 探活失败前都要先走它）。
+        【为什么抽出来】redeploy 原来直接 _start_server ⇒ 旧进程不被杀、一直占着端口，
+        新进程绑不上端口死掉、`_procs` 被覆盖成死进程 ⇒ 之后 stop 杀的是死进程、
+        老进程变永久孤儿（实测推演 ✗✗✗）。统一走这里就不会漏杀。"""
+        proc = self._procs.pop(pid, None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=6)
+        except Exception:                                   # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:                               # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _port_free(port: int) -> bool:
+        """端口当前是否空闲（bind 一次即测，随后释放）。"""
+        try:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", int(port)))
+            return True
+        except OSError:
+            return False
+
     def _test_and_deploy(self, pid: str, src: Path) -> None:
         p = self.store.get(pid)
         if p is None:
+            return
+        # 【停止权优先】构建/自测期间用户点了"停止" ⇒ 后续状态一律不写（否则
+        # stop 会被构建线程改回 testing/live 并把服务真的拉起来 ✗✗✗）。
+        if p.get("status") == ST_STOPPED:
+            self.log(pid, "项目已被停止，跳过部署")
             return
         kind = self._classify(src)
         self.log(pid, f"自测开始：产物形态 = {kind}")
@@ -597,9 +655,12 @@ class PlatformApi:
         web_url = None
         test = {"kind": kind, "ok": False, "http": None, "title": None, "note": ""}
         if kind in ("web", "three-tier"):
-            # 重部署优先复用旧端口（每次都换会把 19000+ 耗尽，也让人困惑）
-            port = int(p.get("port") or 0) or self._pick_port()
-            proc = self._start_server(pid, src, port)
+            # 重部署复用旧端口，但**必须先确认它空闲** —— 单调 +1 或旧进程没死时
+            # 挑到被占端口 ⇒ 新进程绑不上、探活探到**别人的服务**当自己的 ✗✗✗。
+            port = int(p.get("port") or 0)
+            if not port or not self._port_free(port):
+                port = self._pick_port()
+            proc = self._start_server(pid, src, port) if port else None
             if proc is not None:
                 self._procs[pid] = proc
                 ok, code, title = self._probe(port)
@@ -610,7 +671,10 @@ class PlatformApi:
                     self.store.update(pid, port=port, webUrl=web_url)
                 else:
                     self.log(pid, "❌ 自测未通过：服务起不来或探活超时（server.log 有明细）")
+                    self._stop_proc(pid)        # 半死进程不许留着占资源（探活失败即回收）
             else:
+                if not port:
+                    self.log(pid, "⚠ 无可用端口（19000-19999 全占）→ 按静态站处理")
                 # 静态站：只要目录里有 html 就算通过
                 html = src / "public" / "index.html"
                 if not html.is_file():
@@ -629,6 +693,7 @@ class PlatformApi:
         over = used_mb > int(p.get("diskGb", 0)) * 1024
         self.log(pid, f"磁盘占用 {used_mb} MB / 配额 {p.get('diskGb')} GB" + ("（⚠ 超配额）" if over else ""))
         if not test["ok"] and kind in ("web", "three-tier"):
+            self._release_quota(pid, "自测未通过")
             self.store.update(pid, status=ST_FAILED, test=test,
                               error="自测未通过（服务探活失败）——产物保留在项目目录，可让 AI 继续修")
             return
@@ -636,13 +701,37 @@ class PlatformApi:
             # 【没有任何可识别产物 = 构建失败】第一次实测：Agent 那轮拿到空模型名、
             # 云端 400，目录里一个文件都没有，管线却标了 live ✗✗✗ —— 产物形态
             # 认不出来就必须算失败，不许用"部署完成"骗人。
+            self._release_quota(pid, "没有可识别产物")
             self.store.update(pid, status=ST_FAILED, test=test,
                               error="Agent 没有产出可识别的产物（多半是构建那轮失败了，"
                                     "看上面的「Agent 结论」）—— 可继续对话让它重做")
             return
+        # 【停止权优先】最终状态写入前再核一次：部署期间用户点了停止就不许改写成 live
+        if not self._still_running(pid):
+            self._release_quota(pid, "部署期间被停止")
+            self.log(pid, "部署被用户停止打断（不写 live、不保留配额）")
+            return
         self.store.update(pid, status=ST_LIVE, test=test)
         self.log(pid, f"✅ 部署完成：网页={web_url or '（无）'} 下载页=/dl/{pid}/")
-        # 配额保留到显式 stop（项目在线期间资源就是它的）——见 stop_project
+        # 配额保留到显式 stop/失败释放 —— 见 stop_project 与 _release_quota
+
+    def _still_running(self, pid: str) -> bool:
+        cur = self.store.get(pid)
+        return cur is not None and cur.get("status") != ST_STOPPED
+
+    def _release_quota(self, pid: str, why: str) -> None:
+        """失败/中断即释放配额 —— 原来只有 stop 释放 ✗✗✗：项目连续失败几次后
+        资源池被僵尸配额占满、再也建不了新项目（总池是按物理机总量算的）。
+        之后若点「重新部署」，会由 _ensure_quota 重新划走。"""
+        if self.pool.release(pid):
+            self.log(pid, f"资源配额已释放（{why}）")
+
+    def _ensure_quota(self, pid: str) -> str | None:
+        """重新部署前确保配额在册（失败已释放过 / 后端重启后池与状态不同步）；
+        划不到就如实返回原因（不许"没配额也照样起服务"绕过总池）。"""
+        p = self.store.get(pid) or {}
+        return self.pool.allocate(pid, int(p.get("cpu", 1)), int(p.get("memoryMb", 1024)),
+                                  int(p.get("diskGb", 5)))
 
     # ---------------------------------------------------- API 处理
     def info(self) -> dict[str, Any]:
@@ -797,17 +886,13 @@ class PlatformApi:
     def _restart_deploy(self, pid: str) -> None:
         p = self.store.get(pid)
         src = self.projects_dir / pid
-        old = self._procs.pop(pid, None)
-        if old is not None:
-            try:
-                old.terminate()
-                old.wait(timeout=6)
-            except Exception:                               # noqa: BLE001
-                try:
-                    old.kill()
-                except Exception:                           # noqa: BLE001
-                    pass
-        port = int(p.get("port") or self._pick_port())
+        self._stop_proc(pid)                # 统一走停进程助手（否则旧进程会成孤儿）
+        port = int(p.get("port") or 0)
+        if not port or not self._port_free(port):
+            port = self._pick_port()
+        if not port:
+            self.log(pid, "⚠ 无可用端口，部署未重启")
+            return
         proc = self._start_server(pid, src, port)
         if proc is not None:
             self._procs[pid] = proc
@@ -820,16 +905,12 @@ class PlatformApi:
         p = self.store.get(pid)
         if p is None:
             return {"ok": False, "error": "项目不存在"}
-        proc = self._procs.pop(pid, None)
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=6)
-            except Exception:                               # noqa: BLE001
-                proc.kill()
-        self.pool.release(pid)
+        # 先改状态再杀进程：构建线程的后续写入都会被 `_still_running` 挡掉
+        # （否则 stop 后构建线程照样把状态改回 live 并起服务 ✗✗✗）
         self.store.update(pid, status=ST_STOPPED)
-        self.log(pid, "已停止（运行时进程已终止，资源配额已释放）")
+        self._stop_proc(pid)
+        self.pool.release(pid)
+        self.log(pid, "已停止（状态=已停止；服务进程已终止；资源配额已释放）")
         return {"ok": True}
 
 
@@ -923,11 +1004,22 @@ def register(router: Any, ctx: Any, Response: Any) -> None:
 
         def run() -> None:
             try:
+                # 【先停旧、再确保配额】原实现直接 _start_server ⇒ 旧进程成孤儿、
+                # 新进程绑不上端口（端口被旧进程占着）✗✗✗；配额若因失败/重启不在册，
+                # 也要在这里重新划走，否则等于绕过物理机总池。
+                api._stop_proc(pid)
+                qerr = api._ensure_quota(pid)
+                if qerr:
+                    api.log(pid, f"重新部署被拒：{qerr}")
+                    api.store.update(pid, status=ST_FAILED, error=qerr)
+                    return
                 api.log(pid, "重新部署（自测 + 部署）…")
                 api._test_and_deploy(pid, api.projects_dir / pid)
             except Exception as e:                           # noqa: BLE001
                 api.log(pid, f"❌ 重新部署异常: {type(e).__name__}: {e}")
-                api.store.update(pid, status=ST_FAILED, error=f"{type(e).__name__}: {e}")
+                api._release_quota(pid, "重新部署异常")
+                if api._still_running(pid):
+                    api.store.update(pid, status=ST_FAILED, error=f"{type(e).__name__}: {e}")
             finally:
                 with LOCK:
                     api._busy.discard(pid)
@@ -1006,20 +1098,24 @@ def register(router: Any, ctx: Any, Response: Any) -> None:
 
 
 def _dl_html(api: PlatformApi, p: dict[str, Any]) -> str:
+    # 【项目名/文件名是外部输入】f-string 直接进 HTML = XSS；下载页与平台页同一
+    # origin，恶意租户起个 <script> 名字就能在别人打开下载页时执行（多租户服务器是真风险）。
+    from html import escape as _esc
+    pname = _esc(str(p.get("name") or ""))
     rows = []
     for name in p.get("artifacts") or []:
         f = api.projects_dir / p["id"] / ".lionforge" / name
         size = f"{f.stat().st_size // 1024} KB" if f.is_file() else "缺失"
-        rows.append(f'<tr><td><a href="/dl/{p["id"]}/{urllib.parse.quote(name)}">{name}</a></td>'
-                    f'<td>{size}</td></tr>')
+        rows.append(f'<tr><td><a href="/dl/{p["id"]}/{urllib.parse.quote(name)}">'
+                    f'{_esc(str(name))}</td><td>{size}</td></tr>')
     body = "\n".join(rows) or '<tr><td colspan="2">（还没有产物）</td></tr>'
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>{p['name']} · 下载</title>
+<title>{pname} · 下载</title>
 <style>body{{background:#0d1117;color:#e6edf3;font:15px/1.7 -apple-system,"Segoe UI",Consolas,sans-serif;}}
 .wrap{{max-width:760px;margin:40px auto;padding:0 20px}}a{{color:#e3b341}}
 table{{width:100%;border-collapse:collapse;margin-top:16px}}th,td{{border:1px solid #30363d;padding:8px 12px;text-align:left}}</style>
 </head><body><div class="wrap">
-<h1>{p['name']}</h1><p class="muted">由 LionForge（狮铸）构建与部署 · {p.get('kind','')}</p>
+<h1>{pname}</h1><p class="muted">由 LionForge（狮铸）构建与部署 · {_esc(str(p.get('kind', '')))}</p>
 <table><tr><th>产物</th><th>大小</th></tr>{body}</table>
 <p><a href="/platform">← 返回 LionForge</a></p></div></body></html>"""
 
@@ -1080,10 +1176,13 @@ async function create(){const msg=$('msg');msg.textContent='创建中…';
   aiApi:$('apisel').value==='custom'?{baseUrl:$('baseUrl').value,apiKey:$('apiKey').value,model:$('model').value}:{}};
  try{const d=await j('/api/platform/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   msg.textContent='已创建 '+d.id+' ，Agent 开始干活…';$('prompt').value='';refresh()}
- catch(e){msg.innerHTML='<span class="err">'+e.message+'</span>'}}
+ catch(e){msg.innerHTML='<span class="err">'+esc(e.message)+'</span>'}}
 async function refresh(){try{const d=await j('/api/platform/projects');$('list').innerHTML=d.items.map(p=>card(p,d.busy)).join('')||'<div class="muted">还没有项目</div>'}catch(e){}}
 function card(p,busy){const b=busy.includes(p.id)||['building','testing','deploying'].includes(p.status);
- return `<div class="card"><b>${p.name}</b> <span class="badge b-${p.status}">${statusText(p.status)}</span>
+ // 【项目名是用户输入，必须转义】直接插 innerHTML 是 XSS（多租户服务器上是真风险：
+ // 一个租户起个 <img onerror=…> 名字就能在别的租户看同一页时执行）—— 名称/标题/错误
+ // 文案全都过 esc()。
+ return `<div class="card"><b>${esc(p.name)}</b> <span class="badge b-${p.status}">${esc(statusText(p.status))}</span>
  <div class="muted">${p.cpu} 核 · ${p.memoryMb} MB · ${p.diskGb} GB${p.kind?' · '+kindText(p.kind):''} · ${p.createdAt}</div>
  <div style="margin-top:8px"><button class="ghost" onclick="detail('${p.id}')">详情</button>
  ${p.webUrl?`<button class="ghost" onclick="open('/serve/${p.id}/')">打开网页</button>`:''}
@@ -1096,13 +1195,13 @@ async function stopP(id){await j('/api/platform/projects/'+id+'/stop',{method:'P
 async function redeploy(id){await j('/api/platform/projects/'+id+'/redeploy',{method:'POST'});refresh();detail(id)}
 async function detail(id){SEL=id;const p=await j('/api/platform/projects/'+id);
  const t=p.test||{};
- $('detail').innerHTML=`<div class="card"><b>${p.name}</b> <span class="badge b-${p.status}">${statusText(p.status)}</span>
- <div class="muted">会话 ${p.sessionId}</div>
- ${t.kind?`<div class="muted">自测: ${kindText(t.kind)}${t.http!==null?' · HTTP '+t.http:''}${t.title?' · 标题「'+t.title+'」':''}</div>`:''}
- ${p.webUrl?`<div>网页：<a href="${p.webUrl}" target="_blank">${p.webUrl}</a></div>`:''}
- ${p.dlUrl?`<div>下载页：<a href="${p.dlUrl}" target="_blank">${p.dlUrl}</a></div>`:''}
- ${p.error?`<div class="err">${p.error}</div>`:''}
- <div class="muted" style="margin-top:6px">隔离说明：本项目的工作目录就是这个租户实例的**全部可见空间**
+ $('detail').innerHTML=`<div class="card"><b>${esc(p.name)}</b> <span class="badge b-${p.status}">${esc(statusText(p.status))}</span>
+ <div class="muted">会话 ${esc(p.sessionId)}</div>
+ ${t.kind?`<div class="muted">自测: ${esc(kindText(t.kind))}${t.http!==null?' · HTTP '+esc(String(t.http)):''}${t.title?' · 标题「'+esc(t.title)+'」':''}</div>`:''}
+ ${p.webUrl?`<div>网页：<a href="${p.webUrl}" target="_blank">${esc(p.webUrl)}</a></div>`:''}
+ ${p.dlUrl?`<div>下载页：<a href="${p.dlUrl}" target="_blank">${esc(p.dlUrl)}</a></div>`:''}
+ ${p.error?`<div class="err">${esc(p.error)}</div>`:''}
+ <div class="muted" style="margin-top:6px">隔离说明：本项目的工作目录就是这个租户实例的<b>全部可见空间</b>
  —— Agent 的文件工具被硬性限定在该目录内（越界访问会被直接拒绝）。shell 命令以该目录为工作目录启动；
  若需要 OS 级强隔离（多租户同机），需要把实例跑进受限账户/容器 —— 见 README 的部署说明。</div>
  <div style="margin-top:8px"><button class="ghost" onclick="redeploy('${p.id}')">重新部署</button></div>
@@ -1118,7 +1217,7 @@ async function send(){const id=SEL,msg=$('chatin').value.trim();if(!msg)return;
  $('chatsend').disabled=true;$('chatmsg').textContent='AI 思考中…（改动+自测需要时间）';
  try{const d=await j('/api/platform/projects/'+id+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
   $('chatmsg').textContent=d.note||'完成';detail(id)}
- catch(e){$('chatmsg').innerHTML='<span class="err">'+e.message+'</span>'}
+ catch(e){$('chatmsg').innerHTML='<span class="err">'+esc(e.message)+'</span>'}
  finally{$('chatsend').disabled=false}}
 loadInfo();refresh();setInterval(refresh,4000);
 setInterval(()=>{if(SEL){fetch('/api/platform/projects/'+SEL+'/log').then(r=>r.text()).then(t=>{const el=$('dlog');if(el)el.textContent=t||'（暂无）'}).catch(()=>{})}},3000);

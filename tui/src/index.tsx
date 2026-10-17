@@ -270,8 +270,17 @@ function App() {
         return true
       }
       case "/mode": {
-        const out = await jpost("/api/runtime/mode", { mode: a || "local" })
-        say([S(out.success ? `  ✓ 模型来源 = ${a || "local"}` : "  ✗ " + (out.message || ""), out.success ? C.ok : C.err)])
+        // 【裸 /mode 不许切】原实现 `a || "local"` ⇒ 不带参数会**直接切到 local**
+        // （云端被禁、下条消息就失败）✗✗✗✗✗。不带参数 = 查看当前；带参数才是切换。
+        if (!a) {
+          const cur = await jget("/api/runtime/mode")
+          const m = cur?.data?.model
+          say([S("  当前模式: " + (m ? `custom（云端模型 ${m}）` : String(cur?.data?.mode ?? "?")), C.text)])
+          say([S("  切换: /mode custom（云端）或 /mode local", C.gray)])
+          return true
+        }
+        const out = await jpost("/api/runtime/mode", { mode: a })
+        say([S(out.success ? `  ✓ 模型来源 = ${a}` : "  ✗ " + (out.message || ""), out.success ? C.ok : C.err)])
         return true
       }
       case "/clear":
@@ -309,11 +318,26 @@ function App() {
       }
       return
     }
+    // 【esc 也必须能中断】界面两处明写 "(esc to interrupt)" / "esc to interrupt"，
+    // 但原实现只认 Ctrl+C ⇒ 按 ESC 毫无反应 = 假功能（实测抱怨 ✗✗✗）。
+    // 行为与 Ctrl+C 完全一致：忙=中断（停后端+断流），空闲=退出。
+    if (key?.name === "escape") {
+      if (busy() && abort) {
+        abort.abort()
+        jpost("/api/chat/control/stop", { sessionId: sid })
+        say([S("  ✓ 已中断", C.ok)])
+      } else {
+        process.exit(0)
+      }
+      return
+    }
+    // 【生成期间也要能翻页】长回复滚上去后想回看 —— 原来 busy 期间 PageUp/Down
+    // 也被挡 ✗✗✗。翻页只动滚动位置，不碰输入，先放行。
+    if (key?.name === "pageup") return setScroll((s) => s + 5)
+    if (key?.name === "pagedown") return setScroll((s) => Math.max(0, s - 5))
     if (busy()) return
     if (key?.name === "return" || key?.name === "enter") return void submit()
     if (key?.name === "backspace") return setInput((v) => v.slice(0, -1))
-    if (key?.name === "pageup") return setScroll((s) => s + 5)
-    if (key?.name === "pagedown") return setScroll((s) => Math.max(0, s - 5))
     const seq = String(key?.sequence || "")
     if (!key?.ctrl && !key?.meta && seq.length === 1 && seq >= " ") setInput((v) => v + seq)
   })
