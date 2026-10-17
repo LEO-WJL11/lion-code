@@ -845,6 +845,26 @@ index 1768b1e..4a85398 100644
      const intl = createMemo(() => INTL[effective()])
      const label = (locale: Locale) => t(LABEL_KEY[locale])
  
+diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sdk.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sdk.tsx
+index 2256184..1c76b0a 100644
+--- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sdk.tsx
++++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sdk.tsx
+@@ -141,6 +141,15 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       switchDirectory(next: string) {
+         currentDirectory = next
+         sdk = createSDK(next)
++        // 【切目录必须重连 SSE，否则事件整条被丢】SSE 是**连接时**用当时的 sdk 起的
++        // （startSSE 闭包里那个 `sdk.global.event`），声明的 `?directory=` 就是当时的
++        // 快照。切工作区后 instance.directory 会跟着 /path 变（适配层已按 workspace
++        // 优先解析），而旧 SSE 的 directory 停在启动值 ⇒ 两边不一致 ⇒ useEvent
++        // （event.ts:20-28）按 directory 过滤时把事件整条丢掉 ✗✗✗ ⇒ session.created
++        // 收不到 ⇒ 新会话不进 store ⇒ **发消息后一片黑**，切走再切回来才好（本机实测）。
++        // startSSE() 第一行就是 `sse?.abort()`（断旧连接），重连时用的 `sdk` 已是新的
++        // ⇒ 新连接带新 directory ⇒ 与 instance.directory 同源 ⇒ 事件不丢 ✓。
++        startSSE()
+       },
+       event: emitter,
+       fetch: props.fetch ?? fetch,
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx
 index 521c2d3..3ab4d14 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/context/sync.tsx
@@ -2146,7 +2166,7 @@ index d2c42d0..2205daa 100644
  
    return <DialogSelect title="Subagents" options={options()} />
 diff --git a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
-index e7c9c35..83cceb0 100644
+index e7c9c35..eae1e03 100644
 --- a/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 +++ b/MiMo-Code-main/packages/cli/src/cli/cmd/tui/routes/session/index.tsx
 @@ -18,6 +18,9 @@ import { useProject } from "@tui/context/project"
@@ -2193,7 +2213,18 @@ index e7c9c35..83cceb0 100644
        toast.show({
          message: `Session not found: ${route.sessionID}`,
          variant: "error",
-@@ -364,11 +383,15 @@ export function Session() {
+@@ -308,6 +327,10 @@ export function Session() {
+       } catch (e) {}
+     }
+     await sync.session.sync(route.sessionID)
++    // 【切目录后让 SSE 跟着换目录】project.sync() 发现目录变了会调 switchDirectory
++    // （那里已重建 sdk），但**SSE 连接声明的 directory 是连接时的快照** ✗✗✗ ——
++    // 不重连就与新 instance.directory 不一致 ⇒ useEvent 丢事件 ⇒ session.created
++    // 收不到 ⇒ 新会话不进 store ⇒ 发消息后黑屏。switchDirectory 现在会重连 SSE（见 sdk.tsx）。
+     if (scroll) scroll.scrollBy(100_000)
+   })
+ 
+@@ -364,11 +387,15 @@ export function Session() {
      const title = Locale.truncate(session()?.title ?? "", 50)
      const pad = (text: string) => text.padEnd(10, " ")
      const weak = (text: string) => UI.Style.TEXT_DIM + pad(text) + UI.Style.TEXT_NORMAL
@@ -2210,7 +2241,7 @@ index e7c9c35..83cceb0 100644
          `  ${weak("Session")}${UI.Style.TEXT_NORMAL_BOLD}${title}${UI.Style.TEXT_NORMAL}`,
          `  ${weak("Continue")}${UI.Style.TEXT_NORMAL_BOLD}mimo -s ${session()?.id}${UI.Style.TEXT_NORMAL}`,
          ``,
-@@ -561,46 +584,6 @@ export function Session() {
+@@ -561,46 +588,6 @@ export function Session() {
          dialog.clear()
        },
      },
@@ -2257,7 +2288,7 @@ index e7c9c35..83cceb0 100644
      {
        title: t("tui.command.session.rename.title"),
        value: "session.rename",
-@@ -686,86 +669,6 @@ export function Session() {
+@@ -686,86 +673,6 @@ export function Session() {
          dialog.clear()
        },
      },
@@ -2344,7 +2375,7 @@ index e7c9c35..83cceb0 100644
      {
        title: t("tui.command.session.undo.title"),
        value: "session.undo",
-@@ -2328,6 +2231,46 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
+@@ -2328,6 +2235,46 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
          <Match when={props.part.tool === "plan_exit"}>
            <PlanExit {...toolprops} />
          </Match>
